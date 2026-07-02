@@ -1,0 +1,20 @@
+/target
+**/*.rs.bk
+Cargo.lock
+
+# Model weights and data — bring your own; never commit these.
+/models
+/data
+*.safetensors
+*.bpk
+*.bin
+*.npy
+
+# Python caches (A0 validation scripts)
+__pycache__/
+*.pyc
+
+# Local Python venv + Manim render artifacts (from the reward harness / demos — never commit)
+/.venv
+/scene.py
+/media
