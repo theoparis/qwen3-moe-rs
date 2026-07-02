@@ -1,6 +1,6 @@
-# qwen3-burn
+# qwen3-moe-rs
 
-> Rust crate: `qwen3-burn` (imported as `qwen3_burn`). MIT-licensed.
+> Rust crate: `qwen3-burn` (imported as `qwen3_burn`) — the repo is `qwen3-moe-rs`, the crate keeps its original name. MIT-licensed.
 
 A Rust implementation of the [Qwen3](https://github.com/QwenLM/Qwen3) family of large language
 models, built on the [Burn](https://burn.dev/) deep-learning framework instead of PyTorch. It runs

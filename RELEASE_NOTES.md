@@ -1,8 +1,8 @@
-# Release Notes — qwen3-burn v0.3.0
+# Release Notes — qwen3-moe-rs v0.3.0
 
 ## What this release is
 
-`qwen3-burn` is a Rust implementation of the Qwen3 family of large language
+`qwen3-moe-rs` is a Rust implementation of the Qwen3 family of large language
 models, built on the [Burn](https://burn.dev) deep-learning framework instead of
 PyTorch. This release turns it from a single-model text generator into a small
 stack: two Mixture-of-Experts inference engines, a quantization layer, fast

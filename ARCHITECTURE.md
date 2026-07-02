@@ -1,9 +1,9 @@
 # Architecture
 
-A beginner-friendly tour of `qwen3-burn`: what the pieces are and how a request flows
+A beginner-friendly tour of `qwen3-moe-rs` (crate name: `qwen3-burn`): what the pieces are and how a request flows
 through them. Each section links its deep-dive plan under `docs/`.
 
-`qwen3-burn` is a Rust implementation of Alibaba's **Qwen3** large language models,
+`qwen3-moe-rs` is a Rust implementation of Alibaba's **Qwen3** large language models,
 built on the **Burn** deep-learning framework instead of PyTorch. It began as a dense
 text-generation engine and grew two large additions: a **GRPO** reinforcement-learning
 trainer whose training loop runs natively in Rust/Burn, and **Mixture-of-Experts
