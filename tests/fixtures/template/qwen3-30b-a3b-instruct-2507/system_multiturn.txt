@@ -1,0 +1,9 @@
+<|im_start|>system
+You are a terse assistant. Answer in one sentence.<|im_end|>
+<|im_start|>user
+Name a prime number.<|im_end|>
+<|im_start|>assistant
+Seven.<|im_end|>
+<|im_start|>user
+And one bigger than that?<|im_end|>
+<|im_start|>assistant

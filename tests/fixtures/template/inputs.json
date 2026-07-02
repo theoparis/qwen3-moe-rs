@@ -1,0 +1,115 @@
+[
+  {
+    "name": "single_user",
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is the capital of France?"
+      }
+    ],
+    "enable_thinking": null,
+    "tools": null
+  },
+  {
+    "name": "system_multiturn",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a terse assistant. Answer in one sentence."
+      },
+      {
+        "role": "user",
+        "content": "Name a prime number."
+      },
+      {
+        "role": "assistant",
+        "content": "Seven."
+      },
+      {
+        "role": "user",
+        "content": "And one bigger than that?"
+      }
+    ],
+    "enable_thinking": null,
+    "tools": null
+  },
+  {
+    "name": "thinking_on",
+    "messages": [
+      {
+        "role": "user",
+        "content": "How many r's are in strawberry?"
+      }
+    ],
+    "enable_thinking": true,
+    "tools": null
+  },
+  {
+    "name": "thinking_off",
+    "messages": [
+      {
+        "role": "user",
+        "content": "How many r's are in strawberry?"
+      }
+    ],
+    "enable_thinking": false,
+    "tools": null
+  },
+  {
+    "name": "assistant_think_history",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Is 91 prime?"
+      },
+      {
+        "role": "assistant",
+        "content": "<think>\n91 = 7 * 13, so no.\n</think>\n\nNo, 91 = 7 x 13."
+      },
+      {
+        "role": "user",
+        "content": "What about 97?"
+      }
+    ],
+    "enable_thinking": null,
+    "tools": null
+  },
+  {
+    "name": "tool_defs",
+    "messages": [
+      {
+        "role": "user",
+        "content": "What's the weather in Paris?"
+      }
+    ],
+    "enable_thinking": null,
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_current_weather",
+          "description": "Get the current weather in a given location",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "location": {
+                "type": "string",
+                "description": "The city and state, e.g. San Francisco, CA"
+              },
+              "unit": {
+                "type": "string",
+                "enum": [
+                  "celsius",
+                  "fahrenheit"
+                ]
+              }
+            },
+            "required": [
+              "location"
+            ]
+          }
+        }
+      }
+    ]
+  }
+]

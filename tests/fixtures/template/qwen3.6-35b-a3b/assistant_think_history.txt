@@ -1,0 +1,8 @@
+<|im_start|>user
+Is 91 prime?<|im_end|>
+<|im_start|>assistant
+No, 91 = 7 x 13.<|im_end|>
+<|im_start|>user
+What about 97?<|im_end|>
+<|im_start|>assistant
+<think>

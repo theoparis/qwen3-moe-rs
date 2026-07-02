@@ -1,0 +1,12 @@
+# A0 Python validation — full SFT+GRPO run.
+# Pin versions when you run, so the locked metrics are reproducible by the Burn port (A1).
+# The numerical reference (grpo_reference.py) and reward harness (manim_reward.py) need
+# ONLY numpy + stdlib — these heavy deps are only for run_sft_grpo.py.
+torch>=2.4
+transformers>=4.51        # Qwen3 support
+trl>=0.19                 # GRPOTrainer; PIN exact version for parity (reduction/KL differ across versions)
+datasets>=2.20
+peft>=0.12
+accelerate>=0.34
+numpy>=1.26
+# manim                   # install separately (system deps: cairo, pango, ffmpeg, latex) for the render reward stage

@@ -1,0 +1,366 @@
+[package]
+name = "qwen3-burn"
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Qwen3 transformer in the Burn deep-learning framework, with a Rust-native GRPO reinforcement-learning trainer, bf16 mixed-precision training, and a batch-safe Linear for the CubeCL CUDA backend."
+license = "MIT"
+keywords = ["qwen", "llm", "grpo", "burn", "rl"]
+categories = ["science", "text-processing"]
+
+[dependencies]
+# Pinned to the Burn pre-release this was built and verified against. The bf16 path relies on
+# Burn's runtime dtype + CubeCL/cubek matmul that accumulates bf16 inputs in f32; other revs may
+# differ. Bump deliberately and re-run the probes (see docs/BF16.md).
+burn = { git = "https://github.com/tracel-ai/burn.git", rev = "5923b1e7587e4c76a5d35035147e775ec4002919", features = ["store"] }
+burn-store = { git = "https://github.com/tracel-ai/burn.git", rev = "5923b1e7587e4c76a5d35035147e775ec4002919", features = ["burnpack", "safetensors"] }
+rootcause = "0.11.0"
+thiserror = "2.0.17"
+# Optional, cuda-only. Pinned to the SAME git revs Burn itself uses (rev parity = type identity, so
+# `tensor.client` etc. unify with Burn's internal copies). Only pulled in when the `cuda` feature is
+# enabled, so the default `cargo build --lib` is unaffected. Needed by examples/fusion_bridge_spike.rs
+# to reach the inner CubeBackend types and the burn-fusion custom-op registration API.
+cubecl = { git = "https://github.com/tracel-ai/cubecl", rev = "b19859ee693bb02a25e4da2ca53797bb164be140", default-features = false, features = ["cuda"], optional = true }
+# cubek-random direct dep (cuda-only) so the CUDA-graph device-seed RNG bench (component C3) can call
+# the capturable `random_uniform_with_seeds` on the raw CubeBackend. Same git rev as the transitive
+# copy pulled by cubecl/burn-cubecl; redirected to vendor/cubek by the [patch] below (so the
+# device-seed-buffer prng path is the one actually compiled). Types unify via the single local cubecl.
+cubek-random = { git = "https://github.com/tracel-ai/cubek", rev = "1161040639c1b9819820b337236bd0d265701b5b", default-features = false, optional = true }
+# cubek-attention direct dep (cuda-only) for the SPIKE examples/cubek_attn_spike.rs: probe whether the
+# Blackwell flash-attention can be ADOPTED for our decode (sm_121 smoke / GQA / decode-shape / numerics).
+# Same git source as cubek-random so the [patch] below redirects it to vendor/cubek; types unify via
+# the single local cubecl.
+cubek-attention = { git = "https://github.com/tracel-ai/cubek", rev = "1161040639c1b9819820b337236bd0d265701b5b", default-features = false, optional = true }
+burn-cubecl = { git = "https://github.com/tracel-ai/burn.git", rev = "5923b1e7587e4c76a5d35035147e775ec4002919", optional = true }
+burn-cubecl-fusion = { git = "https://github.com/tracel-ai/burn.git", rev = "5923b1e7587e4c76a5d35035147e775ec4002919", optional = true }
+burn-fusion = { git = "https://github.com/tracel-ai/burn.git", rev = "5923b1e7587e4c76a5d35035147e775ec4002919", optional = true }
+burn-ir = { git = "https://github.com/tracel-ai/burn.git", rev = "5923b1e7587e4c76a5d35035147e775ec4002919", optional = true }
+tokenizers = "0.21"
+rand = "0.9"
+half = "2.4"
+memmap2 = "0.9"
+safetensors = "0.7"
+# --- M-S serve-only deps (docs/SERVE_PLAN.md S3): optional, gated by the `serve` feature so the
+# core library builds unchanged without them. ---
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "signal"], optional = true }
+axum = { version = "0.8", optional = true }
+minijinja = { version = "2.10", features = ["json", "custom_syntax"], optional = true }
+minijinja-contrib = { version = "2.10", features = ["pycompat"], optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
+# ReceiverStream + StreamExt so the SSE handler can feed axum's Sse from the engine's bounded
+# return channel INCREMENTALLY (true streaming; the plan's "ReceiverStream feeds Sse").
+tokio-stream = { version = "0.1", optional = true }
+
+[dev-dependencies]
+# The `generate` example runs on the NdArray (CPU) backend out of the box. `autodiff` is enabled
+# so the GRPO trainer integration test (tests/grpo_trainer.rs) can run a real backward pass on CPU.
+burn = { git = "https://github.com/tracel-ai/burn.git", rev = "5923b1e7587e4c76a5d35035147e775ec4002919", features = ["store", "ndarray", "autodiff"] }
+half = "2.4"
+# GRPO math parity test: read the A0 Python reference tensors (tests/ref/grpo_expected.json).
+serde_json = "1.0"
+
+[features]
+default = []
+# CubeCL CUDA backend (NVIDIA GPU). On aarch64 (e.g. NVIDIA GB10 / Grace) build with
+# RUSTFLAGS="-C target-feature=+fp16" to satisfy the half-precision intrinsics.
+cuda = [
+    "burn/cuda",
+    "dep:cubecl",
+    "dep:cubek-random",
+    "dep:cubek-attention",
+    "dep:burn-cubecl",
+    "dep:burn-cubecl-fusion",
+    "dep:burn-fusion",
+    "dep:burn-ir",
+]
+# Autodiff + dataset API, needed for the bf16 throughput benchmark.
+train = ["burn/autodiff", "burn/dataset"]
+# M-S OpenAI-compat server (docs/SERVE_PLAN.md). Host-side parts (api/template/detok) build and
+# test WITHOUT cuda; the engine + qwen-serve bin additionally need `cuda`.
+serve = [
+    "dep:tokio",
+    "dep:axum",
+    "dep:minijinja",
+    "dep:minijinja-contrib",
+    "dep:serde",
+    "dep:serde_json",
+    "dep:tokio-stream",
+]
+
+[[bin]]
+name = "qwen-serve"
+path = "src/bin/qwen_serve.rs"
+required-features = ["cuda", "serve"]
+
+# Generic text generation on CPU (NdArray). No GPU required.
+[[example]]
+name = "generate"
+path = "examples/generate.rs"
+
+# Reproduces the CubeCL broadcast batched-matmul bug and verifies the 2-D workaround + bf16 parity.
+[[example]]
+name = "matmul_probe"
+path = "examples/matmul_probe.rs"
+required-features = ["cuda"]
+
+# bf16-vs-f32 forward+backward throughput on Qwen3-0.6B (random init/tokens).
+[[example]]
+name = "bench_bf16"
+path = "examples/bench_bf16.rs"
+required-features = ["cuda", "train"]
+
+# Qwen3-MoE on-device smoke on the real GB10/sm_121 (tiny random MoE forward + generate).
+[[example]]
+name = "moe_smoke"
+path = "examples/moe_smoke.rs"
+required-features = ["cuda"]
+
+# Load a REAL Qwen3-MoE checkpoint (per-expert HF format) + generate text. Config read from config.json.
+[[example]]
+name = "moe_generate"
+path = "examples/moe_generate.rs"
+required-features = ["cuda"]
+
+# B2 fast-path spike: batched-vs-loop expert GEMM correctness + speed on sm_121.
+[[example]]
+name = "moe_probe"
+path = "examples/moe_probe.rs"
+required-features = ["cuda"]
+
+# vLLM-like inference: load the 30B ONCE, then `generate(prompts, SamplingParams)` over the FAST
+# FUSED static-decode path (lever c) with real per-request sampling (temperature/top_p/top_k).
+[[example]]
+name = "vllm_infer"
+path = "examples/vllm_infer.rs"
+required-features = ["cuda"]
+
+# Decode-perf MEASUREMENT GATE (docs/PERF_80TOKS_PLAN.md): steady-state tok/s + effective GB/s per MoE
+# path on the real 30B → confirms/refutes "0.73 tok/s is launch-bound (~16% of peak), not bandwidth".
+[[example]]
+name = "decode_perf_bench"
+path = "examples/decode_perf_bench.rs"
+required-features = ["cuda"]
+
+# WAVE-2 STEP 1: bf16 parity gate (static decode == eager greedy) + perf of the fixed-shape, host-sync-free
+# static MoE decode (Block A decode_topk + reused dense static attention) on the real 30B.
+[[example]]
+name = "moe_static_decode"
+path = "examples/moe_static_decode.rs"
+required-features = ["cuda"]
+
+# WAVE-2 STEP 2: CUDA-graph CAPTURE the 30B MoE static decode step (forward_with_cache_static_pre, 48
+# layers + decode_topk) on the RAW CubeBackend (below Fusion) and REPLAY per token — strips the launch
+# tax the Wave-1 bench found dominating the launch-bound MoE decode. Token-identical to eager static +
+# captured-vs-eager tok/s. Mirrors examples/cudagraph_pfinal_bench.rs (the dense template).
+[[example]]
+name = "cudagraph_moe_decode_bench"
+path = "examples/cudagraph_moe_decode_bench.rs"
+required-features = ["cuda"]
+
+# GRPO convergence smoke on CPU (NdArray): tiny random model + toy reward. No GPU/weights/Python.
+[[example]]
+name = "grpo_train"
+path = "examples/grpo_train.rs"
+
+# GRPO on the real Qwen3-0.6B (Autodiff<Cuda>) — on-device training smoke.
+[[example]]
+name = "grpo_cuda"
+path = "examples/grpo_cuda.rs"
+required-features = ["cuda", "train"]
+
+[[example]]
+name = "run_manim_cuda"
+path = "examples/run_manim_cuda.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "fp8_probe"
+required-features = ["cuda"]
+
+[[example]]
+name = "kv_cache_bench"
+required-features = ["cuda"]
+
+# GRPO rollout speed levers on the GB10: (a) dynamic batch-shrink speedup (vs `group_sample_cached`)
+# at high length variance, and (b) a one-decode-step cost breakdown (attention vs linears vs sampling
+# vs host-sync) to decide whether Flash-Decode is the next lever (docs/VLLM_PARITY_PLAN.md Phase 3).
+[[example]]
+name = "rollout_decode_bench"
+path = "examples/rollout_decode_bench.rs"
+required-features = ["cuda"]
+
+# DEVICE-SIDE sampling lever (§0-A): per-step host-sampling cost (into_data[N,V] + CPU softmax/sort)
+# vs the device path (argmax/logsumexp/Gumbel-max + [N] copy-back), plus end-to-end decode wall-clock
+# for group_sample_cached vs group_sample_cached_device, at production vocab on the GB10.
+[[example]]
+name = "device_sample_bench"
+path = "examples/device_sample_bench.rs"
+required-features = ["cuda"]
+
+# GO/NO-GO spike: invoke a hand-written #[cube(launch)] kernel on a tensor that lives on the
+# default Fusion-wrapped Cuda backend, via a burn-fusion custom-op registration.
+[[example]]
+name = "fusion_bridge_spike"
+path = "examples/fusion_bridge_spike.rs"
+required-features = ["cuda"]
+
+# Validates the typed custom-op wrapper (src/cube_custom_op.rs) on N-input / different-shaped-output
+# kernels with mixed Float/Int handles, plus the rule-2 negative-path cross-validation catch.
+[[example]]
+name = "custom_op_test"
+path = "examples/custom_op_test.rs"
+required-features = ["cuda"]
+
+# VLLM_KERNELS.md §1: a custom CubeCL FlashAttention-style kernel (tiled online-softmax, f32 accum),
+# validated on the GB10 against an independent NdArray (CPU f32) oracle (the §0 cross-backend law).
+[[example]]
+name = "attn_kernel_spike"
+path = "examples/attn_kernel_spike.rs"
+required-features = ["cuda"]
+
+# ADOPT-NOT-BUILD SPIKE: can cubek-attention (Blackwell flash-attention) replace our hand-rolled decode
+# attention? sm_121 smoke + GQA + decode-shape + numerics + rough perf vs attention_fallback, on GB10.
+[[example]]
+name = "cubek_attn_spike"
+path = "examples/cubek_attn_spike.rs"
+required-features = ["cuda"]
+
+# VLLM_KERNELS.md §2: a FUSED W8A16 (fp8 e4m3 weight-only) GEMM that reads packed e4m3 BYTES from HBM
+# and dequants in-register in the GEMM load path, validated on the GB10 vs an NdArray (CPU f32) oracle
+# + OCP E4M3 golden vectors (the §0 cross-backend law).
+[[example]]
+name = "w8a16_spike"
+path = "examples/w8a16_spike.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "w8a16_raw_probe"
+path = "examples/w8a16_raw_probe.rs"
+required-features = ["cuda"]
+
+# VLLM_KERNELS.md §3: the DROPLESS MoE grouped-GEMM. Builds the vLLM moe_align_block_size layout
+# (sorted_token_ids + per-block expert_ids) fully on-device, runs a block-per-segment SwiGLU GEMM
+# (i64 global offsets), and validates exact-no-drop + numerics vs an NdArray (CPU f32) oracle on the
+# GB10 (the §0 cross-backend law).
+[[example]]
+name = "moe_grouped_spike"
+path = "examples/moe_grouped_spike.rs"
+required-features = ["cuda"]
+
+# PHASE 0 of the CUDA-graph plan (docs/cudagraph/DESIGN.md §0b): the synthetic no-alloc
+# fixed-buffer kernel-chain microbench that is the STOP/GO launch-overhead gate. Drives the
+# capture/replay FFI on the RAW CubeBackend<CudaRuntime> (below Fusion).
+[[example]]
+name = "cudagraph_p0_bench"
+path = "examples/cudagraph_p0_bench.rs"
+required-features = ["cuda"]
+
+# FIX 1 regression (3-voice review hardening): proves a closure that PANICS inside
+# `ComputeClient::capture` leaves the server usable (the capture-abort unwind guard), instead of
+# wedging the CUDA stream in capture mode.
+[[example]]
+name = "cudagraph_panic_recovery"
+path = "examples/cudagraph_panic_recovery.rs"
+required-features = ["cuda"]
+
+# PHASE 1 of the CUDA-graph plan (docs/cudagraph/DESIGN.md §0b C2): the graph-aware capture ARENA +
+# scalar/metadata staging. Validates scalar capture, alloc-in-capture recycling, lifetime/leak,
+# multi-live distinct blocks (FIX 4), and allocator-usable-after-panic (FIX 1) on the RAW backend.
+[[example]]
+name = "cudagraph_c2_bench"
+path = "examples/cudagraph_c2_bench.rs"
+required-features = ["cuda"]
+
+# PHASE 2 of the CUDA-graph plan (docs/cudagraph/DESIGN.md §0b P0-A + §7): the device-`pos`-indexed
+# static cache + fixed-shape decode loop. Greedy id-parity (static == loop) + end-to-end loop-vs-static
+# wall-clock + the structural capture-readiness statement, on the real GB10 at production vocab.
+[[example]]
+name = "device_static_bench"
+path = "examples/device_static_bench.rs"
+required-features = ["cuda"]
+
+# PHASE 3 of the CUDA-graph plan (docs/cudagraph/DESIGN.md §0b C3 + §6): the device-seed counter RNG.
+# Captures a `random_uniform_with_seeds` region on the RAW CubeBackend and proves that a captured
+# stochastic kernel DECORRELATES across replays when the host writes fresh seeds into the persistent
+# device seed buffer (option (c)) — vs frozen-identical replays when it does not. Also checks eager
+# RNG is unchanged (fresh seed per call, uniform distribution).
+[[example]]
+name = "cudagraph_p3_rng_bench"
+path = "examples/cudagraph_p3_rng_bench.rs"
+required-features = ["cuda"]
+
+# Removes the LAST per-step device->host sync from the GRPO decode loop (the CUDA-graph prerequisite).
+# cuda-only; gated so `cargo test` example auto-discovery doesn't try to build it without the feature.
+[[example]]
+name = "device_loop_bench"
+path = "examples/device_loop_bench.rs"
+required-features = ["cuda"]
+
+# D6 NVFP4/fp8 fake-quant accuracy gate on Qwen3.6-35B-A3B dense linears. The human runs it on the
+# large-GPU host; build-only in CI/local agent work.
+[[example]]
+name = "qwen35_nvfp4_gate"
+path = "examples/qwen35_nvfp4_gate.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "qwen35_fp8_deploy_gate"
+path = "examples/qwen35_fp8_deploy_gate.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "qwen35_experts_fp8_gate"
+path = "examples/qwen35_experts_fp8_gate.rs"
+required-features = ["cuda"]
+
+# M-E.2 correctness probe: n-gram speculative decode over Qwen3.6-35B-A3B. Verifies M>1 draft
+# batches plus KV/GDN rollback by asserting token identity with plain BF16 greedy.
+[[example]]
+name = "qwen35_mtp_ngram"
+path = "examples/qwen35_mtp_ngram.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "qwen35_mtp_parity"
+path = "examples/qwen35_mtp_parity.rs"
+required-features = ["cuda"]
+
+[[example]]
+name = "qwen35_flash_decode_parity"
+path = "examples/qwen35_flash_decode_parity.rs"
+required-features = ["cuda"]
+
+# Local patched CubeCL (CUDA-graph capture FFI, component C1). vendor/cubecl is checked out at
+# the pinned rev b19859ee — identical source plus the additive capture/replay seam — so this is a
+# no-op rebuild for everything except the new code. burn stays on its git pin (different local rev).
+[patch."https://github.com/tracel-ai/cubecl"]
+cubecl = { path = "vendor/cubecl/crates/cubecl" }
+cubecl-common = { path = "vendor/cubecl/crates/cubecl-common" }
+cubecl-core = { path = "vendor/cubecl/crates/cubecl-core" }
+cubecl-cpp = { path = "vendor/cubecl/crates/cubecl-cpp" }
+cubecl-cpu = { path = "vendor/cubecl/crates/cubecl-cpu" }
+cubecl-cuda = { path = "vendor/cubecl/crates/cubecl-cuda" }
+cubecl-hip = { path = "vendor/cubecl/crates/cubecl-hip" }
+cubecl-ir = { path = "vendor/cubecl/crates/cubecl-ir" }
+cubecl-macros = { path = "vendor/cubecl/crates/cubecl-macros" }
+cubecl-macros-internal = { path = "vendor/cubecl/crates/cubecl-macros-internal" }
+cubecl-opt = { path = "vendor/cubecl/crates/cubecl-opt" }
+cubecl-runtime = { path = "vendor/cubecl/crates/cubecl-runtime" }
+cubecl-std = { path = "vendor/cubecl/crates/cubecl-std" }
+cubecl-wgpu = { path = "vendor/cubecl/crates/cubecl-wgpu" }
+cubecl-zspace = { path = "vendor/cubecl/crates/cubecl-zspace" }
+
+# Local patched cubek (CUDA-graph device-seed RNG, component C3 / Phase 3). vendor/cubek is a copy
+# of the pinned rev 1161040 — identical source plus the additive device-seed-buffer prng path — so this
+# is a no-op rebuild for every cubek crate except cubek-random's new seed-buffer code. cubek's own
+# `cubecl` git dep is itself redirected by the cubecl [patch] above, so the whole stack stays on the
+# single local cubecl checkout.
+[patch."https://github.com/tracel-ai/cubek"]
+cubek = { path = "vendor/cubek/crates/cubek" }
+cubek-attention = { path = "vendor/cubek/crates/cubek-attention" }
+cubek-convolution = { path = "vendor/cubek/crates/cubek-convolution" }
+cubek-matmul = { path = "vendor/cubek/crates/cubek-matmul" }
+cubek-quant = { path = "vendor/cubek/crates/cubek-quant" }
+cubek-random = { path = "vendor/cubek/crates/cubek-random" }
+cubek-reduce = { path = "vendor/cubek/crates/cubek-reduce" }
