@@ -1,0 +1,17 @@
+[package]
+authors = []
+name = "gelu"
+publish = false
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[features]
+default = []
+wgpu = ["cubecl/wgpu"]
+cuda = ["cubecl/cuda"]
+cpu = ["cubecl/cpu"]
+
+[dependencies]
+cubecl = { path = "../../crates/cubecl", version = "=0.10.0-pre.1" }
+half = { workspace = true }

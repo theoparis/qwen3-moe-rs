@@ -1,0 +1,77 @@
+use cubecl;
+use cubecl::ir::DeviceProperties;
+use cubecl::prelude::*;
+use cubecl::std::{CubeOption, tensor::r#virtual::VirtualTensor};
+
+use crate::components::global::GlobalAttentionConfig;
+use crate::definition::{
+    AttentionBlueprint, AttentionElems, AttentionPrecision, AttentionSetupError, CubeCountInput,
+    InputRuntimeArg, OutputRuntimeArg,
+};
+use crate::definition::{CubeCountInputArgs, attention_types::*};
+use crate::launch::AttentionArgs;
+use std::{fmt::Debug, hash::Hash};
+
+/// A family of [BatchAttention] implementations that operate with any [precision](AttentionPrecision).
+pub trait BatchAttentionFamily: Send + Sync + 'static {
+    /// The specific [BatchAttention] implementation associated with this family.
+    type Attention<AP: AttentionPrecision>: BatchAttention<AP, Config = Self::Config>;
+
+    /// The configuration type associated with this Attention family.
+    type Config: BatchAttentionConfig;
+    type Blueprint;
+
+    /// Entry point
+    ///
+    /// # Safety
+    ///
+    /// Out-of-bounds can happen
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn launch_unchecked<'a, AA: AttentionArgs, R: Runtime>(
+        client: &ComputeClient<R>,
+        cube_dim: CubeDim,
+        cube_count: CubeCount,
+        address_type: AddressType,
+        input: InputRuntimeArg<'a, AA, R>,
+        output: OutputRuntimeArg<'a, AA, R>,
+        cube_count_input: CubeCountInputArgs<'a, R>,
+        dtypes: &AttentionElems,
+        attention_blueprint: Self::Blueprint,
+    ) -> Result<(), LaunchError>;
+
+    /// Constructs the configuration based on the algorithm's blueprint.
+    ///
+    /// This function may return an error if the configuration cannot be supported.
+    fn expand_config(
+        device_props: &DeviceProperties,
+        blueprint: AttentionBlueprint,
+        dtypes: &AttentionElems,
+    ) -> Result<Self::Config, AttentionSetupError>;
+}
+
+#[cube]
+pub trait BatchAttention<AP: AttentionPrecision>: 'static + Send + Sync {
+    /// The configuration type associated with this Attention.
+    type Config: BatchAttentionConfig;
+
+    fn execute(
+        query: VirtualTensor<QG<AP>>,
+        key: VirtualTensor<KG<AP>>,
+        value: VirtualTensor<VG<AP>>,
+        mask: CubeOption<VirtualTensor<MSK<AP>>>,
+        out: VirtualTensor<OG<AP>, ReadWrite>,
+        cube_count_args: CubeCountInput,
+        #[comptime] config: Self::Config,
+    );
+}
+
+/// Configuration for the Batch Attention level
+pub trait BatchAttentionConfig:
+    Copy + Clone + Eq + PartialEq + Hash + Debug + Send + Sync + 'static
+{
+    type GlobalConfig: GlobalAttentionConfig;
+
+    fn global_config(&self) -> Self::GlobalConfig;
+
+    fn cube_dim(&self) -> CubeDim;
+}

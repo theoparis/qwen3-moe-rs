@@ -1,0 +1,10 @@
+[book]
+authors = [
+    "Nathaniel Simard",
+]
+language = "en"
+src = "src"
+title = "The CubeCL Book 🧊"
+
+[output.html]
+mathjax-support = true

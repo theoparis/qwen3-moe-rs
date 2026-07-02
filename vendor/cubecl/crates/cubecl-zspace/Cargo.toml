@@ -1,0 +1,31 @@
+[package]
+authors = [
+    "nathanielsimard <nathaniel.simard.42@gmail.com>",
+    "louisfd <louisfd94@gmail.com>",
+    "maxtremblay <t.maxime@pm.me>",
+    "crutcher <crutcher@gmail.com>",
+]
+categories = ["science", "mathematics", "algorithms"]
+description = "CubeCL ZSpace Library."
+keywords = []
+name = "cubecl-zspace"
+
+edition.workspace = true
+license.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+
+[lints]
+workspace = true
+
+
+[features]
+default = []
+std = []
+
+[dependencies]
+derive-new = { workspace = true }
+serde = { workspace = true }
+smallvec = { workspace = true, features = ["serde"] }
