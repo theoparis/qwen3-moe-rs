@@ -95,7 +95,7 @@ mod cache;
 pub mod capture;
 /// Typed, safe wrapper around the Burn-Fusion custom-op bridge (CUDA only). Foundation for the
 /// custom CubeCL kernels (fp8 GEMM, MoE grouped-GEMM); enforces the §0b production rules.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal-fusion-diag"))]
 pub mod cube_custom_op;
 #[cfg(feature = "cubecl-gpu")]
 pub(crate) mod cubecl_rt;
@@ -105,9 +105,14 @@ pub mod expert_stream;
 /// Validated on the GB10 vs an NdArray CPU oracle (see `examples/attn_kernel_spike.rs`).
 #[cfg(feature = "cuda")]
 pub mod flash_attn;
-/// L2A.2 split-K online-softmax flash-decode (raw CubeBackend, capture-ready). CUDA only.
-#[cfg(feature = "cuda")]
+/// L2A.2 split-K online-softmax flash-decode (raw CubeBackend, capture-ready). Backend-generic:
+/// runs on any CubeCL GPU backend (CUDA, Metal, Vulkan, portable wgpu).
+#[cfg(feature = "cubecl-gpu")]
 pub mod flash_decode;
+/// Fused CubeCL kernel for the Gated DeltaNet (GDN) single-token decode inner loop.
+/// Replaces ~45 separate Metal/Wgpu dispatches per GDN layer with one GPU kernel call.
+#[cfg(feature = "cubecl-gpu")]
+pub mod gdn_kernel;
 pub mod grpo;
 mod linear2d;
 pub mod load;
@@ -126,6 +131,7 @@ pub mod moe_decode;
 pub mod moe_grouped;
 /// L2C NVFP4 host codec plus CubeCL decode-GEMV / fused MoE kernels (CUDA and wgpu/Metal/Vulkan).
 pub mod nvfp4;
+pub mod nvfp4_blob;
 #[cfg(feature = "cubecl-gpu")]
 mod nvfp4_kernels;
 pub mod nvfp4_linear;

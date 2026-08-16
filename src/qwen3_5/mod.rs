@@ -42,9 +42,6 @@ pub trait Qwen3_5DenseQuantBackend {}
 #[cfg(not(feature = "cuda"))]
 impl Qwen3_5DenseQuantBackend for () {}
 
-#[cfg(feature = "cuda")]
-const FLASH_MIN_CTX: usize = 1024;
-
 #[cfg(feature = "cubecl-gpu")]
 const QWEN35_FUSED_MOE_MAX_T: usize = 16;
 
@@ -62,13 +59,84 @@ fn qwen35_fused_moe_enabled() -> bool {
     QWEN35_FUSED_MOE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cubecl-gpu")]
+static QWEN35_FUSED_GDN_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+#[cfg(feature = "cubecl-gpu")]
+pub fn set_qwen35_fused_gdn_enabled(enabled: bool) {
+    QWEN35_FUSED_GDN_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(feature = "cubecl-gpu")]
+fn qwen35_fused_gdn_enabled() -> bool {
+    if let Ok(val) = std::env::var("QWEN35_FUSED_GDN") {
+        return val != "0" && val != "false";
+    }
+    QWEN35_FUSED_GDN_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(feature = "cubecl-gpu")]
 fn flash_decode_n_splits(sk: usize) -> usize {
     if sk < 1024 {
         1
     } else {
         sk.div_ceil(512).clamp(1, 32)
     }
+}
+
+/// Numerically stable softmax + top-k on the host, lowest expert id on ties.
+fn host_softmax_topk(
+    logits: &[f32],
+    tokens: usize,
+    num_experts: usize,
+    top_k: usize,
+    norm_topk_prob: bool,
+) -> (Vec<i64>, Vec<f32>) {
+    assert_eq!(logits.len(), tokens * num_experts);
+    let mut sel_idx = Vec::with_capacity(tokens * top_k);
+    let mut sel_w = Vec::with_capacity(tokens * top_k);
+    for tok in 0..tokens {
+        let row = &logits[tok * num_experts..(tok + 1) * num_experts];
+        let mut max_l = f32::NEG_INFINITY;
+        for &l in row {
+            if l > max_l {
+                max_l = l;
+            }
+        }
+        let mut exp_sum = 0.0f32;
+        let mut probs: Vec<(usize, f32)> = row
+            .iter()
+            .enumerate()
+            .map(|(i, &l)| {
+                let e = (l - max_l).exp();
+                exp_sum += e;
+                (i, e)
+            })
+            .collect();
+        for p in &mut probs {
+            p.1 /= exp_sum;
+        }
+        probs.sort_by(|a, b| match b.1.partial_cmp(&a.1) {
+            Some(std::cmp::Ordering::Equal) | None => a.0.cmp(&b.0),
+            Some(ord) => ord,
+        });
+        probs.truncate(top_k);
+        let mut wsum = 0.0f32;
+        for (_, w) in &probs {
+            wsum += *w;
+        }
+        let wsum_inv = if norm_topk_prob && wsum > 1e-20 {
+            1.0 / wsum
+        } else {
+            1.0
+        };
+        for (i, w) in probs {
+            sel_idx.push(i as i64);
+            sel_w.push(w * wsum_inv);
+        }
+    }
+    (sel_idx, sel_w)
 }
 
 #[derive(Clone, Debug)]
@@ -1458,18 +1526,33 @@ impl Qwen3_5SharedMoeBlock {
             self.route_topk(hidden_states.clone(), top_k)
         });
         let idx_host: Vec<i64> = timed(&profile::ROUTER, &device, || {
-            sel_idx
-                .cast(DType::I64)
-                .into_data()
-                .to_vec()
-                .expect("read Qwen3.5 MoE route ids (streamed)")
+            if profile::cpu_time_enabled() {
+                let _tpre = std::time::Instant::now();
+                let _ = device.sync();
+                let drain_ns = _tpre.elapsed().as_nanos() as u64;
+                let _trb = std::time::Instant::now();
+                let v = sel_idx
+                    .cast(DType::I64)
+                    .into_data()
+                    .to_vec()
+                    .expect("read Qwen3.5 MoE route ids (streamed)");
+                profile::add(&profile::CPU_ROUTE_RB, _trb.elapsed().as_nanos() as u64);
+                profile::add(&profile::CPU_ROUTE_DRAIN, drain_ns);
+                v
+            } else {
+                sel_idx
+                    .cast(DType::I64)
+                    .into_data()
+                    .to_vec()
+                    .expect("read Qwen3.5 MoE route ids (streamed)")
+            }
         });
         // `sel_idx` must come to the host -- the CPU issues the disk reads, so it has to know which
         // experts were routed. `sel_w` must NOT: it was previously downloaded only to be sliced per
         // expert and re-uploaded, costing a second full device->host round trip per layer (~680 forced
         // GPU syncs per 16-token run). Instead keep it resident and gather from it on-device with the
         // flat `tok * top_k + slot` offsets, which we already know host-side from `idx_host`.
-        let sel_w_flat = sel_w.reshape([tokens * top_k]);
+        let sel_w_flat = sel_w.clone().reshape([tokens * top_k]);
         let mut by_expert: Vec<(Vec<i64>, Vec<i64>)> = vec![(Vec::new(), Vec::new()); num_experts];
         for tok in 0..tokens {
             for slot in 0..top_k {
@@ -1486,35 +1569,227 @@ impl Qwen3_5SharedMoeBlock {
         let distinct_experts: Vec<usize> = (0..num_experts)
             .filter(|&e| !by_expert[e].0.is_empty())
             .collect();
-        timed(&profile::MOE_PREFETCH, &device, || {
-            pool.prefetch_layer(layer_idx, &distinct_experts, &device)
-                .expect("streamed prefetch_layer")
+        // Hit-first execution (ported from turbo-fieldfare's DEC-18, ~14% win there): classify hits
+        // vs misses and, for the offline blob store, start reading misses on a background thread
+        // pool without blocking. Cache hits dispatch on the GPU immediately below while those reads
+        // are still in flight, instead of the whole layer waiting on I/O before any GEMV runs.
+        let hits: Vec<usize> = timed(&profile::MOE_PREFETCH, &device, || {
+            pool.prefetch_layer_begin(layer_idx, &distinct_experts, &device)
+                .expect("streamed prefetch_layer_begin")
         });
 
         let x2 = hidden_states.clone().reshape([tokens, hidden]);
         let mut routed = Tensor::<2>::zeros([tokens, hidden], &device);
-        for expert in 0..num_experts {
-            let (tok_ids, weight_offsets) = &by_expert[expert];
-            if tok_ids.is_empty() {
-                continue;
+        if tokens == 1 {
+            // OFF BY DEFAULT (opt in with QWEN35_STREAM_2KERNEL=1): despite being the "fused fast
+            // path", this measures SLOWER than the sequential fallback below (1.41 vs 1.78 tok/s on
+            // M2 Pro / Qwen3.6-35B). Two reasons, both structural:
+            //   1. It `Tensor::cat`s the top_k experts' packed weights into a fresh [k,N,K/2] stack
+            //      on every layer of every token -- ~13.5 MB per layer per token, ~11 GB of pure
+            //      device memcpy plus ~1.7k transient allocations over a 16-token run. The kernel
+            //      already accepts an `assign_e` index tensor, so this copy only exists because the
+            //      pool stores each slot as an independent tensor rather than as slices of one
+            //      contiguous slab.
+            //   2. It must `prefetch_layer_finish` up front (all experts resident before the single
+            //      fused launch), which forfeits the hit-first I/O overlap the fallback gets.
+            // Making this genuinely fast needs the pool to own a pre-stacked slab; until then the
+            // fallback wins.
+            #[cfg(feature = "cubecl-gpu")]
+            if crate::expert_stream::stream_nvfp4()
+                && std::env::var("QWEN35_STREAM_2KERNEL").ok().as_deref() == Some("1")
+            {
+                // Fused 2-Kernel grouped MoE path (matching turbo-fieldfare):
+                // Finish background prefetch so all 8 routed experts are resident in the pool.
+                timed(&profile::MOE_PREFETCH, &device, || {
+                    pool.prefetch_layer_finish(&device)
+                        .expect("streamed prefetch_layer_finish")
+                });
+
+                let mut q_gu_vec = Vec::with_capacity(top_k);
+                let mut bs_gu_vec = Vec::with_capacity(top_k);
+                let mut gs_gu_f32 = Vec::with_capacity(top_k * 2);
+                let mut q_dn_vec = Vec::with_capacity(top_k);
+                let mut bs_dn_vec = Vec::with_capacity(top_k);
+                let mut gs_dn_f32 = Vec::with_capacity(top_k);
+
+                for slot in 0..top_k {
+                    let expert = idx_host[slot] as usize;
+                    let gu_lin = pool
+                        .gate_up_nvfp4(layer_idx, expert, &device)
+                        .expect("fetch gate_up_nvfp4 for 2-kernel MoE");
+                    let dn_lin = pool
+                        .down_nvfp4(layer_idx, expert, &device)
+                        .expect("fetch down_nvfp4 for 2-kernel MoE");
+
+                    q_gu_vec.push(gu_lin.qw().clone().unsqueeze::<3>());
+                    bs_gu_vec.push(gu_lin.bs().clone().unsqueeze::<3>());
+                    let gs_val = gu_lin.gscale_f32();
+                    gs_gu_f32.push(gs_val);
+                    gs_gu_f32.push(gs_val); // gate + up share the same gscale
+
+                    q_dn_vec.push(dn_lin.qw().clone().unsqueeze::<3>());
+                    bs_dn_vec.push(dn_lin.bs().clone().unsqueeze::<3>());
+                    let gs_dn_val = dn_lin.gscale_f32();
+                    gs_dn_f32.push(gs_dn_val);
+                }
+
+                let q_gu_3d = Tensor::cat(q_gu_vec, 0);
+                let bs_gu_3d = Tensor::cat(bs_gu_vec, 0);
+                let gscale_gu_2d =
+                    Tensor::<2>::from_data(TensorData::new(gs_gu_f32, [top_k, 2]), &device);
+                let q_dn_3d = Tensor::cat(q_dn_vec, 0);
+                let bs_dn_3d = Tensor::cat(bs_dn_vec, 0);
+                let gscale_dn_1d =
+                    Tensor::<1>::from_data(TensorData::new(gs_dn_f32, [top_k]), &device);
+                let assign_e = Tensor::<1, Int>::from_data(
+                    TensorData::new((0..top_k as i64).collect::<Vec<_>>(), [top_k]),
+                    &device,
+                );
+                let sel_w_1d = sel_w.clone().reshape([top_k]);
+
+                let inner = q_gu_3d.dims()[1] / 2; // N of gate_up is 2 * inner
+                let out = timed(&profile::MOE_EXPERTS, &device, || {
+                    crate::nvfp4_kernels::fused_moe_2kernel_nvfp4(
+                        x2.clone().cast(DType::F32),
+                        q_gu_3d,
+                        bs_gu_3d,
+                        gscale_gu_2d,
+                        q_dn_3d,
+                        bs_dn_3d,
+                        gscale_dn_1d,
+                        assign_e,
+                        sel_w_1d,
+                        hidden,
+                        inner,
+                        top_k,
+                        1,
+                    )
+                });
+                routed = out;
+            } else {
+                // Fallback sequential path
+                let x2_f32 = x2;
+                // Dispatch hits first so GEMVs overlap miss I/O, but fold in expert-id
+                // order. Hit/miss order is cache-dependent; adding in that order made
+                // greedy decode non-deterministic across runs.
+                let mut contribs: Vec<Option<Tensor<2>>> = vec![None; num_experts];
+                for &expert in &hits {
+                    let slot = by_expert[expert].1[0] as usize;
+                    let w = sel_w.clone().slice([0..1, slot..(slot + 1)]);
+                    let y_e = timed(&profile::MOE_EXPERTS, &device, || {
+                        pool.expert_forward(layer_idx, expert, x2_f32.clone(), prec, &device)
+                            .expect("streamed expert_forward")
+                    });
+                    contribs[expert] = Some(y_e * w);
+                }
+                timed(&profile::MOE_PREFETCH, &device, || {
+                    pool.prefetch_layer_finish(&device)
+                        .expect("streamed prefetch_layer_finish")
+                });
+                for &expert in &distinct_experts {
+                    if contribs[expert].is_none() {
+                        let slot = by_expert[expert].1[0] as usize;
+                        let w = sel_w.clone().slice([0..1, slot..(slot + 1)]);
+                        let y_e = timed(&profile::MOE_EXPERTS, &device, || {
+                            pool.expert_forward(layer_idx, expert, x2_f32.clone(), prec, &device)
+                                .expect("streamed expert_forward")
+                        });
+                        contribs[expert] = Some(y_e * w);
+                    }
+                }
+                for &expert in &distinct_experts {
+                    let contrib = contribs[expert].take().expect("routed expert contrib");
+                    routed = timed(&profile::MOE_SCATTER, &device, || routed + contrib);
+                }
             }
-            let n = tok_ids.len();
-            let tok_idx = Tensor::<1, Int>::from_data(tok_ids.as_slice(), &device);
-            let w = sel_w_flat
-                .clone()
-                .select(
-                    0,
-                    Tensor::<1, Int>::from_data(weight_offsets.as_slice(), &device),
-                )
-                .reshape([n, 1]);
-            let x_e = x2.clone().select(0, tok_idx.clone());
-            let y_e = timed(&profile::MOE_EXPERTS, &device, || {
-                pool.expert_forward(layer_idx, expert, x_e, prec, &device)
-                    .expect("streamed expert_forward")
+            #[cfg(not(feature = "cubecl-gpu"))]
+            {
+                let x2_f32 = x2;
+                // Dispatch hits first so GEMVs overlap miss I/O, but fold in expert-id
+                // order. Hit/miss order is cache-dependent; adding in that order made
+                // greedy decode non-deterministic across runs.
+                let mut contribs: Vec<Option<Tensor<2>>> = vec![None; num_experts];
+                for &expert in &hits {
+                    let slot = by_expert[expert].1[0] as usize;
+                    let w = sel_w.clone().slice([0..1, slot..(slot + 1)]);
+                    let y_e = timed(&profile::MOE_EXPERTS, &device, || {
+                        pool.expert_forward(layer_idx, expert, x2_f32.clone(), prec, &device)
+                            .expect("streamed expert_forward")
+                    });
+                    contribs[expert] = Some(y_e * w);
+                }
+                timed(&profile::MOE_PREFETCH, &device, || {
+                    pool.prefetch_layer_finish(&device)
+                        .expect("streamed prefetch_layer_finish")
+                });
+                for &expert in &distinct_experts {
+                    if contribs[expert].is_none() {
+                        let slot = by_expert[expert].1[0] as usize;
+                        let w = sel_w.clone().slice([0..1, slot..(slot + 1)]);
+                        let y_e = timed(&profile::MOE_EXPERTS, &device, || {
+                            pool.expert_forward(layer_idx, expert, x2_f32.clone(), prec, &device)
+                                .expect("streamed expert_forward")
+                        });
+                        contribs[expert] = Some(y_e * w);
+                    }
+                }
+                for &expert in &distinct_experts {
+                    let contrib = contribs[expert].take().expect("routed expert contrib");
+                    routed = timed(&profile::MOE_SCATTER, &device, || routed + contrib);
+                }
+            }
+        } else {
+            let run_expert =
+                |routed: Tensor<2>, expert: usize, pool: &mut ExpertSlotPool<'_>| -> Tensor<2> {
+                    let (tok_ids, weight_offsets) = &by_expert[expert];
+                    if tok_ids.is_empty() {
+                        return routed;
+                    }
+                    let n = tok_ids.len();
+                    let tok_idx = Tensor::<1, Int>::from_data(tok_ids.as_slice(), &device);
+                    let w = sel_w_flat
+                        .clone()
+                        .select(
+                            0,
+                            Tensor::<1, Int>::from_data(weight_offsets.as_slice(), &device),
+                        )
+                        .reshape([n, 1]);
+                    let x_e = x2.clone().select(0, tok_idx.clone());
+                    let y_e = timed(&profile::MOE_EXPERTS, &device, || {
+                        pool.expert_forward(layer_idx, expert, x_e, prec, &device)
+                            .expect("streamed expert_forward")
+                    });
+                    timed(&profile::MOE_SCATTER, &device, || {
+                        routed.select_assign(0, tok_idx, y_e * w, IndexingUpdateOp::Add)
+                    })
+                };
+            // Hits first for I/O overlap, then fold select_assign in expert-id order so
+            // FP add order does not depend on the LRU hit set.
+            let mut pending: Vec<Option<Tensor<2>>> = vec![None; num_experts];
+            for &expert in &hits {
+                pending[expert] = Some(run_expert(
+                    Tensor::<2>::zeros([tokens, hidden], &device),
+                    expert,
+                    pool,
+                ));
+            }
+            timed(&profile::MOE_PREFETCH, &device, || {
+                pool.prefetch_layer_finish(&device)
+                    .expect("streamed prefetch_layer_finish")
             });
-            routed = timed(&profile::MOE_SCATTER, &device, || {
-                routed.select_assign(0, tok_idx, y_e * w, IndexingUpdateOp::Add)
-            });
+            for &expert in &distinct_experts {
+                if pending[expert].is_none() {
+                    pending[expert] = Some(run_expert(
+                        Tensor::<2>::zeros([tokens, hidden], &device),
+                        expert,
+                        pool,
+                    ));
+                }
+            }
+            for &expert in &distinct_experts {
+                let part = pending[expert].take().expect("routed expert contrib");
+                routed = timed(&profile::MOE_SCATTER, &device, || routed + part);
+            }
         }
 
         // When the per-expert sync is disabled (QWEN35_STREAM_SYNC=0), still bound the in-flight
@@ -1541,41 +1816,21 @@ impl Qwen3_5SharedMoeBlock {
         let [batch, seq_len, _hidden] = hidden_states.dims();
         let tokens = batch * seq_len;
         let num_experts = self.gate.weight.val().dims()[1];
-        let logits =
-            linear3(&self.gate, hidden_states, Precision::F32).reshape([tokens, num_experts]);
-        let probs = softmax(logits.cast(DType::F32), 1);
-        let (sel_idx, sel_w) = self.topk_select(probs, tokens, top_k);
-        (Tensor::cat(sel_idx, 1), Tensor::cat(sel_w, 1))
-    }
+        let device = hidden_states.device();
 
-    fn topk_select(
-        &self,
-        probs: Tensor<2>,
-        tokens: usize,
-        top_k: usize,
-    ) -> (Vec<Tensor<2, Int>>, Vec<Tensor<2>>) {
-        let device = probs.device();
-        let mut masked = probs;
-        let mut sel_idx = Vec::with_capacity(top_k);
-        let mut sel_w = Vec::with_capacity(top_k);
-        for _ in 0..top_k {
-            let idx = masked.clone().argmax(1);
-            let w = masked.clone().gather(1, idx.clone());
-            let neg = Tensor::<2>::full([tokens, 1], -1.0e30, &device);
-            masked = masked.scatter(1, idx.clone(), neg, IndexingUpdateOp::Add);
-            sel_idx.push(idx);
-            sel_w.push(w);
-        }
-        if self.norm_topk_prob {
-            let mut wsum = sel_w[0].clone();
-            for w in sel_w.iter().skip(1) {
-                wsum = wsum + w.clone();
-            }
-            let wsum = wsum.clamp_min(1e-20);
-            for w in sel_w.iter_mut() {
-                *w = w.clone() / wsum.clone();
-            }
-        }
+        // Host softmax + top-k for every token count. GPU argmax over the 256-way gate is not
+        // run-to-run stable on Metal (autotuned reduce / ties); one expert flip in prefill
+        // diverges the greedy continuation. The gate is tiny (tokens×256), so the download
+        // is cheaper than 8 GPU argmax/scatter launches anyway.
+        let logits = linear3(&self.gate, hidden_states, Precision::F32)
+            .reshape([tokens, num_experts])
+            .cast(DType::F32);
+        let logits_vec: Vec<f32> = logits.into_data().to_vec().expect("read router logits");
+        let (sel_idx_vec, sel_w_vec) =
+            host_softmax_topk(&logits_vec, tokens, num_experts, top_k, self.norm_topk_prob);
+        let sel_idx =
+            Tensor::<2, Int>::from_data(TensorData::new(sel_idx_vec, [tokens, top_k]), &device);
+        let sel_w = Tensor::<2>::from_data(TensorData::new(sel_w_vec, [tokens, top_k]), &device);
         (sel_idx, sel_w)
     }
 
@@ -2177,6 +2432,47 @@ pub mod profile {
         LM_HEAD
     );
 
+    // Host-side ENQUEUE-time counters (no device sync), gated by QWEN35_CPU_TIME=1. They show
+    // how long the CPU spends building/dispatching work -- when this rivals wall-clock decode
+    // time, the host, not the GPU, is the bottleneck.
+    pub static CPU_GDN_PROJ: AtomicU64 = AtomicU64::new(0);
+    pub static CPU_GDN_CONV: AtomicU64 = AtomicU64::new(0);
+    pub static CPU_GDN_SPLIT: AtomicU64 = AtomicU64::new(0);
+    pub static CPU_GDN_GATE: AtomicU64 = AtomicU64::new(0);
+    pub static CPU_GDN_STATE: AtomicU64 = AtomicU64::new(0);
+    pub static CPU_GDN_OUT: AtomicU64 = AtomicU64::new(0);
+    pub static CPU_ROUTE_RB: AtomicU64 = AtomicU64::new(0);
+    pub static CPU_ROUTE_DRAIN: AtomicU64 = AtomicU64::new(0);
+
+    pub fn cpu_time_enabled() -> bool {
+        std::env::var("QWEN35_CPU_TIME").ok().as_deref() == Some("1")
+    }
+
+    pub fn cpu_report() -> String {
+        let rows = vec![
+            ("CPU_GDN_PROJ", CPU_GDN_PROJ.load(Ordering::Relaxed)),
+            ("CPU_GDN_CONV", CPU_GDN_CONV.load(Ordering::Relaxed)),
+            ("CPU_GDN_SPLIT", CPU_GDN_SPLIT.load(Ordering::Relaxed)),
+            ("CPU_GDN_GATE", CPU_GDN_GATE.load(Ordering::Relaxed)),
+            ("CPU_GDN_STATE", CPU_GDN_STATE.load(Ordering::Relaxed)),
+            ("CPU_GDN_OUT", CPU_GDN_OUT.load(Ordering::Relaxed)),
+            ("CPU_ROUTE_RB", CPU_ROUTE_RB.load(Ordering::Relaxed)),
+            ("CPU_ROUTE_DRAIN", CPU_ROUTE_DRAIN.load(Ordering::Relaxed)),
+        ];
+        let mut out = String::from(
+            "host enqueue profile (no device sync):
+",
+        );
+        for (label, ns) in rows {
+            out.push_str(&format!(
+                "    {label:14} {:8.2}s
+",
+                ns as f64 / 1e9
+            ));
+        }
+        out
+    }
+
     pub fn init_from_env() {
         ENABLED.store(
             std::env::var("QWEN35_PROFILE").ok().as_deref() == Some("1"),
@@ -2561,6 +2857,14 @@ impl Qwen3_5GdnAttention {
     ) -> Tensor<3> {
         let [batch_size, seq_len, hidden_size] = hidden_states.dims();
         debug_assert_eq!(seq_len, 1, "GDN recurrent decode expects [B, 1, H]");
+        let ct = profile::cpu_time_enabled();
+        macro_rules! cpu_t {
+            ($ctr:expr, $t0:expr) => {
+                if ct {
+                    profile::add(&$ctr, $t0.elapsed().as_nanos() as u64);
+                }
+            };
+        }
         // Output the residual-stream dtype (F32 on the real model), NOT `prec` — `residual + gdn_out`
         // must match. The recurrence is f32 internally; the out_proj (linear3) is F32; cast to this.
         let out_dtype = hidden_states.dtype();
@@ -2577,6 +2881,7 @@ impl Qwen3_5GdnAttention {
         debug_assert_eq!(value_head_dim, cache.value_dim);
         debug_assert_eq!(qkv_dim, cache.qkv_dim);
 
+        let _tp = std::time::Instant::now();
         let qkv_unconv = ql3(
             &self.in_proj_qkv_fp8,
             &self.in_proj_qkv,
@@ -2604,10 +2909,94 @@ impl Qwen3_5GdnAttention {
         let in_b = ql3(&self.in_proj_b_fp8, &self.in_proj_b, hidden_states, prec)
             .reshape([batch_size, num_value_heads])
             .cast(DType::F32);
+        cpu_t!(profile::CPU_GDN_PROJ, _tp);
 
+        let _tc = std::time::Instant::now();
         let device = qkv_unconv.device();
         let dtype = qkv_unconv.dtype();
         cache.ensure_allocated(batch_size, &device, dtype);
+
+        // `value_head_dim % 32 == 0` is a hard precondition of `gdn_state_gate` (its threadgroup is
+        // one warp wide per value head), asserted host-side inside the launch. Check it here instead
+        // of panicking: toy/test configs (value_head_dim 8) must fall through to the unfused path.
+        #[cfg(feature = "cubecl-gpu")]
+        if qwen35_fused_gdn_enabled()
+            && batch_size == 1
+            && value_head_dim % 32 == 0
+            && matches!(write_mode, GdnStateWriteMode::Functional)
+        {
+            let conv_weight = self
+                .conv1d
+                .weight
+                .val()
+                .cast(DType::F32)
+                .reshape([qkv_dim, cache.kernel_dim]);
+            let conv_hist = cache
+                .conv
+                .as_ref()
+                .expect("GDN conv cache must be allocated")
+                .clone();
+            let prev_state = cache
+                .state
+                .take()
+                .unwrap_or_else(|| {
+                    Tensor::<4>::zeros(
+                        [batch_size, num_value_heads, key_head_dim, value_head_dim],
+                        &device,
+                    )
+                })
+                .cast(DType::F32);
+            let dt_bias = self
+                .dt_bias
+                .val()
+                .cast(DType::F32)
+                .reshape([num_value_heads]);
+            let a_log = self.A_log.val().cast(DType::F32).reshape([num_value_heads]);
+            let norm_w = self
+                .norm
+                .gamma
+                .val()
+                .cast(DType::F32)
+                .reshape([value_head_dim]);
+
+            let sh = crate::gdn_kernel::GdnShape {
+                batch: batch_size,
+                qkv_dim,
+                num_value_heads,
+                num_key_heads,
+                key_head_dim,
+                value_head_dim,
+                kernel_size: cache.kernel_dim,
+                epsilon: self.norm.epsilon as f32,
+            };
+
+            let (o_gated, new_state, new_hist) = crate::gdn_kernel::gdn_step_fused(
+                qkv_unconv,
+                z,
+                in_a,
+                in_b,
+                conv_hist,
+                conv_weight,
+                dt_bias,
+                a_log,
+                norm_w,
+                prev_state,
+                sh,
+            );
+
+            cache.conv = Some(new_hist);
+            cache.set_state(new_state);
+            cpu_t!(profile::CPU_GDN_CONV, _tc);
+
+            let out = o_gated.reshape([batch_size, 1, value_dim_total]);
+            let out = ql3(&self.out_proj_fp8, &self.out_proj, out, prec).reshape([
+                batch_size,
+                1,
+                hidden_size,
+            ]);
+            return out.cast(out_dtype);
+        }
+
         let history = cache
             .conv
             .as_ref()
@@ -2647,6 +3036,8 @@ impl Qwen3_5GdnAttention {
             }
         }
         let qkv_silu = silu(qkv_conv).cast(DType::F32);
+        cpu_t!(profile::CPU_GDN_CONV, _tc);
+        let _ts = std::time::Instant::now();
 
         // qwen3_5_moe Qwen3_5MoeGatedDeltaNet splits the post-conv mixed_qkv with a FLAT block split
         // `torch.split(mixed_qkv, [key_dim, key_dim, value_dim], dim=-1)` then reshapes each block to
@@ -2687,6 +3078,8 @@ impl Qwen3_5GdnAttention {
             .unsqueeze_dim::<4>(2)
             .repeat(&[1, 1, num_value_heads / num_key_heads, 1])
             .reshape([batch_size, num_value_heads, key_head_dim]);
+        cpu_t!(profile::CPU_GDN_SPLIT, _ts);
+        let _tg = std::time::Instant::now();
 
         let dt = in_a
             + self
@@ -2705,6 +3098,8 @@ impl Qwen3_5GdnAttention {
             .mul_scalar(-1.0)
             .exp();
         let b = sigmoid(in_b).cast(DType::F32);
+        cpu_t!(profile::CPU_GDN_GATE, _tg);
+        let _tr = std::time::Instant::now();
 
         let prev_state = match write_mode {
             GdnStateWriteMode::Functional => cache
@@ -2749,6 +3144,8 @@ impl Qwen3_5GdnAttention {
         let o = (new_state.clone() * q_f32.unsqueeze_dim::<4>(3))
             .sum_dim(2)
             .reshape([batch_size, num_value_heads, value_head_dim]);
+        cpu_t!(profile::CPU_GDN_STATE, _tr);
+        let _to = std::time::Instant::now();
         match write_mode {
             GdnStateWriteMode::Functional => cache.set_state(new_state),
             GdnStateWriteMode::Static => {
@@ -2776,6 +3173,7 @@ impl Qwen3_5GdnAttention {
             1,
             hidden_size,
         ]);
+        cpu_t!(profile::CPU_GDN_OUT, _to);
         out.cast(out_dtype)
     }
 
@@ -3091,9 +3489,17 @@ impl Qwen3_5FullAttention {
         let (key, value) = cache.update(key, value);
         let [_, total_seq, _, _] = key.dims();
 
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "cubecl-gpu")]
         {
-            if use_flash_decode && seq_len == 1 && total_seq >= FLASH_MIN_CTX {
+            // No minimum-context gate: flash_decode with n_splits=1 (see `flash_decode_n_splits`)
+            // is 2 dispatches total and skips the GQA-repeat materialization, which beats the
+            // unfused path's ~5 dispatches (repeat + QK matmul + softmax + PV matmul + mask) at
+            // every context length, not just long ones.
+            //
+            // `head_dim % 32 == 0` is a hard kernel precondition, not a heuristic: the split kernel
+            // partitions D strictly across the 32 lanes of a warp. Small test/toy configs (head_dim
+            // 8) must fall through to the generic path below.
+            if use_flash_decode && seq_len == 1 && head_dim % 32 == 0 {
                 let q4 = query.movedim(1, 2).cast(DType::F32);
                 let k4 = key.movedim(1, 2);
                 let v4 = value.movedim(1, 2);
@@ -3115,7 +3521,7 @@ impl Qwen3_5FullAttention {
                 .cast(out_dtype);
             }
         }
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "cubecl-gpu"))]
         let _ = use_flash_decode;
 
         let n_rep = num_heads / num_kv_heads;
@@ -3294,9 +3700,20 @@ impl Qwen3_5Model {
         let mut hidden_states = timed(&profile::EMBED, &prof_device, || {
             self.embed_tokens.forward(input_ids).cast(DType::F32)
         });
+        let cpu_time = std::env::var("QWEN35_CPU_TIME").ok().as_deref() == Some("1");
+        let mut layer_ns: Vec<u64> = if cpu_time {
+            vec![0; self.layers.len()]
+        } else {
+            Vec::new()
+        };
         for (idx, (layer, layer_cache)) in
             self.layers.iter().zip(cache.layers.iter_mut()).enumerate()
         {
+            let t0 = if cpu_time {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             hidden_states = match (layer, layer_cache) {
                 (Qwen3_5DecoderLayer::Linear(layer), Qwen3_5HybridLayerCache::Linear(cache)) => {
                     layer.forward_decoder_recurrent_streamed(hidden_states, cache, prec, pool, idx)
@@ -3317,6 +3734,33 @@ impl Qwen3_5Model {
                     panic!("Qwen3.5 hybrid cache layer {idx} is Linear but model layer is Full")
                 }
             };
+            if let Some(t0) = t0 {
+                layer_ns[idx] += t0.elapsed().as_nanos() as u64;
+            }
+        }
+        if cpu_time {
+            // NOTE: these are CPU-side enqueue times (no device.sync), so they measure how long
+            // the HOST spends building/dispatching work -- not GPU execution. Compare against
+            // wall-clock decode time to see whether the host is the bottleneck.
+            let total: u64 = layer_ns.iter().sum();
+            let gdn: u64 = layer_ns
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| matches!(self.layers[*i], Qwen3_5DecoderLayer::Linear(_)))
+                .map(|(_, ns)| *ns)
+                .sum();
+            let full: u64 = layer_ns
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| matches!(self.layers[*i], Qwen3_5DecoderLayer::Full(_)))
+                .map(|(_, ns)| *ns)
+                .sum();
+            eprintln!(
+                "[cpu-time] layers host total: {:.1} ms (GDN {:.1} ms, full-attn {:.1} ms)",
+                total as f64 / 1e6,
+                gdn as f64 / 1e6,
+                full as f64 / 1e6
+            );
         }
         timed(&profile::FINAL_NORM, &prof_device, || {
             self.norm.forward(hidden_states)

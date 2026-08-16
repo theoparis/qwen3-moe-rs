@@ -54,17 +54,28 @@ fn assert_logits_all_finite(logits: &Tensor<2>, what: &str) -> Result<(), String
 }
 
 fn argmax_last(logits: &Tensor<2>) -> Result<i64, String> {
-    assert_logits_all_finite(logits, "decode")?;
-    let ids = logits
+    // Host argmax with lowest-index ties. Metal GPU reduce is not run-to-run stable
+    // (autotuned kernels + ties); one flipped token diverges greedy decode.
+    let values = logits
         .clone()
-        .argmax(1)
-        .cast(DType::I64)
+        .cast(DType::F32)
         .into_data()
-        .to_vec::<i64>()
-        .map_err(|e| format!("read argmax token: {e:?}"))?;
-    ids.first()
-        .copied()
-        .ok_or_else(|| "argmax returned no token".to_string())
+        .to_vec::<f32>()
+        .map_err(|e| format!("read decode logits: {e:?}"))?;
+    let mut best_i = 0usize;
+    let mut best_v = f32::NEG_INFINITY;
+    for (idx, &v) in values.iter().enumerate() {
+        if v > best_v {
+            best_v = v;
+            best_i = idx;
+        }
+    }
+    if !best_v.is_finite() {
+        return Err(format!(
+            "decode logits non-finite at selected vocab index {best_i}: {best_v}"
+        ));
+    }
+    Ok(best_i as i64)
 }
 
 fn main() {
@@ -146,26 +157,147 @@ fn run() -> Result<(), String> {
     // QWEN35_STREAM_EXPERTS=1 loads only the resident core (skips the 68GB-scale routed-expert
     // stacks) and fetches each step's top-k experts on demand through an ExpertSlotPool instead —
     // see docs/MEMORY_STREAMING_PLAN.md. Falls back to the original fully-resident eager load.
-    let stream_experts = std::env::var("QWEN35_STREAM_EXPERTS").as_deref() == Ok("1");
+    let stream_experts = std::env::var("QWEN35_STREAM_EXPERTS").as_deref() != Ok("0");
+
+    // Prefer the offline-quantized resident core (`<blob>/resident_core.nvfp4`, ~1.3 GB) over the
+    // BF16 checkpoint (~3.9 GB at F16). Decode is memory-pressure bound on a 16 GB machine, and
+    // this path never materializes the dense weights at all -- quantizing after a dense load does
+    // not help, because freed tensors go back to CubeCL's memory pool rather than to the OS.
+    // QWEN35_RESIDENT_NVFP4=0 forces the old dense path.
+    #[cfg(feature = "cubecl-gpu")]
+    let resident_blob_dir: Option<PathBuf> =
+        if std::env::var("QWEN35_RESIDENT_NVFP4").as_deref() == Ok("0") {
+            None
+        } else {
+            [
+                std::env::var("QWEN35_NVFP4_BLOB_DIR")
+                    .ok()
+                    .map(PathBuf::from),
+                Some(PathBuf::from("models-nvfp4")),
+                Some(dir.join("models-nvfp4")),
+                Some(dir.clone()),
+            ]
+            .into_iter()
+            .flatten()
+            .find(|p| {
+                p.join("resident_core.nvfp4").exists() && p.join("resident_manifest.txt").exists()
+            })
+        };
+    #[cfg(not(feature = "cubecl-gpu"))]
+    let resident_blob_dir: Option<PathBuf> = None;
+
     let load_start = Instant::now();
-    let report = if stream_experts {
-        println!("loading RESIDENT CORE ONLY from {dir:?} (routed experts streamed on demand) ...");
+    let quantized_resident = resident_blob_dir.is_some();
+
+    #[cfg(feature = "cubecl-gpu")]
+    if let Some(blob_dir) = resident_blob_dir.as_ref() {
+        println!(
+            "loading QUANTIZED RESIDENT CORE from {} (NVFP4 sidecars, dense weights never allocated) ...",
+            blob_dir.display()
+        );
         model
-            .load_weights_sharded_resident_core(&dir)
-            .map_err(|e| format!("load_weights_sharded_resident_core failed: {e:?}"))?
-    } else {
-        println!("loading sharded BF16 weights from {dir:?} (eager, backend-portable path) ...");
-        model
-            .load_weights_sharded(&dir)
-            .map_err(|e| format!("load_weights_sharded failed: {e:?}"))?
-    };
-    println!(
-        "load verify: pass={}, mapped_tensors={}, params={}",
-        report.pass(),
-        report.mapped_tensors,
-        report.param_count
-    );
+            .load_weights_resident_nvfp4(blob_dir, &dir)
+            .map_err(|e| format!("load_weights_resident_nvfp4 failed: {e:?}"))?;
+    }
+
+    if !quantized_resident {
+        let report = if stream_experts {
+            println!(
+                "loading RESIDENT CORE ONLY from {dir:?} (routed experts streamed on demand) ..."
+            );
+            model
+                .load_weights_sharded_resident_core(&dir)
+                .map_err(|e| format!("load_weights_sharded_resident_core failed: {e:?}"))?
+        } else {
+            println!(
+                "loading sharded BF16 weights from {dir:?} (eager, backend-portable path) ..."
+            );
+            model
+                .load_weights_sharded(&dir)
+                .map_err(|e| format!("load_weights_sharded failed: {e:?}"))?
+        };
+        println!(
+            "load verify: pass={}, mapped_tensors={}, params={}",
+            report.pass(),
+            report.mapped_tensors,
+            report.param_count
+        );
+    }
     println!("load time: {:.1}s", load_start.elapsed().as_secs_f64());
+
+    // Pre-cast resident-core Linear weights to the compute dtype ONCE. `linear3` otherwise
+    // re-casts every weight matrix on every forward call (bf16 -> f16), which at decode meant
+    // re-casting ~1.0B params per token across the GDN layers alone. Set QWEN35_PRECAST=0 to
+    // disable and compare.
+    // Skipped entirely on the quantized-resident path: those Linears are `[1,n]` placeholders whose
+    // real weights live in NVFP4 sidecars, so casting them would be pure waste.
+    if !quantized_resident && std::env::var("QWEN35_PRECAST").as_deref() != Ok("0") {
+        let want = match prec {
+            Precision::F16 => Some(DType::F16),
+            Precision::Bf16 => Some(DType::BF16),
+            Precision::F32 => None,
+        };
+        if let Some(dt) = want {
+            let t = Instant::now();
+            let n = model.cast_resident_core_linears(dt);
+            println!(
+                "pre-cast resident-core Linears to {:?}: {} params in {:.2}s",
+                dt,
+                n,
+                t.elapsed().as_secs_f64()
+            );
+        }
+    }
+
+    // Cast the 1 GB token-embedding table off BF16. burn's Metal/wgpu embedding gather has no BF16
+    // fast path: an isolated row lookup costs 9.15 ms at BF16 vs 0.35 ms at F16 and 0.011 ms at F32
+    // (`examples/embed_dtype_probe.rs`).
+    //
+    // Default is F16, NOT the microbenchmark-fastest F32: decode here is memory-pressure bound, and
+    // F32 doubles this table to ~2 GB, which measured 3.5x SLOWER end-to-end (0.22 vs 0.84 tok/s)
+    // with every profile bucket inflating. F16 keeps BF16's footprint. QWEN35_EMBED_DTYPE=f32|f16|bf16.
+    {
+        let embed_dt = match std::env::var("QWEN35_EMBED_DTYPE").as_deref() {
+            Ok("bf16") => None,
+            Ok("f32") => Some(DType::F32),
+            _ => Some(DType::F16),
+        };
+        if let Some(dt) = embed_dt {
+            let t = Instant::now();
+            let n = model.cast_embedding(dt);
+            if n > 0 {
+                println!(
+                    "cast embedding to {:?}: {} params in {:.2}s",
+                    dt,
+                    n,
+                    t.elapsed().as_secs_f64()
+                );
+            }
+        }
+    }
+
+    // Quantize the resident core (q/k/v/o_proj, GDN projections, shared-expert MLP) to NVFP4 via
+    // sidecars, freeing the F16/bf16 weight afterward. The routed experts stream from
+    // models-nvfp4/ already; this is the resident-core half of the same idea (~6.1 GiB F16 ->
+    // ~1.5 GiB), which was previously CUDA-only (`quantize_dense_fp8`).
+    //
+    // OFF BY DEFAULT: naive round-to-nearest NVFP4 (`Nvfp4Linear::from_linear` -> plain
+    // `quantize_nvfp4`, no Hadamard rotation / MSE calibration) measurably degrades output quality
+    // on the attention/GDN projections -- this file's `fake_quant_*` helpers already use
+    // `quantize_nvfp4_mse`/`quantize_nvfp4_clip` + Hadamard rotation for exactly this reason, but
+    // that calibrated path isn't wired into the real sidecar quantizer yet. Set
+    // QWEN35_QUANTIZE_DENSE_NVFP4=1 to try it anyway (quality is currently visibly worse).
+    #[cfg(feature = "cubecl-gpu")]
+    if !quantized_resident && std::env::var("QWEN35_QUANTIZE_DENSE_NVFP4").as_deref() == Ok("1") {
+        let t = Instant::now();
+        let coverage = qwen3_burn::quant_gate::quantize_dense_nvfp4(&mut model, &[]);
+        println!(
+            "quantize_dense_nvfp4: {}/{} dense linears in {:.2}s",
+            coverage.quantized,
+            coverage.intended,
+            t.elapsed().as_secs_f64()
+        );
+    }
 
     let (prompt_u32, _) = tokenizer.encode_no_pad(&prompt)?;
     let prompt_ids: Vec<i64> = prompt_u32.iter().map(|&id| id as i64).collect();
@@ -179,19 +311,11 @@ fn run() -> Result<(), String> {
     let mut cache = model.model.new_cache_with_capacity(total);
 
     // Pool capacity, in (layer, projection, expert) slots.
-    //
-    // The previous default of 64 came from an era when (a) the LRU touch was O(capacity), and (b)
-    // slots held dense bf16 tensors, so a big pool cost a lot of memory and bought nothing. Both
-    // premises are now false: the LRU is O(1), and NVFP4 slots are ~4x smaller (~1 MB per gate_up,
-    // ~0.5 MB per down on this model). The old "hits=0 regardless of capacity" note is also no
-    // longer what the counters show.
-    //
-    // Measured on the real 68 GB checkpoint, 16 tokens, Metal / M2 Pro, identical output text:
-    //   capacity=64   -> hits=11643 misses=12029, upload=104.0s, decode=194.5s (0.08 tok/s)
-    //   capacity=4096 -> hits=19054 misses= 4618, upload= 38.4s, decode=143.4s (0.11 tok/s)
-    // i.e. 64 slots (~32 experts across ALL 40 layers) self-evicts constantly and re-pays the
-    // expensive expert repack ~2.6x more often than it needs to. 4096 slots costs roughly 3 GB of
-    // NVFP4 expert residency; lower it on a memory-tight machine, raise it if `misses` stays high.
+    // 40 layers x 8 experts x 2 projections = 640 slots per token working set.
+    // 4096 measures better than 1024 (1.83 vs 1.62 tok/s, hit rate 78% vs 67%) now that the
+    // resident core loads pre-quantized: the extra ~3 GB of slot headroom used to be cancelled out
+    // by the swap pressure a 3.9 GB F16 resident core created, which is why earlier capacity
+    // sweeps came out flat.
     let pool_capacity: usize = std::env::var("QWEN35_STREAM_POOL_CAPACITY")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -247,6 +371,9 @@ fn run() -> Result<(), String> {
             pool.resident_slots()
         );
         println!("streamed pool timing: {}", pool.timing_report());
+    }
+    if qwen3_burn::qwen3_5::profile::cpu_time_enabled() {
+        print!("{}", qwen3_burn::qwen3_5::profile::cpu_report());
     }
     if qwen3_burn::qwen3_5::profile::enabled() {
         print!("{}", qwen3_burn::qwen3_5::profile::report());

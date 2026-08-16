@@ -751,7 +751,7 @@ fn linear_mlp_by_tail_mut<'a>(
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cubecl-gpu")]
 pub fn sidecar_by_role_mut<'a>(
     m: &'a mut Qwen3_5MoeForCausalLM,
     role: &str,
@@ -777,7 +777,7 @@ pub fn sidecar_by_role_mut<'a>(
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cubecl-gpu")]
 fn sidecar_gdn_by_tail_mut<'a>(
     layer: &'a mut Qwen3_5GdnLayer,
     tail: &str,
@@ -792,7 +792,7 @@ fn sidecar_gdn_by_tail_mut<'a>(
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cubecl-gpu")]
 fn sidecar_full_by_tail_mut<'a>(
     layer: &'a mut Qwen3_5FullAttnLayer,
     tail: &str,
@@ -806,7 +806,7 @@ fn sidecar_full_by_tail_mut<'a>(
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cubecl-gpu")]
 fn sidecar_mlp_by_tail_mut<'a>(
     mlp: &'a mut Qwen3_5SharedMoeBlock,
     tail: &str,
@@ -868,6 +868,89 @@ pub fn quantize_dense_fp8(m: &mut Qwen3_5MoeForCausalLM, skip_extra: &[&str]) ->
 
     println!(
         "quantize_dense_fp8: quantized={} intended={} skipped={:?}",
+        quantized,
+        targets.len(),
+        skipped
+    );
+    QuantCoverage {
+        intended: targets.len(),
+        quantized,
+        skipped,
+        targets,
+    }
+}
+
+/// Quantize dense resident-core linears into real sidecar NVFP4 kernels, then shrink the original
+/// weight to a `[1,1]` placeholder so the memory is actually reclaimed.
+///
+/// Unlike `quantize_dense_fp8` (CUDA-only, via `W8A16Linear`/tensor-core E4M3), this runs on any
+/// `cubecl-gpu` backend (Metal/Wgpu/Vulkan/CUDA) — `Nvfp4Linear`'s GEMV kernel is already
+/// backend-generic (see `nvfp4_kernels.rs`). This is the missing half of what `docs/
+/// metal-streamed-decode-findings.md` calls out: the routed experts were already NVFP4-streamed,
+/// but the resident core (q/k/v/o_proj, GDN projections, shared-expert MLP, ...) stayed full F16/
+/// bf16, at ~6.1 GiB — most of this process's memory footprint. Call once, right after loading and
+/// any precision pre-cast, before decode.
+#[cfg(feature = "cubecl-gpu")]
+pub fn quantize_dense_nvfp4(m: &mut Qwen3_5MoeForCausalLM, skip_extra: &[&str]) -> QuantCoverage {
+    let roles = dense_linear_roles(m);
+    let mut skip = DEFAULT_DENSE_SKIP.to_vec();
+    skip.extend_from_slice(skip_extra);
+    let mut skipped = Vec::new();
+    let mut targets = Vec::new();
+
+    for role in roles {
+        if should_skip(&role, &skip) {
+            skipped.push(role);
+        } else {
+            targets.push(role);
+        }
+    }
+
+    for role in &targets {
+        let ql = {
+            let lin = linear_by_role_mut(m, role)
+                .unwrap_or_else(|| panic!("quantize_dense_nvfp4: missing Linear for role {role}"));
+            crate::nvfp4_linear::QuantLinear::Nvfp4(crate::nvfp4_linear::Nvfp4Linear::from_linear(
+                lin,
+            ))
+        };
+        let sidecar = sidecar_by_role_mut(m, role).unwrap_or_else(|| {
+            panic!("quantize_dense_nvfp4: missing sidecar for target role {role}")
+        });
+        *sidecar = Some(ql);
+
+        // Shrink the now-redundant dense weight to a `[1,N]` placeholder (same convention as the
+        // routed-expert streaming path's `set_expert_placeholders`) so its backing GPU buffer is
+        // actually freed instead of sitting alongside the new NVFP4 sidecar. Keep the real output
+        // width N (not just `[1,1]`): a few call sites (e.g. `Qwen3_5GdnAttention::forward_recurrent`
+        // reading `in_proj_qkv.weight.val().dims()[1]`) read the *shape* of `Linear.weight` for
+        // dimension bookkeeping without going through `ql3`'s sidecar dispatch.
+        let lin = linear_by_role_mut(m, role).unwrap_or_else(|| {
+            panic!("quantize_dense_nvfp4: missing Linear for role {role} (shrink pass)")
+        });
+        let device = lin.weight.device();
+        let dtype = lin.weight.val().dtype();
+        let n = lin.weight.val().dims()[1];
+        let tiny =
+            Tensor::<2>::from_data(TensorData::new(vec![0.0f32; n], [1, n]), &device).cast(dtype);
+        lin.weight = Param::initialized(ParamId::new(), tiny);
+        lin.bias = None;
+    }
+
+    let mut quantized = 0usize;
+    for role in &targets {
+        let sidecar = sidecar_by_role_mut(m, role).unwrap_or_else(|| {
+            panic!("quantize_dense_nvfp4: missing sidecar while verifying {role}")
+        });
+        assert!(
+            sidecar.is_some(),
+            "quantize_dense_nvfp4: target role {role} did not get an NVFP4 sidecar"
+        );
+        quantized += 1;
+    }
+
+    println!(
+        "quantize_dense_nvfp4: quantized={} intended={} skipped={:?}",
         quantized,
         targets.len(),
         skipped

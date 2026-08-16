@@ -28,6 +28,10 @@ fn matmul_out_in(x: Tensor<2>, weight_out_in: Tensor<2>, prec: Precision) -> Ten
             .cast(DType::BF16)
             .matmul(weight_in_out.cast(DType::BF16))
             .cast(DType::F32),
+        Precision::F16 => x
+            .cast(DType::F16)
+            .matmul(weight_in_out.cast(DType::F16))
+            .cast(DType::F32),
     }
 }
 

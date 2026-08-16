@@ -8,7 +8,7 @@ use burn::{
     nn::{Embedding, Linear, RmsNorm},
     prelude::Device,
     store::{BurnpackStore, ModuleStore, PyTorchToBurnAdapter, SafetensorsStore, TensorSnapshot},
-    tensor::{DType, Tensor},
+    tensor::{DType, Tensor, TensorData},
 };
 use rootcause::{Report, prelude::ResultExt};
 use thiserror::Error;
@@ -19,11 +19,13 @@ use crate::nvfp4_linear::{Nvfp4Linear, QuantLinear};
 use crate::nvidia_ckpt::quantize_dequantized_expert_to_fp8;
 #[cfg(feature = "cuda")]
 use crate::nvidia_ckpt::{
-    QuantGroupKind, RawTensor, ShardReader, collect_quant_groups, dense_fp8_parts_from_reader,
-    dense_fp8_role, expected_quantized_counts, expert_projection_parts_from_reader,
-    fuse_expert_nvfp4_parts, nvfp4_linear_parts_from_reader, parse_expert_base, quant_group_keys,
-    shard_index, shared_nvfp4_role,
+    QuantGroupKind, RawTensor, collect_quant_groups, dense_fp8_parts_from_reader, dense_fp8_role,
+    expected_quantized_counts, expert_projection_parts_from_reader, fuse_expert_nvfp4_parts,
+    nvfp4_linear_parts_from_reader, parse_expert_base, quant_group_keys, shared_nvfp4_role,
 };
+// Also needed by the (backend-generic) NVFP4 resident-core loader, not just the CUDA paths.
+#[cfg(feature = "cubecl-gpu")]
+use crate::nvidia_ckpt::{ShardReader, shard_index};
 #[cfg(feature = "cuda")]
 use crate::qwen3_5::{ExpertNvfp4, ExpertNvfp4Sidecar, ExpertQuantSidecar, QuantSidecar};
 use crate::qwen3_5::{
@@ -34,8 +36,6 @@ use crate::qwen3_5::{
 #[cfg(feature = "cuda")]
 use crate::w8a16_linear::W8A16Linear;
 use crate::{Qwen3ForCausalLM, Qwen3Model, Qwen3MoeForCausalLM};
-#[cfg(feature = "cuda")]
-use burn::tensor::TensorData;
 
 #[derive(Error, Debug)]
 pub enum ModelLoadError {
@@ -421,6 +421,112 @@ impl Qwen3MoeForCausalLM {
 }
 
 impl Qwen3_5MoeForCausalLM {
+    /// Pre-cast every resident-core `Linear` weight to `dtype` **once**, so the per-call cast in
+    /// [`crate::linear2d::linear3`] becomes a no-op.
+    ///
+    /// Why this matters: `linear3`'s `Precision::F16`/`Bf16` paths do `w.cast(dt)` on **every
+    /// forward call**. Weights load as bf16, so at `Precision::F16` every decode step re-cast the
+    /// full weight matrix of every resident projection -- ~1.0B params across the 30 GDN layers
+    /// alone (in_proj_qkv is [2048,8192] = 16.7M elements by itself). That is several GB of pure
+    /// memory traffic per token, plus a full-size temporary allocation per projection per layer,
+    /// which also drove the resident-memory/swap pressure on a 16 GB machine. Casting once at
+    /// load turns all of that into a same-dtype no-op.
+    ///
+    /// Only weights that feed `linear3` are touched. Norm gammas, `A_log`/`dt_bias`, and conv1d are
+    /// left alone (they are genuinely small), and the routed-expert stacks are untouched because
+    /// they stream through the NVFP4 pool instead. The embedding table is handled separately by
+    /// [`Self::cast_embedding`] -- it is 1 GB, not small, and its dtype matters enormously (see
+    /// that method).
+    pub fn cast_resident_core_linears(&mut self, dtype: DType) -> usize {
+        fn cast_linear(lin: &mut Linear, dtype: DType) -> usize {
+            let w = lin.weight.val();
+            if w.dtype() == dtype {
+                return 0;
+            }
+            let n = w.shape().num_elements();
+            lin.weight = Param::initialized(ParamId::new(), w.cast(dtype));
+            if let Some(b) = &lin.bias {
+                let bv = b.val();
+                lin.bias = Some(Param::initialized(ParamId::new(), bv.cast(dtype)));
+            }
+            n
+        }
+
+        let mut cast = 0usize;
+        for layer in self.model.layers.iter_mut() {
+            match layer {
+                Qwen3_5DecoderLayer::Linear(l) => {
+                    let a = &mut l.linear_attn;
+                    cast += cast_linear(&mut a.in_proj_qkv, dtype);
+                    cast += cast_linear(&mut a.in_proj_a, dtype);
+                    cast += cast_linear(&mut a.in_proj_b, dtype);
+                    cast += cast_linear(&mut a.in_proj_z, dtype);
+                    cast += cast_linear(&mut a.out_proj, dtype);
+                    cast += cast_shared_moe_linears(&mut l.mlp, dtype);
+                }
+                Qwen3_5DecoderLayer::Full(l) => {
+                    let a = &mut l.self_attn;
+                    cast += cast_linear(&mut a.q_proj, dtype);
+                    cast += cast_linear(&mut a.k_proj, dtype);
+                    cast += cast_linear(&mut a.v_proj, dtype);
+                    cast += cast_linear(&mut a.o_proj, dtype);
+                    cast += cast_shared_moe_linears(&mut l.mlp, dtype);
+                }
+            }
+        }
+        cast += cast_linear(&mut self.lm_head, dtype);
+
+        fn cast_shared_moe_linears(mlp: &mut Qwen3_5SharedMoeBlock, dtype: DType) -> usize {
+            fn cast_linear(lin: &mut Linear, dtype: DType) -> usize {
+                let w = lin.weight.val();
+                if w.dtype() == dtype {
+                    return 0;
+                }
+                let n = w.shape().num_elements();
+                lin.weight = Param::initialized(ParamId::new(), w.cast(dtype));
+                if let Some(b) = &lin.bias {
+                    let bv = b.val();
+                    lin.bias = Some(Param::initialized(ParamId::new(), bv.cast(dtype)));
+                }
+                n
+            }
+            let mut cast = 0;
+            cast += cast_linear(&mut mlp.gate, dtype);
+            cast += cast_linear(&mut mlp.shared_expert_gate, dtype);
+            cast += cast_linear(&mut mlp.shared_expert.gate_proj, dtype);
+            cast += cast_linear(&mut mlp.shared_expert.up_proj, dtype);
+            cast += cast_linear(&mut mlp.shared_expert.down_proj, dtype);
+            cast
+        }
+
+        cast
+    }
+
+    /// Cast the token-embedding table `[vocab, hidden]` to `dtype`, returning the element count
+    /// (0 if it already matches).
+    ///
+    /// Why this is worth its own pass: burn's Metal/wgpu `embedding` gather has no BF16 fast path,
+    /// and the checkpoint stores `embed_tokens` as BF16. Measured on a 248320x2048 table
+    /// (`examples/embed_dtype_probe.rs`), one decode-shaped single-row gather costs:
+    ///
+    /// ```text
+    /// F32 table    0.011 ms      F16 table    0.352 ms      BF16 table    9.154 ms
+    /// ```
+    ///
+    /// i.e. leaving the table BF16 makes a single row lookup ~830x more expensive than F32 and
+    /// dominates the decode profile's EMBED bucket. F32 is the fastest and costs no extra
+    /// conversion (the gather's consumer immediately casts to F32 anyway) but doubles the table to
+    /// ~2 GB; F16 keeps the ~1 GB footprint and is still ~26x faster than BF16.
+    pub fn cast_embedding(&mut self, dtype: DType) -> usize {
+        let w = self.model.embed_tokens.weight.val();
+        if w.dtype() == dtype {
+            return 0;
+        }
+        let n = w.shape().num_elements();
+        self.model.embed_tokens.weight = Param::initialized(ParamId::new(), w.cast(dtype));
+        n
+    }
+
     pub fn verify_weights_sharded(
         config: &Qwen3_5MoeConfig,
         dir: impl AsRef<Path>,
@@ -528,6 +634,143 @@ impl Qwen3_5MoeForCausalLM {
             "[qwen3_5 load] resident-core load: skipped {skipped} routed-expert tensor(s), fetch them via ExpertSlotPool instead"
         );
         Ok(report)
+    }
+
+    /// Load the pre-quantized contiguous resident core from an offline blob store
+    /// (`resident_core.nvfp4`), matching turbo-fieldfare's mmapped-quantized resident core.
+    ///
+    /// # Why this exists (and why post-hoc quantization does not work)
+    ///
+    /// Decode on a 16 GB Apple Silicon machine is **memory-pressure bound**, not dispatch bound:
+    /// per-dispatch overhead measures ~14 us (`examples/dispatch_overhead_probe.rs`), far too small
+    /// to explain ~1.1 s/token, while *adding* 1 GB (casting the embedding to F32) made every
+    /// profile bucket ~3.5x slower. The resident core is ~1.94 B params ≈ 3.9 GiB at F16, which is
+    /// what pushes the process into swap.
+    ///
+    /// Quantizing *after* a normal dense load does not fix this: replacing `Linear::weight` frees
+    /// the tensor into CubeCL's memory pool, which retains the buffer rather than returning it to
+    /// the OS, so peak footprint barely moves. The dense weights must therefore **never be
+    /// allocated** — this loader builds the [`Nvfp4Linear`] sidecars straight from the blob's packed
+    /// bytes and leaves each `Linear::weight` as a tiny placeholder, never touching the lazy
+    /// full-size initializer.
+    ///
+    /// `src_dir` is the original checkpoint, needed only for the handful of tensors that must stay
+    /// dense (see [`resident_nvfp4_role`]): the embedding (gathers, no NVFP4 gather kernel) and the
+    /// MoE router gates (tiny, and routing quality is disproportionately sensitive to weight error).
+    #[cfg(feature = "cubecl-gpu")]
+    pub fn load_weights_resident_nvfp4(
+        &mut self,
+        blob_dir: impl AsRef<Path>,
+        src_dir: impl AsRef<Path>,
+    ) -> Result<(), Report<ModelLoadError>> {
+        let blob_dir = blob_dir.as_ref();
+        let src_dir = src_dir.as_ref();
+        let blob = crate::nvfp4_blob::ResidentCoreBlob::open(blob_dir).map_err(|e| {
+            eprintln!("[qwen3_5 load] failed to open resident blob: {e}");
+            Report::new(ModelLoadError::LoadError)
+        })?;
+        let device = self.model.device();
+        eprintln!(
+            "[qwen3_5 load] resident NVFP4 blob mmapped: {} bytes (~{:.2} GiB)",
+            blob.manifest.total_size,
+            blob.manifest.total_size as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
+
+        let index = shard_index(src_dir).map_err(|msg| {
+            eprintln!("[qwen3_5 load] {msg}");
+            Report::new(ModelLoadError::LoadError)
+        })?;
+        let mut reader = ShardReader::new(src_dir, &index);
+
+        let mut sidecars = 0usize;
+        let mut dense_from_src = 0usize;
+        let mut raw = 0usize;
+
+        for entry in &blob.manifest.entries {
+            let slice = &blob.mmap[entry.offset..entry.offset + entry.byte_len];
+            match entry.dtype {
+                crate::nvfp4_blob::ResidentDType::Nvfp4Linear { k, n } => {
+                    match resident_nvfp4_role(&entry.name) {
+                        Some(role) => {
+                            let layout = crate::nvfp4_blob::ProjLayout::new(n, k, 0);
+                            let rec =
+                                crate::nvfp4_blob::read_record(slice, &layout, 0).map_err(|e| {
+                                    eprintln!("[qwen3_5 load] read record {}: {e}", entry.name);
+                                    Report::new(ModelLoadError::LoadError)
+                                })?;
+                            let ql = crate::nvfp4_linear::QuantLinear::Nvfp4(
+                                crate::nvfp4_linear::Nvfp4Linear::from_packed_parts(
+                                    rec.qw.to_vec(),
+                                    rec.block_scales.to_vec(),
+                                    rec.gscale,
+                                    k,
+                                    n,
+                                    &device,
+                                ),
+                            );
+                            let slot = crate::quant_gate::sidecar_by_role_mut(self, &role)
+                                .ok_or_else(|| {
+                                    eprintln!(
+                                        "[qwen3_5 load] no sidecar slot for role {role} ({})",
+                                        entry.name
+                                    );
+                                    Report::new(ModelLoadError::LoadError)
+                                })?;
+                            *slot = Some(ql);
+                            // Placeholder the dense weight WITHOUT calling `.val()` -- these are
+                            // lazily-initialized params, so reading them would allocate the very
+                            // full-size tensor this whole path exists to avoid.
+                            if let Some(lin) = crate::quant_gate::linear_by_role_mut(self, &role) {
+                                set_linear_placeholder(lin, n, &device);
+                            }
+                            sidecars += 1;
+                        }
+                        None => {
+                            // Must stay dense: pull the original (unquantized) tensor instead.
+                            let rawt = reader.read_raw_tensor(&entry.name).map_err(|msg| {
+                                eprintln!("[qwen3_5 load] read src {}: {msg}", entry.name);
+                                Report::new(ModelLoadError::LoadError)
+                            })?;
+                            let snap = raw_tensor_snapshot(&entry.name, &rawt).map_err(|msg| {
+                                eprintln!("[qwen3_5 load] snapshot {}: {msg}", entry.name);
+                                Report::new(ModelLoadError::LoadError)
+                            })?;
+                            self.load_qwen35_tensor(&entry.name, &snap, &device)
+                                .map_err(|msg| {
+                                    eprintln!("[qwen3_5 load] load tensor {}: {msg}", entry.name);
+                                    Report::new(ModelLoadError::LoadError)
+                                })?;
+                            dense_from_src += 1;
+                        }
+                    }
+                }
+                crate::nvfp4_blob::ResidentDType::Bf16 | crate::nvfp4_blob::ResidentDType::F32 => {
+                    let (dt, width) = match entry.dtype {
+                        crate::nvfp4_blob::ResidentDType::F32 => (DType::F32, 4),
+                        _ => (DType::BF16, 2),
+                    };
+                    let len = entry.shape.iter().product::<usize>() * width;
+                    let data =
+                        TensorData::from_bytes_vec(slice[..len].to_vec(), entry.shape.clone(), dt);
+                    let snap = TensorSnapshot::from_data(
+                        data,
+                        entry.name.split('.').map(str::to_string).collect(),
+                        Vec::new(),
+                        ParamId::new(),
+                    );
+                    self.load_qwen35_tensor(&entry.name, &snap, &device)
+                        .map_err(|msg| {
+                            eprintln!("[qwen3_5 load] load tensor {}: {msg}", entry.name);
+                            Report::new(ModelLoadError::LoadError)
+                        })?;
+                    raw += 1;
+                }
+            }
+        }
+        eprintln!(
+            "[qwen3_5 load] resident NVFP4: {sidecars} quantized sidecar(s), {dense_from_src} dense-from-source, {raw} raw"
+        );
+        Ok(())
     }
 
     /// Load NVIDIA's ModelOpt mixed-precision Qwen3.6 NVFP4 checkpoint.
@@ -1051,6 +1294,97 @@ fn experts_by_layer_mut(
         Qwen3_5DecoderLayer::Linear(layer) => Some(&mut layer.mlp.experts),
         Qwen3_5DecoderLayer::Full(layer) => Some(&mut layer.mlp.experts),
     }
+}
+
+/// Map a resident-core blob tensor name to the stable `quant_gate` role whose NVFP4 sidecar should
+/// receive it, or `None` for tensors that must stay dense.
+///
+/// `None` cases, all deliberate:
+/// - `embed_tokens` — consumed by a gather, and there is no NVFP4 embedding-gather kernel.
+/// - `mlp.gate` / `mlp.shared_expert_gate` — the MoE routers. Tiny (a few MB total), and top-k
+///   routing is disproportionately sensitive to weight error: a flipped expert choice changes the
+///   output far more than the same relative error inside a projection. These are also what
+///   [`crate::quant_gate::DEFAULT_DENSE_SKIP`] excludes for the same reason.
+#[cfg(feature = "cubecl-gpu")]
+pub fn resident_nvfp4_role(name: &str) -> Option<String> {
+    if name == "lm_head.weight" {
+        return Some("lm_head".to_string());
+    }
+    if name == "mtp.fc.weight" {
+        return Some("mtp.fc".to_string());
+    }
+    // Keep-dense set.
+    if name.ends_with("embed_tokens.weight")
+        || name.ends_with("mlp.gate.weight")
+        || name.ends_with("mlp.shared_expert_gate.weight")
+    {
+        return None;
+    }
+
+    // `mtp.layers.{i}.<tail>` and `model.language_model.layers.{i}.<tail>` share tail spellings.
+    let (prefix, rest) = if let Some(rest) = name.strip_prefix("mtp.layers.") {
+        ("mtp.layers.", rest)
+    } else if let Some(rest) = name.strip_prefix("model.language_model.layers.") {
+        ("L", rest)
+    } else {
+        return None;
+    };
+    let (idx, tail) = rest.split_once('.')?;
+    idx.parse::<usize>().ok()?;
+    let role_tail = match tail {
+        "self_attn.q_proj.weight" => "attn.q_proj",
+        "self_attn.k_proj.weight" => "attn.k_proj",
+        "self_attn.v_proj.weight" => "attn.v_proj",
+        "self_attn.o_proj.weight" => "attn.o_proj",
+        "linear_attn.in_proj_qkv.weight" => "gdn.in_proj_qkv",
+        "linear_attn.in_proj_a.weight" => "gdn.in_proj_a",
+        "linear_attn.in_proj_b.weight" => "gdn.in_proj_b",
+        "linear_attn.in_proj_z.weight" => "gdn.in_proj_z",
+        "linear_attn.out_proj.weight" => "gdn.out_proj",
+        "mlp.shared_expert.gate_proj.weight" => "moe.shared.gate_proj",
+        "mlp.shared_expert.up_proj.weight" => "moe.shared.up_proj",
+        "mlp.shared_expert.down_proj.weight" => "moe.shared.down_proj",
+        _ => return None,
+    };
+    Some(if prefix == "L" {
+        format!("L{idx}.{role_tail}")
+    } else {
+        format!("mtp.layers.{idx}.{role_tail}")
+    })
+}
+
+/// Replace a `Linear`'s weight with a `[1, n]` placeholder *without* reading the existing param.
+///
+/// The model is built with lazily-initialized params, so calling `.val()` here would materialize
+/// the full `[k, n]` tensor — exactly the allocation the NVFP4 resident path exists to avoid. The
+/// real output width `n` is preserved because a few call sites read `weight.dims()[1]` for shape
+/// bookkeeping without going through the sidecar dispatch.
+#[cfg(feature = "cubecl-gpu")]
+fn set_linear_placeholder(lin: &mut Linear, n: usize, device: &Device) {
+    let tiny = Tensor::<2>::from_data(TensorData::new(vec![0.0f32; n], [1, n]), device);
+    lin.weight = Param::initialized(ParamId::new(), tiny);
+    lin.bias = None;
+}
+
+/// Wrap a raw safetensors tensor as a `TensorSnapshot` for `load_qwen35_tensor`.
+#[cfg(feature = "cubecl-gpu")]
+fn raw_tensor_snapshot(
+    name: &str,
+    t: &crate::nvidia_ckpt::RawTensor,
+) -> Result<TensorSnapshot, String> {
+    let dt = match t.dtype {
+        safetensors::Dtype::BF16 => DType::BF16,
+        safetensors::Dtype::F16 => DType::F16,
+        safetensors::Dtype::F32 => DType::F32,
+        other => return Err(format!("{name}: unsupported source dtype {other:?}")),
+    };
+    let data = TensorData::from_bytes_vec(t.data.clone(), t.shape.clone(), dt);
+    Ok(TensorSnapshot::from_data(
+        data,
+        name.split('.').map(str::to_string).collect(),
+        Vec::new(),
+        ParamId::new(),
+    ))
 }
 
 #[cfg(feature = "cuda")]

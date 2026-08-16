@@ -140,7 +140,7 @@ fn hadamard_signs(k: usize, g: usize, seed: u64) -> Vec<f32> {
 }
 
 #[cfg(feature = "cubecl-gpu")]
-pub use crate::nvfp4_kernels::{fused_moe_gu2_down_nvfp4, nvfp4_gemv};
+pub use crate::nvfp4_kernels::{fused_moe_2kernel_nvfp4, fused_moe_gu2_down_nvfp4, nvfp4_gemv};
 
 /// Quantize a row-major Burn Linear weight `W:[K,N]` to NVFP4 host storage.
 ///

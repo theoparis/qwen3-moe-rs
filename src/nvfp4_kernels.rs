@@ -15,21 +15,21 @@ const NVFP4_COLS_PER_CTA: u32 = 4;
 pub mod gpu {
     use cubecl::prelude::*;
 
+    /// Decode one E2M1 nibble. Runs 16x per 8-byte block in the GEMV inner loop, so the power-of-two
+    /// term is built with an integer shift instead of the previous nested 3-way branch ladder --
+    /// lanes in a warp decode different codes, so those branches diverged on every element.
     #[cube]
     pub fn e2m1_decode(code: u32) -> f32 {
         let mag = code & 7u32;
         let m = f32::cast_from(mag & 1u32);
         let e = (mag >> 1u32) & 3u32;
+        // pe = 2^(e-1) for e >= 1. The shift amount is clamped so the (unused) e == 0 lane can't
+        // shift by a wrapped-around count.
+        let sh = if e == 0u32 { 0u32 } else { e - 1u32 };
+        let pe = f32::cast_from(1u32 << sh);
         let val_mag = if e == 0u32 {
             f32::new(0.5f32) * m
         } else {
-            let pe = if e == 1u32 {
-                f32::new(1.0f32)
-            } else if e == 2u32 {
-                f32::new(2.0f32)
-            } else {
-                f32::new(4.0f32)
-            };
             pe * (f32::new(1.0f32) + f32::new(0.5f32) * m)
         };
         if (code >> 3u32) & 1u32 == 1u32 {
@@ -39,49 +39,28 @@ pub mod gpu {
         }
     }
 
+    /// Decode one E4M3 block scale.
+    ///
+    /// The 14-way `exp` branch ladder this replaces was both slow (divergent across lanes) and
+    /// WRONG at `exp == 15`: its trailing `else` returned 128.0 for exp 14 *and* 15, but the host
+    /// encoder/decoder (`crate::nvfp4::e4m3_to_f32`) uses `2^(exp-7)` throughout, i.e. 256.0 at
+    /// exp 15. Any block whose scale landed in the top binade therefore dequantized ~2x too small
+    /// on GPU relative to how it was quantized on the host. Here `2^(exp-7)` is built as
+    /// `(1 << exp) * 2^-7`, which is exact for the whole 1..=15 range and branch-free.
     #[cube]
     pub fn e4m3_decode(byte: u32) -> f32 {
         let exp = (byte >> 3u32) & 15u32;
         let mant = byte & 7u32;
+        let pe = f32::cast_from(1u32 << exp) * f32::new(0.0078125f32); // 2^(exp - 7)
+        let normal = pe * (f32::new(1.0f32) + f32::cast_from(mant) * f32::new(0.125f32));
+        let subnormal = f32::cast_from(mant) * f32::new(0.001953125f32); // mant * 2^-9
         let mag = if exp == 0u32 {
-            if mant == 0u32 {
-                f32::new(0.0f32)
-            } else {
-                f32::cast_from(mant) * f32::new(0.001953125f32)
-            }
+            subnormal
         } else if exp == 15u32 && mant == 7u32 {
+            // NaN sentinel; the serving path treats it as zero rather than propagating NaN.
             f32::new(0.0f32)
         } else {
-            let pe = if exp == 1u32 {
-                f32::new(0.015625f32)
-            } else if exp == 2u32 {
-                f32::new(0.03125f32)
-            } else if exp == 3u32 {
-                f32::new(0.0625f32)
-            } else if exp == 4u32 {
-                f32::new(0.125f32)
-            } else if exp == 5u32 {
-                f32::new(0.25f32)
-            } else if exp == 6u32 {
-                f32::new(0.5f32)
-            } else if exp == 7u32 {
-                f32::new(1.0f32)
-            } else if exp == 8u32 {
-                f32::new(2.0f32)
-            } else if exp == 9u32 {
-                f32::new(4.0f32)
-            } else if exp == 10u32 {
-                f32::new(8.0f32)
-            } else if exp == 11u32 {
-                f32::new(16.0f32)
-            } else if exp == 12u32 {
-                f32::new(32.0f32)
-            } else if exp == 13u32 {
-                f32::new(64.0f32)
-            } else {
-                f32::new(128.0f32)
-            };
-            pe * (f32::new(1.0f32) + f32::cast_from(mant) * f32::new(0.125f32))
+            normal
         };
         if (byte & 128u32) == 128u32 { -mag } else { mag }
     }
@@ -196,14 +175,11 @@ pub mod gpu {
             let e_i = i64::cast_from(e);
             let tok_i = i64::cast_from(tok);
             let ci_i = i64::cast_from(ci);
-            let half_bytes = i64::cast_from(i_dim_u / 2usize);
-            let byte_i = i64::cast_from(ci / 2usize);
-            let high = (ci & 1usize) == 1usize;
             let x_base = tok_i * xs0;
-            let g_q_base = e_i * qs0 + byte_i * qs2;
-            let u_q_base = e_i * qs0 + (half_bytes + byte_i) * qs2;
-            let g_bs_base = e_i * bs0 + ci_i * bs1;
-            let u_bs_base = e_i * bs0 + (ci_i + i64::cast_from(i_dim_u)) * bs1;
+            let g_q_row = e_i * qs0 + ci_i * qs1;
+            let u_q_row = e_i * qs0 + (ci_i + i64::cast_from(i_dim_u)) * qs1;
+            let g_bs_row = e_i * bs0 + ci_i * bs1;
+            let u_bs_row = e_i * bs0 + (ci_i + i64::cast_from(i_dim_u)) * bs1;
             let g_gscale = gscale_gu[usize::cast_from(e_i * gs0)];
             let u_gscale = gscale_gu[usize::cast_from(e_i * gs0 + gs1)];
 
@@ -211,12 +187,14 @@ pub mod gpu {
             let mut uacc = f32::new(0.0f32);
             for hh in 0..h_dim_u {
                 let h_i = i64::cast_from(hh);
+                let byte_i = i64::cast_from(hh / 2usize);
+                let high = (hh & 1usize) == 1usize;
                 let block_i = i64::cast_from(hh / 16usize);
                 let xv = x[usize::cast_from(x_base + h_i * xs1)];
-                let gb = u32::cast_from(q_gu[usize::cast_from(g_q_base + h_i * qs1)]);
-                let ub = u32::cast_from(q_gu[usize::cast_from(u_q_base + h_i * qs1)]);
-                let gs = u32::cast_from(bs_gu[usize::cast_from(g_bs_base + block_i * bs2)]);
-                let us = u32::cast_from(bs_gu[usize::cast_from(u_bs_base + block_i * bs2)]);
+                let gb = u32::cast_from(q_gu[usize::cast_from(g_q_row + byte_i * qs2)]);
+                let ub = u32::cast_from(q_gu[usize::cast_from(u_q_row + byte_i * qs2)]);
+                let gs = u32::cast_from(bs_gu[usize::cast_from(g_bs_row + block_i * bs2)]);
+                let us = u32::cast_from(bs_gu[usize::cast_from(u_bs_row + block_i * bs2)]);
                 gacc += xv * nvfp4_dequant_nibble(gb, high, gs, g_gscale);
                 uacc += xv * nvfp4_dequant_nibble(ub, high, us, u_gscale);
             }
@@ -258,25 +236,161 @@ pub mod gpu {
             let e_i = i64::cast_from(e);
             let n_i = i64::cast_from(n);
             let h_i = i64::cast_from(hh);
-            let byte_i = i64::cast_from(hh / 2usize);
-            let high = (hh & 1usize) == 1usize;
             let gu_base = n_i * gus0;
-            let q_base = e_i * qs0 + byte_i * qs2;
-            let bs_base = e_i * bs0 + h_i * bs1;
+            let q_row = e_i * qs0 + h_i * qs1;
+            let bs_row = e_i * bs0 + h_i * bs1;
             let gd = gscale_dn[e as usize * gscale_dn.stride(0)];
 
             let mut acc = f32::new(0.0f32);
             for ci in 0..i_dim_u {
                 let ci_i = i64::cast_from(ci);
+                let byte_i = i64::cast_from(ci / 2usize);
+                let high = (ci & 1usize) == 1usize;
                 let block_i = i64::cast_from(ci / 16usize);
-                let qb = u32::cast_from(q_dn[usize::cast_from(q_base + ci_i * qs1)]);
-                let sb = u32::cast_from(bs_dn[usize::cast_from(bs_base + block_i * bs2)]);
+                let qb = u32::cast_from(q_dn[usize::cast_from(q_row + byte_i * qs2)]);
+                let sb = u32::cast_from(bs_dn[usize::cast_from(bs_row + block_i * bs2)]);
                 acc += gu[usize::cast_from(gu_base + ci_i * gus1)]
                     * nvfp4_dequant_nibble(qb, high, sb, gd);
             }
             out[pos] = acc * w;
         }
     }
+
+    #[cube(launch)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn fused35_down_reduce_k8_nvfp4(
+        gu: &Tensor<f32>,
+        q_dn: &Tensor<u8>,
+        bs_dn: &Tensor<u8>,
+        gscale_dn: &Tensor<f32>,
+        assign_e: &Tensor<i32>,
+        sel_w: &Tensor<f32>,
+        out: &mut Tensor<f32>,
+        h_dim: u32,
+        i_dim: u32,
+        top_k: u32,
+    ) {
+        if ABSOLUTE_POS < out.len() {
+            let pos = ABSOLUTE_POS as usize;
+            let h_dim_u = h_dim as usize;
+            let i_dim_u = i_dim as usize;
+            let tok = pos / h_dim_u;
+            let hh = pos % h_dim_u;
+            let top_k_u = top_k as usize;
+
+            let gus0 = i64::cast_from(gu.stride(0));
+            let gus1 = i64::cast_from(gu.stride(1));
+            let qs0 = i64::cast_from(q_dn.stride(0));
+            let qs1 = i64::cast_from(q_dn.stride(1));
+            let qs2 = i64::cast_from(q_dn.stride(2));
+            let bs0 = i64::cast_from(bs_dn.stride(0));
+            let bs1 = i64::cast_from(bs_dn.stride(1));
+            let bs2 = i64::cast_from(bs_dn.stride(2));
+
+            let h_i = i64::cast_from(hh);
+
+            let mut token_acc = f32::new(0.0f32);
+
+            for k in 0..top_k_u {
+                let slot = tok * top_k_u + k;
+                let e = assign_e[slot * assign_e.stride(0)];
+                let w = sel_w[slot * sel_w.stride(0)];
+                let e_i = i64::cast_from(e);
+                let slot_i = i64::cast_from(slot);
+
+                let gu_base = slot_i * gus0;
+                let q_row = e_i * qs0 + h_i * qs1;
+                let bs_row = e_i * bs0 + h_i * bs1;
+                let gd = gscale_dn[e as usize * gscale_dn.stride(0)];
+
+                let mut expert_acc = f32::new(0.0f32);
+                for ci in 0..i_dim_u {
+                    let ci_i = i64::cast_from(ci);
+                    let byte_i = i64::cast_from(ci / 2usize);
+                    let high = (ci & 1usize) == 1usize;
+                    let block_i = i64::cast_from(ci / 16usize);
+                    let qb = u32::cast_from(q_dn[usize::cast_from(q_row + byte_i * qs2)]);
+                    let sb = u32::cast_from(bs_dn[usize::cast_from(bs_row + block_i * bs2)]);
+                    expert_acc += gu[usize::cast_from(gu_base + ci_i * gus1)]
+                        * nvfp4_dequant_nibble(qb, high, sb, gd);
+                }
+                token_acc += expert_acc * w;
+            }
+
+            out[pos] = token_acc;
+        }
+    }
+}
+
+fn launch_fused_2kernel_nvfp4<R: CubeRuntime>(
+    x: CubeTensor<R>,
+    q_gu: CubeTensor<R>,
+    bs_gu: CubeTensor<R>,
+    gscale_gu: CubeTensor<R>,
+    q_dn: CubeTensor<R>,
+    bs_dn: CubeTensor<R>,
+    gscale_dn: CubeTensor<R>,
+    assign_e: CubeTensor<R>,
+    sel_w: CubeTensor<R>,
+    h: usize,
+    i: usize,
+    n: usize,
+    tokens: usize,
+) -> CubeTensor<R> {
+    let x = into_contiguous(x);
+    let q_gu = into_contiguous(q_gu);
+    let bs_gu = into_contiguous(bs_gu);
+    let gscale_gu = into_contiguous(gscale_gu);
+    let q_dn = into_contiguous(q_dn);
+    let bs_dn = into_contiguous(bs_dn);
+    let gscale_dn = into_contiguous(gscale_dn);
+    let ae = into_contiguous(assign_e);
+    let sw = into_contiguous(sel_w);
+    let gu = alloc_f32(&x, &[n, i]);
+    let out = alloc_f32(&x, &[tokens, h]);
+
+    let top_k = (n / tokens) as u32;
+    let threads = 256u32;
+    let cdim = CubeDim {
+        x: threads,
+        y: 1,
+        z: 1,
+    };
+
+    // Kernel 1 (Phase 1): Evaluate Gate_Up + SwiGLU for all top-K routed experts in parallel
+    gpu::fused35_gu_nvfp4_scalar::launch::<R>(
+        &x.client,
+        CubeCount::Static(((n * i) as u32).div_ceil(threads), 1, 1),
+        cdim,
+        x.clone().into_tensor_arg(),
+        q_gu.into_tensor_arg(),
+        bs_gu.into_tensor_arg(),
+        gscale_gu.into_tensor_arg(),
+        ae.clone().into_tensor_arg(),
+        gu.clone().into_tensor_arg(),
+        h as u32,
+        i as u32,
+        top_k,
+    );
+
+    // Kernel 2 (Phase 2): Evaluate Down projection + router-weighted reduction across top-K experts
+    gpu::fused35_down_reduce_k8_nvfp4::launch::<R>(
+        &x.client,
+        CubeCount::Static(((tokens * h) as u32).div_ceil(threads), 1, 1),
+        cdim,
+        gu.into_tensor_arg(),
+        q_dn.into_tensor_arg(),
+        bs_dn.into_tensor_arg(),
+        gscale_dn.into_tensor_arg(),
+        ae.into_tensor_arg(),
+        sw.into_tensor_arg(),
+        out.clone().into_tensor_arg(),
+        h as u32,
+        i as u32,
+        top_k,
+    );
+
+    out
 }
 
 fn assert_nvfp4_gemv_shapes(
@@ -492,12 +606,48 @@ pub fn nvfp4_gemv(
     assert_eq!(gscale.dims(), [1], "nvfp4_gemv: gscale must be [1]");
     assert_nvfp4_gemv_shapes(m, k, n, n * (k / 2), n * (k / 16), m_max);
 
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", not(feature = "metal-fusion-diag")))]
     try_backend_gemv!(burn::backend::Metal, x, qw, bs, gscale, k, n, m, m_max);
     #[cfg(feature = "vulkan")]
     try_backend_gemv!(burn::backend::Vulkan, x, qw, bs, gscale, k, n, m, m_max);
     #[cfg(feature = "wgpu")]
     try_backend_gemv!(burn::backend::Wgpu, x, qw, bs, gscale, k, n, m, m_max);
+    // Fusion is enabled for this backend (`burn::backend::Metal` == `Fusion<CubeBackend<...>>`,
+    // not a raw `CubeBackend`), so `try_backend_gemv!`'s try_into_primitive::<CubeBackend<..>>
+    // can never match. Route through the CubeCustomOp fusion bridge instead (same mechanism the
+    // `cuda` branch below already uses) so the kernel is reachable at all under fusion.
+    #[cfg(feature = "metal-fusion-diag")]
+    {
+        type MetalRuntime = cubecl::wgpu::WgpuRuntime<cubecl::wgpu::MslCompiler>;
+        if let (Ok(x_p), Ok(qw_p), Ok(bs_p), Ok(gs_p)) = (
+            x.clone().try_into_primitive::<burn::backend::Metal>(),
+            qw.clone().try_into_primitive::<burn::backend::Metal>(),
+            bs.clone().try_into_primitive::<burn::backend::Metal>(),
+            gscale.clone().try_into_primitive::<burn::backend::Metal>(),
+        ) {
+            let outputs = crate::cube_custom_op::CubeCustomOp::<MetalRuntime>::new("nvfp4_gemv")
+                .float_input(x_p)
+                .int_input(qw_p)
+                .int_input(bs_p)
+                .float_input(gs_p)
+                .float_output([m, n], DType::F32)
+                .launch(move |inputs| {
+                    vec![launch_nvfp4_gemv(
+                        inputs[0].clone(),
+                        inputs[1].clone(),
+                        inputs[2].clone(),
+                        inputs[3].clone(),
+                        k,
+                        n,
+                        m,
+                        m_max,
+                    )]
+                });
+            return Tensor::from_primitive::<burn::backend::Metal>(
+                outputs.into_iter().next().expect("one output"),
+            );
+        }
+    }
     #[cfg(feature = "cuda")]
     {
         type CudaRaw = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
@@ -559,7 +709,7 @@ pub fn fused_moe_gu2_down_nvfp4(
     let x = x.cast(DType::F32);
     let sel_w = sel_w.cast(DType::F32);
 
-    #[cfg(feature = "metal")]
+    #[cfg(all(feature = "metal", not(feature = "metal-fusion-diag")))]
     try_backend_fused!(
         burn::backend::Metal,
         x,
@@ -575,6 +725,73 @@ pub fn fused_moe_gu2_down_nvfp4(
         i,
         n
     );
+    // See the matching branch in `nvfp4_gemv` above: under fusion, `burn::backend::Metal` is
+    // `Fusion<CubeBackend<...>>`, not a raw `CubeBackend`, so the try_into_primitive fast path
+    // above can never match and this kernel must go through the CubeCustomOp bridge instead.
+    #[cfg(feature = "metal-fusion-diag")]
+    {
+        type MetalRuntime = cubecl::wgpu::WgpuRuntime<cubecl::wgpu::MslCompiler>;
+        if let (
+            Ok(x_p),
+            Ok(q_gu_p),
+            Ok(bs_gu_p),
+            Ok(gscale_gu_p),
+            Ok(q_dn_p),
+            Ok(bs_dn_p),
+            Ok(gscale_dn_p),
+            Ok(ae_p),
+            Ok(sw_p),
+        ) = (
+            x.clone().try_into_primitive::<burn::backend::Metal>(),
+            q_gu.clone().try_into_primitive::<burn::backend::Metal>(),
+            bs_gu.clone().try_into_primitive::<burn::backend::Metal>(),
+            gscale_gu
+                .clone()
+                .try_into_primitive::<burn::backend::Metal>(),
+            q_dn.clone().try_into_primitive::<burn::backend::Metal>(),
+            bs_dn.clone().try_into_primitive::<burn::backend::Metal>(),
+            gscale_dn
+                .clone()
+                .try_into_primitive::<burn::backend::Metal>(),
+            assign_e
+                .clone()
+                .try_into_primitive::<burn::backend::Metal>(),
+            sel_w.clone().try_into_primitive::<burn::backend::Metal>(),
+        ) {
+            let outputs = crate::cube_custom_op::CubeCustomOp::<MetalRuntime>::new(
+                "fused_moe_gu2_down_nvfp4",
+            )
+            .float_input(x_p)
+            .int_input(q_gu_p)
+            .int_input(bs_gu_p)
+            .float_input(gscale_gu_p)
+            .int_input(q_dn_p)
+            .int_input(bs_dn_p)
+            .float_input(gscale_dn_p)
+            .int_input(ae_p)
+            .float_input(sw_p)
+            .float_output([n, h], DType::F32)
+            .launch(move |inputs| {
+                vec![launch_fused_nvfp4(
+                    inputs[0].clone(),
+                    inputs[1].clone(),
+                    inputs[2].clone(),
+                    inputs[3].clone(),
+                    inputs[4].clone(),
+                    inputs[5].clone(),
+                    inputs[6].clone(),
+                    inputs[7].clone(),
+                    inputs[8].clone(),
+                    h,
+                    i,
+                    n,
+                )]
+            });
+            return Tensor::from_primitive::<burn::backend::Metal>(
+                outputs.into_iter().next().expect("one output"),
+            );
+        }
+    }
     #[cfg(feature = "vulkan")]
     try_backend_fused!(
         burn::backend::Vulkan,
@@ -617,6 +834,127 @@ pub fn fused_moe_gu2_down_nvfp4(
 
     panic!(
         "fused_moe_gu2_down_nvfp4: tensor is not on a CubeCL GPU backend; device={:?}",
+        x.device()
+    )
+}
+
+macro_rules! try_backend_fused_2kernel {
+    ($B:ty, $x:expr, $q_gu:expr, $bs_gu:expr, $gscale_gu:expr, $q_dn:expr, $bs_dn:expr, $gscale_dn:expr, $ae:expr, $sw:expr, $h:expr, $i:expr, $n:expr, $tokens:expr) => {{
+        if let (
+            Ok(x),
+            Ok(q_gu),
+            Ok(bs_gu),
+            Ok(gscale_gu),
+            Ok(q_dn),
+            Ok(bs_dn),
+            Ok(gscale_dn),
+            Ok(ae),
+            Ok(sw),
+        ) = (
+            $x.clone().try_into_primitive::<$B>(),
+            $q_gu.clone().try_into_primitive::<$B>(),
+            $bs_gu.clone().try_into_primitive::<$B>(),
+            $gscale_gu.clone().try_into_primitive::<$B>(),
+            $q_dn.clone().try_into_primitive::<$B>(),
+            $bs_dn.clone().try_into_primitive::<$B>(),
+            $gscale_dn.clone().try_into_primitive::<$B>(),
+            $ae.clone().try_into_primitive::<$B>(),
+            $sw.clone().try_into_primitive::<$B>(),
+        ) {
+            let out = launch_fused_2kernel_nvfp4(
+                x, q_gu, bs_gu, gscale_gu, q_dn, bs_dn, gscale_dn, ae, sw, $h, $i, $n, $tokens,
+            );
+            return Tensor::from_primitive::<$B>(out);
+        }
+    }};
+}
+
+/// 2-Kernel grouped MoE dispatch ported from turbo-fieldfare:
+/// 1. `fused35_gu_nvfp4_scalar` computes gate_up + SwiGLU for all top-K routed experts in parallel into scratch `gu: [N, I]`.
+/// 2. `fused35_down_reduce_k8_nvfp4` computes down projections, multiplies by router weights, and reduces directly into `out: [T, H]`.
+/// Replaces 32 separate kernel dispatches per layer with exactly 2.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_moe_2kernel_nvfp4(
+    x: Tensor<2>,
+    q_gu: Tensor<3, Int>,
+    bs_gu: Tensor<3, Int>,
+    gscale_gu: Tensor<2>,
+    q_dn: Tensor<3, Int>,
+    bs_dn: Tensor<3, Int>,
+    gscale_dn: Tensor<1>,
+    assign_e: Tensor<1, Int>,
+    sel_w: Tensor<1>,
+    h: usize,
+    i: usize,
+    n: usize,
+    tokens: usize,
+) -> Tensor<2> {
+    let assign_e = assign_e.cast(DType::I32);
+    let x = x.cast(DType::F32);
+    let sel_w = sel_w.cast(DType::F32);
+
+    #[cfg(all(feature = "metal", not(feature = "metal-fusion-diag")))]
+    try_backend_fused_2kernel!(
+        burn::backend::Metal,
+        x,
+        q_gu,
+        bs_gu,
+        gscale_gu,
+        q_dn,
+        bs_dn,
+        gscale_dn,
+        assign_e,
+        sel_w,
+        h,
+        i,
+        n,
+        tokens
+    );
+    #[cfg(feature = "vulkan")]
+    try_backend_fused_2kernel!(
+        burn::backend::Vulkan,
+        x,
+        q_gu,
+        bs_gu,
+        gscale_gu,
+        q_dn,
+        bs_dn,
+        gscale_dn,
+        assign_e,
+        sel_w,
+        h,
+        i,
+        n,
+        tokens
+    );
+    #[cfg(feature = "wgpu")]
+    try_backend_fused_2kernel!(
+        burn::backend::Wgpu,
+        x,
+        q_gu,
+        bs_gu,
+        gscale_gu,
+        q_dn,
+        bs_dn,
+        gscale_dn,
+        assign_e,
+        sel_w,
+        h,
+        i,
+        n,
+        tokens
+    );
+    #[cfg(feature = "cuda")]
+    {
+        type CudaRaw = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+        try_backend_fused_2kernel!(
+            CudaRaw, x, q_gu, bs_gu, gscale_gu, q_dn, bs_dn, gscale_dn, assign_e, sel_w, h, i, n,
+            tokens
+        );
+    }
+
+    panic!(
+        "fused_moe_2kernel_nvfp4: tensor is not on a CubeCL GPU backend; device={:?}",
         x.device()
     )
 }

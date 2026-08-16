@@ -85,6 +85,9 @@ wgpu = ["burn/wgpu", "cubecl-gpu", "cubecl/wgpu"]
 # Same as `wgpu` but pins the wgpu shader compiler to MSL at compile time instead of runtime
 # auto-dispatch. Useful on Apple Silicon.
 metal = ["burn/metal", "cubecl-gpu", "cubecl/metal"]
+# Diagnostic only: metal + fusion, to capture the REAL first panic burn-fusion hits on this crate's
+# call pattern (see Cargo.toml's `burn-fusion` comment). Not for normal use.
+metal-fusion-diag = ["metal", "burn/fusion", "dep:burn-cubecl-fusion", "dep:burn-fusion", "dep:burn-ir"]
 # Pins the wgpu shader compiler to SPIR-V (Vulkan) at compile time. Useful on AMD/NVIDIA Linux/
 # Windows hosts that have Vulkan but not the CUDA toolkit.
 vulkan = ["burn/vulkan", "cubecl-gpu", "cubecl/vulkan"]
@@ -515,3 +518,54 @@ name = "nvfp4_ckpt_golden"
 path = "examples/nvfp4_ckpt_golden.rs"
 required-features = ["cuda"]
 test = false
+
+# Offline expert repack: bf16 checkpoint -> fixed-stride NVFP4 blob store (CPU only, no GPU needed).
+[[example]]
+name = "nvfp4_offline_repack"
+path = "examples/nvfp4_offline_repack.rs"
+
+# Isolates real GPU cost of one streamed expert's NVFP4 decode at M=1 decode shapes (portable GPU).
+[[example]]
+name = "nvfp4_gemv_metal_probe"
+path = "examples/nvfp4_gemv_metal_probe.rs"
+required-features = ["cubecl-gpu"]
+
+# Patched fork of burn 0.22.0-pre.2 with a one-line fix for tracel-ai/burn#5292 (fused-reduce
+# resolves its Concrete-Output reference strides against the wrong launch-arg list, panicking on
+# Metal/wgpu f16 reduces such as the decoder's final RMSNorm). Same version string so this patch
+# satisfies every crates.io burn-* dependency below without touching version requirements.
+# Branch: https://github.com/theoparis/burn/tree/fix-reduce-strides-5292 (candidate upstream PR).
+[patch.crates-io]
+burn = { git = "https://github.com/theoparis/burn.git", rev = "4c7f3a0a7a886c24045bbf26537a9e08511f00b9" }
+burn-store = { git = "https://github.com/theoparis/burn.git", rev = "4c7f3a0a7a886c24045bbf26537a9e08511f00b9" }
+burn-cubecl = { git = "https://github.com/theoparis/burn.git", rev = "4c7f3a0a7a886c24045bbf26537a9e08511f00b9" }
+burn-cubecl-fusion = { git = "https://github.com/theoparis/burn.git", rev = "4c7f3a0a7a886c24045bbf26537a9e08511f00b9" }
+burn-fusion = { git = "https://github.com/theoparis/burn.git", rev = "4c7f3a0a7a886c24045bbf26537a9e08511f00b9" }
+burn-ir = { git = "https://github.com/theoparis/burn.git", rev = "4c7f3a0a7a886c24045bbf26537a9e08511f00b9" }
+
+# Prices ONE GPU dispatch on the portable backends -- the floor that decides whether the decode
+# path is dispatch-bound (it is) rather than compute-bound.
+[[example]]
+name = "dispatch_overhead_probe"
+path = "examples/dispatch_overhead_probe.rs"
+required-features = ["cubecl-gpu"]
+
+[[example]]
+name = "embed_probe"
+path = "examples/embed_probe.rs"
+required-features = ["cubecl-gpu"]
+
+[[example]]
+name = "f16_gemv_probe"
+path = "examples/f16_gemv_probe.rs"
+required-features = ["cubecl-gpu"]
+
+[[example]]
+name = "host_enqueue_probe"
+path = "examples/host_enqueue_probe.rs"
+required-features = ["cubecl-gpu"]
+
+[[example]]
+name = "embed_dtype_probe"
+path = "examples/embed_dtype_probe.rs"
+required-features = ["cubecl-gpu"]

@@ -81,16 +81,16 @@ use burn_cubecl::tensor::CubeTensor;
 use burn_cubecl_fusion::CubeFusionHandle;
 
 use burn_fusion::FusionTensor;
-use burn_fusion::stream::{Operation, OperationStreams};
+use burn_fusion::stream::{Operation, StreamId};
 
 use burn_ir::{CustomOpIr, HandleContainer, OperationIr, TensorIr, TensorStatus};
 
 /// The inner (non-fusion) compute backend that the default `Cuda` wraps. Its float/int tensor
 /// primitive is a [`CubeTensor`], which is what a `#[cube(launch)]` kernel runs against.
-type InnerBackend<R> = CubeBackend<R, f32, i32, u8>;
+type InnerBackend<R> = CubeBackend<R>;
 
-/// The fusion runtime used by `Cuda = Fusion<CubeBackend<CudaRuntime, f32, i32, u8>>`.
-type Fr<R> = FusionCubeRuntime<R, u8>;
+/// The fusion runtime used by `Cuda = Fusion<CubeBackend<CudaRuntime>>`.
+type Fr<R> = FusionCubeRuntime<R>;
 
 /// Which kind of handle a tensor is carried by in the fusion [`HandleContainer`].
 ///
@@ -220,13 +220,15 @@ impl<R: CubeRuntime> CubeCustomOp<R> {
         let client = self.inputs[0].0.client.clone();
 
         // --- Rule 1: ONE inputs list → BOTH the stream registration AND the op IR. ---------------
-        // (a) Record the input streams by *borrowing* the same list (must happen before we consume
-        //     the tensors into their IR below).
-        let streams = OperationStreams::with_inputs(self.inputs.iter().map(|(tensor, _)| tensor));
+        // Newer burn-fusion no longer threads an explicit per-input `OperationStreams` value into
+        // `register`; cross-stream tensor sharing is resolved out-of-band before this call, and
+        // every op just registers on the caller's current stream (see `ClientMutex::register`'s
+        // doc comment upstream).
+        let stream = StreamId::current();
 
-        // (b) Consume the same list into input IRs (and remember each input's handle kind so
-        //     `execute` can route it). Because both (a) and (b) iterate the identical `self.inputs`,
-        //     a caller cannot register an input in one place but forget the other.
+        // Consume the same list into input IRs (and remember each input's handle kind so
+        //     `execute` can route it). Because this is the SAME `self.inputs` list, a caller
+        //     cannot register an input in one place but forget the other.
         let mut input_irs: Vec<TensorIr> = Vec::with_capacity(self.inputs.len());
         let mut input_kinds: Vec<HandleKind> = Vec::with_capacity(self.inputs.len());
         for (tensor, kind) in self.inputs {
@@ -260,7 +262,7 @@ impl<R: CubeRuntime> CubeCustomOp<R> {
             kernel: Box::new(kernel),
         };
 
-        client.register(streams, OperationIr::Custom(desc), op)
+        client.register(stream, OperationIr::Custom(desc), op)
     }
 }
 

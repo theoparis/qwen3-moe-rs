@@ -4,6 +4,7 @@ Cargo.lock
 
 # Model weights and data — bring your own; never commit these.
 /models
+/models-*
 /data
 *.safetensors
 *.bpk

@@ -29,6 +29,8 @@ pub struct Nvfp4Linear {
     bs: Tensor<2, Int>,
     /// Global f32 scale `[1]`.
     gscale: Tensor<1>,
+    /// Global f32 scale scalar value on CPU.
+    gscale_f32: f32,
     /// Optional bias `[N]`, added after the GEMV.
     bias: Option<Tensor<1>>,
     /// Input dim (columns of the activation / rows of the Burn weight).
@@ -62,12 +64,13 @@ impl Nvfp4Linear {
             Tensor::<2, Int>::from_data(TensorData::new(qw_i8, [n, k / 2]), (&device, DType::I8));
         let bs =
             Tensor::<2, Int>::from_data(TensorData::new(bs_i8, [n, k / 16]), (&device, DType::I8));
-        let gscale = Tensor::<1>::from_data(TensorData::new(vec![gscale], [1]), &device);
+        let gscale_tensor = Tensor::<1>::from_data(TensorData::new(vec![gscale], [1]), &device);
 
         Self {
             qw,
             bs,
-            gscale,
+            gscale: gscale_tensor,
+            gscale_f32: gscale,
             bias,
             k,
             n,
@@ -112,18 +115,25 @@ impl Nvfp4Linear {
             "Nvfp4Linear::from_packed_parts: gscale must be finite and positive"
         );
 
-        let qw_i8: Vec<i8> = qw.iter().map(|&b| b as i8).collect();
-        let bs_i8: Vec<i8> = block_scales.iter().map(|&b| b as i8).collect();
-        let qw =
-            Tensor::<2, Int>::from_data(TensorData::new(qw_i8, [n, k / 2]), (device, DType::I8));
-        let bs =
-            Tensor::<2, Int>::from_data(TensorData::new(bs_i8, [n, k / 16]), (device, DType::I8));
-        let gscale = Tensor::<1>::from_data(TensorData::new(vec![gscale], [1]), device);
+        // Reinterpret the raw bytes as I8 rather than mapping element-by-element into a fresh
+        // `Vec<i8>`: `u8 as i8` is a pure bit-reinterpretation, and this constructor runs over the
+        // whole ~1.1 GB resident core at load, where the extra pass and its temporary allocation are
+        // the difference between a brief load and a multi-minute one on a memory-tight machine.
+        let qw = Tensor::<2, Int>::from_data(
+            TensorData::from_bytes_vec(qw, [n, k / 2], DType::I8),
+            (device, DType::I8),
+        );
+        let bs = Tensor::<2, Int>::from_data(
+            TensorData::from_bytes_vec(block_scales, [n, k / 16], DType::I8),
+            (device, DType::I8),
+        );
+        let gscale_tensor = Tensor::<1>::from_data(TensorData::new(vec![gscale], [1]), device);
 
         Self {
             qw,
             bs,
-            gscale,
+            gscale: gscale_tensor,
+            gscale_f32: gscale,
             bias: None,
             k,
             n,
@@ -156,6 +166,26 @@ impl Nvfp4Linear {
     /// Output dim `N`.
     pub fn n(&self) -> usize {
         self.n
+    }
+
+    /// Packed weight tensor.
+    pub fn qw(&self) -> &Tensor<2, Int> {
+        &self.qw
+    }
+
+    /// Block scales tensor.
+    pub fn bs(&self) -> &Tensor<2, Int> {
+        &self.bs
+    }
+
+    /// Global scale tensor.
+    pub fn gscale(&self) -> &Tensor<1> {
+        &self.gscale
+    }
+
+    /// Global scale f32 value.
+    pub fn gscale_f32(&self) -> f32 {
+        self.gscale_f32
     }
 
     /// Whether a bias is stored.

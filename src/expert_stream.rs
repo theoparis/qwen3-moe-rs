@@ -15,6 +15,8 @@
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::path::Path;
+#[cfg(feature = "cubecl-gpu")]
+use std::sync::Arc;
 
 use burn::prelude::Device;
 use burn::tensor::activation::silu;
@@ -25,8 +27,101 @@ use crate::linear2d::Precision;
 #[cfg(feature = "cubecl-gpu")]
 use crate::nvfp4::quantize_nvfp4_from_nk_bf16;
 #[cfg(feature = "cubecl-gpu")]
+use crate::nvfp4_blob::{BlobManifest, BlobProj};
+#[cfg(feature = "cubecl-gpu")]
 use crate::nvfp4_linear::Nvfp4Linear;
 use crate::nvidia_ckpt::ShardReader;
+
+/// Offline NVFP4 expert store (see `crate::nvfp4_blob`), read via bounded parallel `pread`.
+///
+/// Earlier version of this used `mmap`. turbo-fieldfare's own I/O experiments
+/// (`turbo-fieldfare/docs/experiments/summaries/01-model-install-and-expert-io.md`, IO-01) measured
+/// `mmap` as **3.5x slower per cold read** than explicit `pread` in the same regime we're in --
+/// working set (17 GiB) exceeds usable RAM (16 GiB), so every miss is a genuine cold fault either
+/// way, and the VM layer adds overhead `pread` doesn't pay. Their end-to-end simulator: 0.50 tok/s
+/// with `mmap` vs 3.97 tok/s with parallel `pread`. `File::read_exact_at` is positional (no shared
+/// seek cursor), so many threads can safely read the same `File` concurrently -- that's what makes
+/// the bounded parallel read pool below possible without any locking.
+#[cfg(feature = "cubecl-gpu")]
+struct BlobSource {
+    dir: std::path::PathBuf,
+    manifest: BlobManifest,
+    files: std::collections::HashMap<usize, Arc<std::fs::File>>,
+}
+
+#[cfg(feature = "cubecl-gpu")]
+impl BlobSource {
+    fn open(dir: std::path::PathBuf) -> Result<Self, String> {
+        let manifest = BlobManifest::load(&dir)?;
+        Ok(Self {
+            dir,
+            manifest,
+            files: std::collections::HashMap::new(),
+        })
+    }
+
+    fn file_for_layer(&mut self, layer: usize) -> Result<Arc<std::fs::File>, String> {
+        if let Some(f) = self.files.get(&layer) {
+            return Ok(f.clone());
+        }
+        let path = BlobManifest::layer_path(&self.dir, layer);
+        let file = std::fs::File::open(&path)
+            .map_err(|e| format!("open NVFP4 blob {}: {e}", path.display()))?;
+        let want = self.manifest.layer_file_len() as u64;
+        let got = file
+            .metadata()
+            .map_err(|e| format!("stat {}: {e}", path.display()))?
+            .len();
+        if got != want {
+            return Err(format!(
+                "NVFP4 blob {} is {got} bytes, expected {want}; rebuild the store",
+                path.display()
+            ));
+        }
+        let file = Arc::new(file);
+        self.files.insert(layer, file.clone());
+        Ok(file)
+    }
+}
+
+/// One expert's raw NVFP4 record, read off disk with no decode/quantize step.
+#[cfg(feature = "cubecl-gpu")]
+type RawRecord = (Vec<u8>, Vec<u8>, f32); // (qw, block_scales, gscale)
+
+/// `pread` one expert's record out of an open layer file. Positional (`read_exact_at`), so this is
+/// safe to call concurrently from multiple threads against the same `File`.
+#[cfg(feature = "cubecl-gpu")]
+fn pread_record(
+    file: &std::fs::File,
+    layout: &crate::nvfp4_blob::ProjLayout,
+    expert: usize,
+) -> Result<RawRecord, String> {
+    use std::os::unix::fs::FileExt;
+    let base = layout.record_offset(expert) as u64;
+    let mut buf = vec![0u8; layout.stride];
+    file.read_exact_at(&mut buf, base)
+        .map_err(|e| format!("pread NVFP4 record (expert {expert}): {e}"))?;
+    let (qw, rest) = buf.split_at(layout.qw_len());
+    let (block_scales, gs) = rest.split_at(layout.bs_len());
+    let gscale = f32::from_le_bytes([gs[0], gs[1], gs[2], gs[3]]);
+    Ok((qw.to_vec(), block_scales.to_vec(), gscale))
+}
+
+/// How many OS threads read misses concurrently for one layer's prefetch. turbo-fieldfare's own
+/// sweep (DEC/IO summaries) tested 4 and 8 workers; 8 is I/O-bound (blocking syscalls, not spinning)
+/// so it doesn't compete with GPU dispatch on the main thread the way the earlier CPU-bound
+/// `std::thread::scope` quantize parallelization did (that oversubscribed P-cores; this doesn't).
+#[cfg(feature = "cubecl-gpu")]
+const PREAD_WORKERS: usize = 8;
+
+/// A layer's misses, currently being read off disk in the background while the caller can dispatch
+/// that layer's cache *hits* on the GPU. See `ExpertSlotPool::prefetch_layer_begin`.
+#[cfg(feature = "cubecl-gpu")]
+struct PendingReads {
+    layer: usize,
+    proj: Proj,
+    handle: std::thread::JoinHandle<Vec<(usize, Result<RawRecord, String>)>>,
+}
 
 /// Which fused projection tensor within a layer's routed-expert stack.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -51,7 +146,7 @@ enum CachedSlot {
 }
 
 #[cfg(feature = "cubecl-gpu")]
-fn stream_nvfp4() -> bool {
+pub(crate) fn stream_nvfp4() -> bool {
     std::env::var("QWEN35_STREAM_NVFP4").ok().as_deref() != Some("0")
 }
 
@@ -64,8 +159,27 @@ fn stream_nvfp4() -> bool {
 /// itself. `QWEN35_STREAM_SYNC=0` drops to one sync per layer (issued by the caller) so the
 /// dispatches can pipeline; watch memory when enabling it. NVFP4 slots are ~4x smaller than the
 /// bf16 tensors this guard was originally sized against, so the backlog risk is correspondingly lower.
+/// Defaults to false (pipelined dispatch): syncing per-expert forces ~320 GPU pipeline drains
+/// per token, adding ~160-320 ms of pure synchronization stall. Set QWEN35_STREAM_SYNC=1 only for debugging.
 fn sync_per_expert() -> bool {
-    std::env::var("QWEN35_STREAM_SYNC").ok().as_deref() != Some("0")
+    std::env::var("QWEN35_STREAM_SYNC").ok().as_deref() == Some("1")
+}
+
+/// Comptime batch bound baked into the NVFP4 GEMV (`nvfp4_decode_gemv`'s `m_max`).
+///
+/// This is NOT free headroom: `m_max` is `#[comptime]`, so the kernel unrolls `m_max` accumulator
+/// copies AND issues `m_max` `plane_sum` warp reductions per output column regardless of the actual
+/// row count. At decode `m_dim == 1`, so the long-standing `m_max = 8` did 8x the reductions and
+/// carried 8x the register pressure to serve one row. Rows beyond `m_max` are handled by chunking
+/// in `Nvfp4Linear::forward`, so a smaller bound only costs extra launches during prefill (~14 us
+/// each), which is far cheaper than the per-column waste at decode.
+/// Override with QWEN35_STREAM_M_MAX (1..=8).
+fn stream_m_max() -> usize {
+    std::env::var("QWEN35_STREAM_M_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| (1..=8).contains(v))
+        .unwrap_or(1)
 }
 
 #[cfg(feature = "cubecl-gpu")]
@@ -91,7 +205,7 @@ fn pack_out_in_nvfp4(
     // without the two stride-`n` passes and the k*n f32 scratch allocation -- this runs on every
     // routed expert on every decode step, so it is the hot path.
     let (qw, bs, gscale) = quantize_nvfp4_from_nk_bf16(bf16_bytes, k, n);
-    Ok(Nvfp4Linear::from_packed_parts(qw, bs, gscale, k, n, device).with_m_max(8))
+    Ok(Nvfp4Linear::from_packed_parts(qw, bs, gscale, k, n, device).with_m_max(stream_m_max()))
 }
 
 /// LRU-bounded cache of decoded expert weight tensors, backed by on-demand mmap reads of the
@@ -104,6 +218,12 @@ fn pack_out_in_nvfp4(
 /// checkpoint before this fix).
 pub struct ExpertSlotPool<'a> {
     reader: ShardReader<'a>,
+    /// Offline NVFP4 store, when `QWEN35_NVFP4_BLOB_DIR` points at a valid one.
+    #[cfg(feature = "cubecl-gpu")]
+    blob: Option<BlobSource>,
+    /// In-flight background reads started by `prefetch_layer_begin`, joined by `prefetch_layer_finish`.
+    #[cfg(feature = "cubecl-gpu")]
+    pending: Vec<PendingReads>,
     cache: LruCache<SlotKey, CachedSlot>,
     pub hits: usize,
     pub misses: usize,
@@ -120,8 +240,43 @@ impl<'a> ExpertSlotPool<'a> {
     /// e.g. `2 * num_experts_per_tok` gives headroom for a token's routed set changing between
     /// consecutive decode steps without evicting mid-step.
     pub fn new(dir: &'a Path, index: &'a BTreeMap<String, String>, capacity: usize) -> Self {
+        #[cfg(feature = "cubecl-gpu")]
+        let blob = match std::env::var("QWEN35_NVFP4_BLOB_DIR") {
+            Ok(p) if !p.is_empty() => match BlobSource::open(std::path::PathBuf::from(&p)) {
+                Ok(src) => {
+                    eprintln!("streamed experts: using offline NVFP4 blob store at {p}");
+                    Some(src)
+                }
+                // A misconfigured store must not silently fall back to the 10x slower bf16 path.
+                Err(e) => panic!("QWEN35_NVFP4_BLOB_DIR={p} could not be opened: {e}"),
+            },
+            _ => {
+                let candidates = [
+                    std::path::PathBuf::from("models-nvfp4"),
+                    dir.join("models-nvfp4"),
+                    dir.to_path_buf(),
+                ];
+                candidates.into_iter().find_map(|p| {
+                    if p.join("manifest.txt").exists() {
+                        match BlobSource::open(p.clone()) {
+                            Ok(src) => {
+                                eprintln!("streamed experts: auto-detected offline NVFP4 blob store at {}", p.display());
+                                Some(src)
+                            }
+                            Err(_) => None,
+                        }
+                    } else {
+                        None
+                    }
+                })
+            }
+        };
         Self {
             reader: ShardReader::new(dir, index),
+            #[cfg(feature = "cubecl-gpu")]
+            blob,
+            #[cfg(feature = "cubecl-gpu")]
+            pending: Vec::new(),
             cache: LruCache::new(NonZeroUsize::new(capacity.max(1)).unwrap()),
             hits: 0,
             misses: 0,
@@ -196,9 +351,184 @@ impl<'a> ExpertSlotPool<'a> {
         experts: &[usize],
         device: &Device,
     ) -> Result<(), String> {
-        self.prefetch_proj(layer, Proj::GateUp, experts, device)?;
-        self.prefetch_proj(layer, Proj::Down, experts, device)?;
+        self.prefetch_layer_begin(layer, experts, device)?;
+        self.prefetch_layer_finish(device)
+    }
+
+    /// Hit-first split, phase 1: classify `experts` into cache hits (already resident, promoted in
+    /// the LRU, ready to dispatch immediately) versus misses, and for the offline NVFP4 blob store
+    /// (`QWEN35_NVFP4_BLOB_DIR`), start reading the misses on a bounded background thread pool
+    /// (`pread`, not `mmap` -- see `BlobSource`'s doc comment for why) instead of blocking on them.
+    ///
+    /// Caller should run `expert_forward` for the returned hits *before* calling
+    /// [`Self::prefetch_layer_finish`], so that GPU dispatch of the already-resident experts
+    /// overlaps the background disk reads instead of waiting behind them -- this is the same
+    /// "hit-first execution" split turbo-fieldfare measured as a 14.4% win over blocking every
+    /// expert on I/O (`turbo-fieldfare/docs/experiments/summaries/02-decode-moe-int4-and-router.md`,
+    /// DEC-18).
+    ///
+    /// Without the blob store (bf16 fallback), this eagerly does the old synchronous read+quantize
+    /// for all misses and returns only the true hits -- still correct, just without the overlap,
+    /// since `ShardReader::read_expert_slices` takes `&mut self` and isn't safely parallelizable
+    /// without a larger refactor.
+    pub fn prefetch_layer_begin(
+        &mut self,
+        layer: usize,
+        experts: &[usize],
+        device: &Device,
+    ) -> Result<Vec<usize>, String> {
+        #[cfg(feature = "cubecl-gpu")]
+        {
+            use std::collections::HashSet;
+            let mut missed: HashSet<usize> = HashSet::new();
+            for proj in [Proj::GateUp, Proj::Down] {
+                let missing = self.classify_and_spawn(layer, proj, experts, device)?;
+                missed.extend(missing);
+            }
+            return Ok(experts
+                .iter()
+                .copied()
+                .filter(|e| !missed.contains(e))
+                .collect());
+        }
+        #[cfg(not(feature = "cubecl-gpu"))]
+        {
+            self.prefetch_proj(layer, Proj::GateUp, experts, device)?;
+            self.prefetch_proj(layer, Proj::Down, experts, device)?;
+            Ok(Vec::new())
+        }
+    }
+
+    /// Hit-first split, phase 2: join the background reads started by
+    /// [`Self::prefetch_layer_begin`] and upload them into the cache. After this returns, every
+    /// expert passed to `prefetch_layer_begin` is resident.
+    #[cfg(feature = "cubecl-gpu")]
+    pub fn prefetch_layer_finish(&mut self, device: &Device) -> Result<(), String> {
+        let t0 = std::time::Instant::now();
+        let pending = std::mem::take(&mut self.pending);
+        let mut joined: Vec<(SlotKey, RawRecord)> = Vec::new();
+        for pr in pending {
+            let results = pr
+                .handle
+                .join()
+                .map_err(|_| "NVFP4 blob read worker thread panicked".to_string())?;
+            for (expert, res) in results {
+                let rec = res?;
+                joined.push((
+                    SlotKey {
+                        layer: pr.layer,
+                        proj: pr.proj,
+                        expert,
+                    },
+                    rec,
+                ));
+            }
+        }
+        self.io_ns += t0.elapsed().as_nanos() as u64;
+
+        let t1 = std::time::Instant::now();
+        for (key, (qw, bs, gscale)) in joined {
+            let layout = *self
+                .blob
+                .as_ref()
+                .expect("pending reads imply blob is present")
+                .manifest
+                .layout(match key.proj {
+                    Proj::GateUp => BlobProj::GateUp,
+                    Proj::Down => BlobProj::Down,
+                });
+            let packed = Nvfp4Linear::from_packed_parts(qw, bs, gscale, layout.k, layout.n, device)
+                .with_m_max(stream_m_max());
+            self.cache.put(key, CachedSlot::Nvfp4(packed));
+        }
+        self.upload_ns += t1.elapsed().as_nanos() as u64;
         Ok(())
+    }
+
+    #[cfg(not(feature = "cubecl-gpu"))]
+    pub fn prefetch_layer_finish(&mut self, _device: &Device) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Classify one projection's experts into hits/misses (touching the LRU for hits) and, if the
+    /// blob store is active, spawn [`PREAD_WORKERS`] threads to read the misses in the background.
+    /// Returns the miss list (bf16 fallback: misses are read synchronously here instead, so the
+    /// returned list can be treated as "no longer missing" by the caller either way).
+    #[cfg(feature = "cubecl-gpu")]
+    fn classify_and_spawn(
+        &mut self,
+        layer: usize,
+        proj: Proj,
+        experts: &[usize],
+        device: &Device,
+    ) -> Result<Vec<usize>, String> {
+        let missing: Vec<usize> = experts
+            .iter()
+            .copied()
+            .filter(|&e| {
+                let key = SlotKey {
+                    layer,
+                    proj,
+                    expert: e,
+                };
+                if self.cache.get(&key).is_some() {
+                    self.hits += 1;
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+        if missing.is_empty() {
+            return Ok(missing);
+        }
+
+        if let Some(blob) = self.blob.as_mut() {
+            self.misses += missing.len();
+            let file = blob.file_for_layer(layer)?;
+            let blob_proj = match proj {
+                Proj::GateUp => BlobProj::GateUp,
+                Proj::Down => BlobProj::Down,
+            };
+            let layout = *blob.manifest.layout(blob_proj);
+            let workers = PREAD_WORKERS.min(missing.len()).max(1);
+            // Chunk (not one-thread-per-expert): bounds thread count regardless of miss count, and
+            // these are blocking `pread` syscalls, so a chunk's threads sleep while waiting on disk
+            // rather than competing with the main thread's GPU dispatch for a P-core.
+            let chunks: Vec<Vec<usize>> = {
+                let mut out = vec![Vec::new(); workers];
+                for (i, e) in missing.iter().enumerate() {
+                    out[i % workers].push(*e);
+                }
+                out
+            };
+            for chunk in chunks {
+                if chunk.is_empty() {
+                    continue;
+                }
+                let file = file.clone();
+                let layout = layout;
+                let handle = std::thread::spawn(move || {
+                    chunk
+                        .into_iter()
+                        .map(|e| (e, pread_record(&file, &layout, e)))
+                        .collect::<Vec<_>>()
+                });
+                self.pending.push(PendingReads {
+                    layer,
+                    proj,
+                    handle,
+                });
+            }
+            return Ok(missing);
+        }
+
+        // No blob store: fall back to the old synchronous bf16 read+quantize path so behaviour is
+        // unchanged. `prefetch_proj` recomputes its own hit/miss filter over `missing`, but since
+        // every key here is a genuine miss that filter is a no-op re-check (0 additional hits) --
+        // the real miss count still comes from its read loop, so this doesn't double-count.
+        self.prefetch_proj(layer, proj, &missing, device)?;
+        Ok(missing)
     }
 
     fn prefetch_proj(
@@ -228,6 +558,10 @@ impl<'a> ExpertSlotPool<'a> {
         if missing.is_empty() {
             return Ok(());
         }
+        // The offline blob store is handled entirely by `classify_and_spawn` / `prefetch_layer_begin`
+        // + `prefetch_layer_finish` (bounded parallel `pread`, hit-first overlap). `prefetch_proj` is
+        // now only the bf16-checkpoint fallback path used when no blob store is configured.
+
         let tensor_key = match proj {
             Proj::GateUp => Self::gate_up_key(layer),
             Proj::Down => Self::down_key(layer),
@@ -301,7 +635,29 @@ impl<'a> ExpertSlotPool<'a> {
         match self.fetch_slot(key, &tensor_key, device)? {
             CachedSlot::Dense(t) => Ok(t),
             #[cfg(feature = "cubecl-gpu")]
-            CachedSlot::Nvfp4(_) => Err("gate_up: slot is NVFP4-packed; use expert_forward".into()),
+            CachedSlot::Nvfp4(_) => {
+                Err("gate_up: slot is NVFP4-packed; use expert_forward or gate_up_nvfp4".into())
+            }
+        }
+    }
+
+    /// Fetch (from cache or disk) the NVFP4 `gate_up` weight for one expert.
+    #[cfg(feature = "cubecl-gpu")]
+    pub fn gate_up_nvfp4(
+        &mut self,
+        layer: usize,
+        expert: usize,
+        device: &Device,
+    ) -> Result<Nvfp4Linear, String> {
+        let key = SlotKey {
+            layer,
+            proj: Proj::GateUp,
+            expert,
+        };
+        let tensor_key = Self::gate_up_key(layer);
+        match self.fetch_slot(key, &tensor_key, device)? {
+            CachedSlot::Nvfp4(lin) => Ok(lin),
+            CachedSlot::Dense(_) => Err("gate_up_nvfp4: slot is Dense; expected NVFP4".into()),
         }
     }
 
@@ -321,7 +677,29 @@ impl<'a> ExpertSlotPool<'a> {
         match self.fetch_slot(key, &tensor_key, device)? {
             CachedSlot::Dense(t) => Ok(t),
             #[cfg(feature = "cubecl-gpu")]
-            CachedSlot::Nvfp4(_) => Err("down: slot is NVFP4-packed; use expert_forward".into()),
+            CachedSlot::Nvfp4(_) => {
+                Err("down: slot is NVFP4-packed; use expert_forward or down_nvfp4".into())
+            }
+        }
+    }
+
+    /// Fetch (from cache or disk) the NVFP4 `down` weight for one expert.
+    #[cfg(feature = "cubecl-gpu")]
+    pub fn down_nvfp4(
+        &mut self,
+        layer: usize,
+        expert: usize,
+        device: &Device,
+    ) -> Result<Nvfp4Linear, String> {
+        let key = SlotKey {
+            layer,
+            proj: Proj::Down,
+            expert,
+        };
+        let tensor_key = Self::down_key(layer);
+        match self.fetch_slot(key, &tensor_key, device)? {
+            CachedSlot::Nvfp4(lin) => Ok(lin),
+            CachedSlot::Dense(_) => Err("down_nvfp4: slot is Dense; expected NVFP4".into()),
         }
     }
 

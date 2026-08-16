@@ -14,19 +14,18 @@
 //! {ℓ, ℓ+32, …}); layout `q:[B,Hq,1,D]`, `k,v:[B,Hkv,Sk,D]` matching `flash_attention_raw` (the
 //! cache-native `[B,T_max,Hkv,D]` + device-`pos` bound + `Line` vectorization + bf16 are the next
 //! increments). Verified vs a CPU oracle in `examples/flash_raw_smoke.rs`.
+//!
+//! Backend-generic (`R: CubeRuntime`, same pattern as `gdn_kernel.rs`): runs on CUDA, Metal, Vulkan
+//! and portable wgpu, not just CUDA — the split-K algorithm has no CUDA-specific dependency, only the
+//! original wiring hardcoded `CudaRuntime`.
 
-use burn::backend::cuda::Cuda;
-
-use burn::tensor::{DType, Tensor, TensorPrimitive};
-use burn_cubecl::CubeBackend;
+use burn::tensor::{DType, Tensor};
+use burn_cubecl::CubeRuntime;
 use burn_cubecl::kernel::into_contiguous;
 use burn_cubecl::tensor::CubeTensor;
-use cubecl::cuda::CudaRuntime;
-use cubecl::prelude::ScalarArg;
 use cubecl::{CubeCount, CubeDim};
 
-use crate::capture::CaptureBackend;
-use crate::cube_custom_op::CubeCustomOp;
+use crate::cubecl_rt::alloc_f32;
 
 mod gpu {
     use cubecl::prelude::*;
@@ -165,19 +164,6 @@ mod gpu {
     }
 }
 
-/// Split-K flash-decode on the raw `CubeBackend` (below Fusion). `q:[B,Hq,1,D]`, `k,v:[B,Hkv,Sk,D]`
-/// (GQA NOT expanded). `n_splits` partitions the KV range. Correctness-first: f32, scalar strided
-/// D-partition. Verified vs a CPU oracle in `examples/flash_raw_smoke.rs`.
-pub fn flash_decode_raw(
-    q: Tensor<4>,
-    k: Tensor<4>,
-    v: Tensor<4>,
-    scale: f32,
-    n_splits: usize,
-) -> Tensor<4> {
-    <CaptureBackend as FlashDecodeBackend>::flash_decode(q, k, v, scale, n_splits)
-}
-
 fn assert_flash_decode_shapes(
     op: &str,
     q: &Tensor<4>,
@@ -208,14 +194,17 @@ fn assert_flash_decode_shapes(
     assert!(n_splits >= 1, "{op}: n_splits must be >= 1");
 }
 
-#[cfg(feature = "cuda")]
-fn run_flash_decode_tensors(
-    q: CubeTensor<CudaRuntime>,
-    k: CubeTensor<CudaRuntime>,
-    v: CubeTensor<CudaRuntime>,
+/// Backend-generic split-K flash-decode over raw `CubeTensor<R>`s. `q:[B,Hq,1,D]`,
+/// `k,v:[B,Hkv,Sk,D]` (GQA NOT expanded — the split kernel divides by `n_rep` internally, so the
+/// caller must NOT pre-repeat K/V across query heads). Runs on any `CubeRuntime` (CUDA, Metal,
+/// Vulkan, portable wgpu).
+pub fn launch_flash_decode<R: CubeRuntime>(
+    q: CubeTensor<R>,
+    k: CubeTensor<R>,
+    v: CubeTensor<R>,
     scale: f32,
     n_splits: usize,
-) -> CubeTensor<CudaRuntime> {
+) -> CubeTensor<R> {
     let q_shape = q.meta.shape();
     let k_shape = k.meta.shape();
     let [bsz, hq, sq, d] = q_shape.dims();
@@ -228,137 +217,100 @@ fn run_flash_decode_tensors(
     let k_ct = into_contiguous(k);
     let v_ct = into_contiguous(v);
     let client = q_ct.client.clone();
-    let device = q_ct.device.clone();
 
-    let mk = |shape: Vec<usize>| -> CubeTensor<CudaRuntime> {
-        let nelem: usize = shape.iter().product();
-        let buffer = client.empty(nelem * DType::F32.size());
-        CubeTensor::new_contiguous(
-            client.clone(),
-            device.clone(),
-            shape.into(),
-            buffer,
-            DType::F32,
-        )
-    };
-    let acc_out = mk(vec![n_splits, bsz, hq, d]);
-    let m_out = mk(vec![n_splits, bsz, hq]);
-    let l_out = mk(vec![n_splits, bsz, hq]);
-    let out = mk(vec![bsz, hq, 1, d]);
+    let acc_out = alloc_f32(&q_ct, &[n_splits, bsz, hq, d]);
+    let m_out = alloc_f32(&q_ct, &[n_splits, bsz, hq]);
+    let l_out = alloc_f32(&q_ct, &[n_splits, bsz, hq]);
+    let out = alloc_f32(&q_ct, &[bsz, hq, 1, d]);
 
     match k_ct.dtype {
-        DType::BF16 => gpu::flash_decode_split::launch::<half::bf16, CudaRuntime>(
+        DType::BF16 => gpu::flash_decode_split::launch::<half::bf16, R>(
             &client,
             CubeCount::Static(hq as u32, bsz as u32, n_splits as u32),
             CubeDim { x: 32, y: 1, z: 1 },
-            q_ct.as_tensor_arg(1),
-            k_ct.as_tensor_arg(1),
-            v_ct.as_tensor_arg(1),
-            acc_out.as_tensor_arg(1),
-            m_out.as_tensor_arg(1),
-            l_out.as_tensor_arg(1),
-            ScalarArg::new(scale),
-            ScalarArg::new(n_rep),
-            ScalarArg::new(split_len as u32),
+            q_ct.clone().into_tensor_arg(),
+            k_ct.clone().into_tensor_arg(),
+            v_ct.clone().into_tensor_arg(),
+            acc_out.clone().into_tensor_arg(),
+            m_out.clone().into_tensor_arg(),
+            l_out.clone().into_tensor_arg(),
+            scale.into(),
+            n_rep.into(),
+            (split_len as u32).into(),
             d,
-        )
-        .expect("flash_decode_split launch failed"),
-        DType::F32 => gpu::flash_decode_split::launch::<f32, CudaRuntime>(
+        ),
+        DType::F32 => gpu::flash_decode_split::launch::<f32, R>(
             &client,
             CubeCount::Static(hq as u32, bsz as u32, n_splits as u32),
             CubeDim { x: 32, y: 1, z: 1 },
-            q_ct.as_tensor_arg(1),
-            k_ct.as_tensor_arg(1),
-            v_ct.as_tensor_arg(1),
-            acc_out.as_tensor_arg(1),
-            m_out.as_tensor_arg(1),
-            l_out.as_tensor_arg(1),
-            ScalarArg::new(scale),
-            ScalarArg::new(n_rep),
-            ScalarArg::new(split_len as u32),
+            q_ct.clone().into_tensor_arg(),
+            k_ct.clone().into_tensor_arg(),
+            v_ct.clone().into_tensor_arg(),
+            acc_out.clone().into_tensor_arg(),
+            m_out.clone().into_tensor_arg(),
+            l_out.clone().into_tensor_arg(),
+            scale.into(),
+            n_rep.into(),
+            (split_len as u32).into(),
             d,
-        )
-        .expect("flash_decode_split launch failed"),
-        d => panic!("flash_decode_raw: unsupported k/v dtype {d:?} (expected bf16 or f32)"),
+        ),
+        dt => panic!("launch_flash_decode: unsupported k/v dtype {dt:?} (expected bf16 or f32)"),
     }
 
-    gpu::flash_decode_combine::launch::<CudaRuntime>(
+    gpu::flash_decode_combine::launch::<R>(
         &client,
         CubeCount::Static(hq as u32, bsz as u32, 1),
         CubeDim { x: 32, y: 1, z: 1 },
-        acc_out.as_tensor_arg(1),
-        m_out.as_tensor_arg(1),
-        l_out.as_tensor_arg(1),
-        out.as_tensor_arg(1),
+        acc_out.into_tensor_arg(),
+        m_out.into_tensor_arg(),
+        l_out.into_tensor_arg(),
+        out.clone().into_tensor_arg(),
         d,
         n_splits,
-    )
-    .expect("flash_decode_combine launch failed");
+    );
 
     out
 }
 
-#[cfg(feature = "cuda")]
-pub trait FlashDecodeBackend: Backend {
-    fn flash_decode(
-        q: Tensor<4>,
-        k: Tensor<4>,
-        v: Tensor<4>,
-        scale: f32,
-        n_splits: usize,
-    ) -> Tensor<4>;
+macro_rules! try_backend_flash_decode {
+    ($B:ty, $q:expr, $k:expr, $v:expr, $scale:expr, $n_splits:expr) => {{
+        if let (Ok(q), Ok(k), Ok(v)) = (
+            $q.clone().try_into_primitive::<$B>(),
+            $k.clone().try_into_primitive::<$B>(),
+            $v.clone().try_into_primitive::<$B>(),
+        ) {
+            let out = launch_flash_decode(q, k, v, $scale, $n_splits);
+            return Tensor::from_primitive::<$B>(out);
+        }
+    }};
 }
 
-#[cfg(feature = "cuda")]
-impl FlashDecodeBackend for Cuda {
-    fn flash_decode(
-        q: Tensor<4>,
-        k: Tensor<4>,
-        v: Tensor<4>,
-        scale: f32,
-        n_splits: usize,
-    ) -> Tensor<4> {
-        assert_flash_decode_shapes("flash_decode", &q, &k, &v, n_splits);
-        let [bsz, hq, _, d] = q.dims();
-        let q = q.into_primitive().tensor();
-        let k = k.into_primitive().tensor();
-        let v = v.into_primitive().tensor();
+/// Split-K flash-decode over standard `burn::tensor::Tensor<4>` handles, dispatched to whichever
+/// GPU backend is compiled in (`cuda`, `metal`, `vulkan`, `wgpu`). `q:[B,Hq,1,D]`,
+/// `k,v:[B,Hkv,Sk,D]` (GQA not pre-expanded). Panics if no matching backend feature is enabled or
+/// primitive conversion fails (should not happen: called only under `cfg(feature = "cubecl-gpu")`
+/// with tensors that live on a `CubeBackend`).
+pub fn flash_decode(
+    q: Tensor<4>,
+    k: Tensor<4>,
+    v: Tensor<4>,
+    scale: f32,
+    n_splits: usize,
+) -> Tensor<4> {
+    assert_flash_decode_shapes("flash_decode", &q, &k, &v, n_splits);
 
-        let outputs = CubeCustomOp::<CudaRuntime>::new("flash_decode")
-            .float_input(q)
-            .float_input(k)
-            .float_input(v)
-            .float_output([bsz, hq, 1, d], DType::F32)
-            .launch(move |inputs| {
-                vec![run_flash_decode_tensors(
-                    inputs[0].clone(),
-                    inputs[1].clone(),
-                    inputs[2].clone(),
-                    scale,
-                    n_splits,
-                )]
-            });
-
-        Tensor::from_primitive(TensorPrimitive::Float(
-            outputs.into_iter().next().expect("one output"),
-        ))
+    #[cfg(all(feature = "metal", not(feature = "metal-fusion-diag")))]
+    try_backend_flash_decode!(burn::backend::Metal, q, k, v, scale, n_splits);
+    #[cfg(feature = "vulkan")]
+    try_backend_flash_decode!(burn::backend::Vulkan, q, k, v, scale, n_splits);
+    #[cfg(feature = "wgpu")]
+    try_backend_flash_decode!(burn::backend::Wgpu, q, k, v, scale, n_splits);
+    #[cfg(feature = "cuda")]
+    {
+        type CudaRaw = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime>;
+        try_backend_flash_decode!(CudaRaw, q, k, v, scale, n_splits);
+        try_backend_flash_decode!(burn::backend::Cuda, q, k, v, scale, n_splits);
     }
-}
 
-#[cfg(feature = "cuda")]
-impl FlashDecodeBackend for CubeBackend<CudaRuntime, f32, i32, u8> {
-    fn flash_decode(
-        q: Tensor<4>,
-        k: Tensor<4>,
-        v: Tensor<4>,
-        scale: f32,
-        n_splits: usize,
-    ) -> Tensor<4> {
-        assert_flash_decode_shapes("flash_decode_raw", &q, &k, &v, n_splits);
-        let q = q.into_primitive().tensor();
-        let k = k.into_primitive().tensor();
-        let v = v.into_primitive().tensor();
-        let out = run_flash_decode_tensors(q, k, v, scale, n_splits);
-        Tensor::from_primitive(TensorPrimitive::Float(out))
-    }
+    panic!("flash_decode: backend not supported or primitive conversion failed");
 }
