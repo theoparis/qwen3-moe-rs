@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use burn::store::{ModuleStore, SafetensorsStore};
-use qwen3_burn::nvidia_ckpt::{shard_index, ShardReader};
+use qwen3_burn::nvidia_ckpt::{ShardReader, shard_index};
 
 fn main() {
     let dir = std::env::args()

@@ -15,20 +15,20 @@
 //!
 //!   RUSTFLAGS="-C target-feature=+fp16" cargo run --release --features cuda --example rollout_decode_bench
 
-use burn::backend::cuda::{Cuda, CudaDevice};
-use burn::tensor::backend::Backend;
+use burn::prelude::Device;
+
 use burn::tensor::module::attention_fallback as attention;
 use burn::tensor::ops::AttentionModuleOptions;
-use burn::tensor::{Distribution, Int, Tensor};
-use qwen3_burn::grpo::{group_sample_cached, group_sample_cached_shrink, RolloutConfig};
+use burn::tensor::{Device, Distribution, Int, Tensor};
 use qwen3_burn::Qwen3Config;
+use qwen3_burn::grpo::{RolloutConfig, group_sample_cached, group_sample_cached_shrink};
 use std::time::Instant;
 
 type B = Cuda;
 
 /// Force the device queue to drain so `Instant` brackets measure real GPU work (not just enqueue).
 fn sync(d: &CudaDevice) {
-    let _ = Tensor::<B, 1>::zeros([1], d).sum().into_scalar();
+    let _ = Tensor::<1>::zeros([1], d).sum().into_scalar();
 }
 
 /// Median / mean / min / max of a length vector.
@@ -42,11 +42,17 @@ fn stats(v: &[usize]) -> (usize, usize, f64, usize) {
 
 /// Per-row response lengths from a completion mask `[N, gen_len]` (row-major host vec) = sum of 1s.
 fn lengths_from_mask(mask: &[f32], n: usize, gen_len: usize) -> Vec<usize> {
-    (0..n).map(|s| (0..gen_len).filter(|&t| mask[s * gen_len + t] == 1.0).count()).collect()
+    (0..n)
+        .map(|s| {
+            (0..gen_len)
+                .filter(|&t| mask[s * gen_len + t] == 1.0)
+                .count()
+        })
+        .collect()
 }
 
 /// Build a Qwen3 with the given vocab and a fixed 0.6B-class per-layer geometry (random init).
-fn build_model(device: &CudaDevice, vocab: usize, layers: usize) -> qwen3_burn::Qwen3ForCausalLM<B> {
+fn build_model(device: &CudaDevice, vocab: usize, layers: usize) -> qwen3_burn::Qwen3ForCausalLM {
     let cfg = Qwen3Config::new()
         .with_vocab_size(vocab)
         .with_hidden_size(1024)
@@ -55,11 +61,11 @@ fn build_model(device: &CudaDevice, vocab: usize, layers: usize) -> qwen3_burn::
         .with_num_attention_heads(16)
         .with_num_key_value_heads(8)
         .with_head_dim(Some(128));
-    cfg.init_causal_lm::<B>(device)
+    cfg.init_causal_lm(device)
 }
 
 fn main() {
-    let device = CudaDevice::default();
+    let device = Device::cuda(0);
     println!("device: {device:?} | backend: Cuda (sm_121 / GB10)\n");
 
     let (hidden, inter, layers, heads, kv, hd) = (1024usize, 3072, 12, 16, 8, 128);
@@ -76,14 +82,22 @@ fn main() {
     // vocab-independent, and every per-step cost scales with the live row count, so the speedup RATIO
     // is the same as at production vocab (part b measures the absolute per-component costs at real vocab).
     let vocab_a = 256usize;
-    <B as Backend>::seed(&device, 1234);
+    device.seed(1234);
     let model_a = build_model(&device, vocab_a, layers);
     let (p, g, lp, max_new) = (16usize, 4usize, 16usize, 128usize);
     let n = p * g;
-    let prompt_ids: Vec<i64> = (0..(p * lp) as i64).map(|i| (i * 131 + 17) % vocab_a as i64).collect();
-    let prompt = Tensor::<B, 1, Int>::from_data(prompt_ids.as_slice(), &device).reshape([p, lp]);
+    let prompt_ids: Vec<i64> = (0..(p * lp) as i64)
+        .map(|i| (i * 131 + 17) % vocab_a as i64)
+        .collect();
+    let prompt = Tensor::<1, Int>::from_data(prompt_ids.as_slice(), &device).reshape([p, lp]);
     let eos: Vec<i64> = ((vocab_a as i64 * 45 / 100)..vocab_a as i64).collect(); // upper ~55% of vocab
-    let rc = RolloutConfig { group_size: g, max_new_tokens: max_new, temperature: 0.0, top_p: 1.0, top_k: 0 };
+    let rc = RolloutConfig {
+        group_size: g,
+        max_new_tokens: max_new,
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 0,
+    };
 
     println!(
         "=== (a) BATCH-SHRINK speedup  (model vocab={vocab_a}, N={n}, prompt_len={lp}, max_new={max_new}, GREEDY) ==="
@@ -94,10 +108,16 @@ fn main() {
     let _ = group_sample_cached_shrink(&model_a, prompt.clone(), &rc, &eos);
     sync(&device);
     let gen_len = warm.gen_len;
-    let lens = lengths_from_mask(&warm.completion_mask.into_data().to_vec::<f32>().unwrap(), n, gen_len);
+    let lens = lengths_from_mask(
+        &warm.completion_mask.into_data().to_vec::<f32>().unwrap(),
+        n,
+        gen_len,
+    );
     let (mn, md, me, mx) = stats(&lens);
     let early = lens.iter().filter(|&&l| l < gen_len).count();
-    println!("  realized lengths: min={mn} median={md} mean={me:.1} max={mx} | finished_before_end={early}/{n}");
+    println!(
+        "  realized lengths: min={mn} median={md} mean={me:.1} max={mx} | finished_before_end={early}/{n}"
+    );
 
     // time no-shrink
     sync(&device);
@@ -132,15 +152,17 @@ fn main() {
     // =====================================================================================
     // (b) DECODE-STEP COST BREAKDOWN at PRODUCTION vocab (host read/sample/logits scale with vocab).
     let vocab_b = 151936usize; // the real Qwen3 vocab
-    <B as Backend>::seed(&device, 99);
+    device.seed(99);
     let model_b = build_model(&device, vocab_b, layers);
     println!("=== (b) DECODE-STEP COST BREAKDOWN  (model vocab={vocab_b}, N={n}) ===");
-    decode_cost_breakdown(&model_b, &device, n, vocab_b, hidden, inter, layers, heads, kv, hd);
+    decode_cost_breakdown(
+        &model_b, &device, n, vocab_b, hidden, inter, layers, heads, kv, hd,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
 fn decode_cost_breakdown(
-    model: &qwen3_burn::Qwen3ForCausalLM<B>,
+    model: &qwen3_burn::Qwen3ForCausalLM,
     device: &CudaDevice,
     n: usize,
     vocab: usize,
@@ -159,30 +181,44 @@ fn decode_cost_breakdown(
     // Prime the cache ONCE with a prefill of `ctx0`, then time `reps` real decode steps (each feeds one
     // token at the next position, advancing `filled`). This is the steady-state per-token decode cost —
     // NOT prefill (the earlier bug: re-prefilling every rep measured prefill+decode).
-    let prompt = Tensor::<B, 1, Int>::from_data(
-        (0..(n * ctx0) as i64).map(|i| (i * 131 + 17) % vocab as i64).collect::<Vec<_>>().as_slice(),
+    let prompt = Tensor::<1, Int>::from_data(
+        (0..(n * ctx0) as i64)
+            .map(|i| (i * 131 + 17) % vocab as i64)
+            .collect::<Vec<_>>()
+            .as_slice(),
         device,
     )
     .reshape([n, ctx0]);
     let mut cache = model.new_cache_with_capacity(ctx0 + reps + 4);
-    let pos0 = Tensor::<B, 1, Int>::arange(0..ctx0 as i64, device).unsqueeze_dim::<2>(0).repeat(&[n, 1]);
-    let _ = model.model.forward_with_cache(prompt, None, pos0, &mut cache, Default::default()); // prefill
+    let pos0 = Tensor::<1, Int>::arange(0..ctx0 as i64, device)
+        .unsqueeze_dim::<2>(0)
+        .repeat(&[n, 1]);
+    let _ = model
+        .model
+        .forward_with_cache(prompt, None, pos0, &mut cache, Default::default()); // prefill
     sync(device);
 
-    let decode = |cache: &mut qwen3_burn::ModelCache<B>, pos_i: usize| {
-        let next = Tensor::<B, 1, Int>::from_data(vec![7i64; n].as_slice(), device).reshape([n, 1]);
-        let pos = Tensor::<B, 1, Int>::from_data([pos_i as i64].as_slice(), device)
+    let decode = |cache: &mut qwen3_burn::ModelCache, pos_i: usize| {
+        let next = Tensor::<1, Int>::from_data(vec![7i64; n].as_slice(), device).reshape([n, 1]);
+        let pos = Tensor::<1, Int>::from_data([pos_i as i64].as_slice(), device)
             .unsqueeze_dim::<2>(0)
             .repeat(&[n, 1]);
-        model.model.forward_with_cache(next, None, pos, cache, Default::default()) // [n, 1, hidden]
+        model
+            .model
+            .forward_with_cache(next, None, pos, cache, Default::default()) // [n, 1, hidden]
     };
 
     // warmup one decode (on a throwaway primed cache so we don't burn the timed cache's budget)
     {
         let mut wc = model.new_cache_with_capacity(ctx0 + 2);
-        let wp = Tensor::<B, 1, Int>::from_data(vec![1i64; n * ctx0].as_slice(), device).reshape([n, ctx0]);
-        let wpos = Tensor::<B, 1, Int>::arange(0..ctx0 as i64, device).unsqueeze_dim::<2>(0).repeat(&[n, 1]);
-        let _ = model.model.forward_with_cache(wp, None, wpos, &mut wc, Default::default());
+        let wp =
+            Tensor::<1, Int>::from_data(vec![1i64; n * ctx0].as_slice(), device).reshape([n, ctx0]);
+        let wpos = Tensor::<1, Int>::arange(0..ctx0 as i64, device)
+            .unsqueeze_dim::<2>(0)
+            .repeat(&[n, 1]);
+        let _ = model
+            .model
+            .forward_with_cache(wp, None, wpos, &mut wc, Default::default());
         core::hint::black_box(decode(&mut wc, ctx0));
         sync(device);
     }
@@ -251,24 +287,39 @@ fn decode_cost_breakdown(
     // ---------- per-layer micro-benchmarks: ATTENTION-SDPA vs PROJECTION/MLP linears ----------
     // Decode shape: 1 query attending to T cached keys, per head. Linears are the 2-D GEMMs the model
     // runs (linear2d). Summed x layers ≈ the transformer forward (cross-check vs ms_fwd).
-    let x_h = Tensor::<B, 2>::random([n, hidden], Distribution::Normal(0.0, 1.0), device);
-    let w_qkv = Tensor::<B, 2>::random([hidden, heads * hd], Distribution::Normal(0.0, 0.02), device);
-    let w_kv = Tensor::<B, 2>::random([hidden, kv * hd], Distribution::Normal(0.0, 0.02), device);
-    let w_o = Tensor::<B, 2>::random([heads * hd, hidden], Distribution::Normal(0.0, 0.02), device);
-    let w_gate = Tensor::<B, 2>::random([hidden, inter], Distribution::Normal(0.0, 0.02), device);
-    let w_up = Tensor::<B, 2>::random([hidden, inter], Distribution::Normal(0.0, 0.02), device);
-    let w_down = Tensor::<B, 2>::random([inter, hidden], Distribution::Normal(0.0, 0.02), device);
-    let x_i = Tensor::<B, 2>::random([n, inter], Distribution::Normal(0.0, 1.0), device);
+    let x_h = Tensor::<2>::random([n, hidden], Distribution::Normal(0.0, 1.0), device);
+    let w_qkv = Tensor::<2>::random(
+        [hidden, heads * hd],
+        Distribution::Normal(0.0, 0.02),
+        device,
+    );
+    let w_kv = Tensor::<2>::random([hidden, kv * hd], Distribution::Normal(0.0, 0.02), device);
+    let w_o = Tensor::<2>::random(
+        [heads * hd, hidden],
+        Distribution::Normal(0.0, 0.02),
+        device,
+    );
+    let w_gate = Tensor::<2>::random([hidden, inter], Distribution::Normal(0.0, 0.02), device);
+    let w_up = Tensor::<2>::random([hidden, inter], Distribution::Normal(0.0, 0.02), device);
+    let w_down = Tensor::<2>::random([inter, hidden], Distribution::Normal(0.0, 0.02), device);
+    let x_i = Tensor::<2>::random([n, inter], Distribution::Normal(0.0, 1.0), device);
 
     // attention tensors (KV heads already expanded to `heads` for GQA, as the model does pre-SDPA)
-    let q4 = Tensor::<B, 4>::random([n, heads, 1, hd], Distribution::Normal(0.0, 1.0), device);
-    let k4 = Tensor::<B, 4>::random([n, heads, ctx, hd], Distribution::Normal(0.0, 1.0), device);
-    let v4 = Tensor::<B, 4>::random([n, heads, ctx, hd], Distribution::Normal(0.0, 1.0), device);
+    let q4 = Tensor::<4>::random([n, heads, 1, hd], Distribution::Normal(0.0, 1.0), device);
+    let k4 = Tensor::<4>::random([n, heads, ctx, hd], Distribution::Normal(0.0, 1.0), device);
+    let v4 = Tensor::<4>::random([n, heads, ctx, hd], Distribution::Normal(0.0, 1.0), device);
 
     // warmup the micro ops
     {
         let q = x_h.clone().matmul(w_qkv.clone());
-        let a = attention(q4.clone(), k4.clone(), v4.clone(), None, None, AttentionModuleOptions::default());
+        let a = attention(
+            q4.clone(),
+            k4.clone(),
+            v4.clone(),
+            None,
+            None,
+            AttentionModuleOptions::default(),
+        );
         core::hint::black_box((q, a));
         sync(device);
     }
@@ -303,7 +354,14 @@ fn decode_cost_breakdown(
     sync(device);
     let t0 = Instant::now();
     for _ in 0..reps {
-        let a = attention(q4.clone(), k4.clone(), v4.clone(), None, None, AttentionModuleOptions::default());
+        let a = attention(
+            q4.clone(),
+            k4.clone(),
+            v4.clone(),
+            None,
+            None,
+            AttentionModuleOptions::default(),
+        );
         core::hint::black_box(a);
     }
     sync(device);
@@ -317,19 +375,40 @@ fn decode_cost_breakdown(
     let total = ms_fwd + ms_logits + ms_read + ms_sample;
     let pct = |x: f64| 100.0 * x / total;
     println!("  per decode step (avg of {reps}), N={n}, context T={ctx}:");
-    println!("    transformer fwd (all {layers} layers) : {ms_fwd:8.3} ms  ({:5.1}%)", pct(ms_fwd));
-    println!("    logits proj  [N,h]@[h,{vocab}]        : {ms_logits:8.3} ms  ({:5.1}%)", pct(ms_logits));
-    println!("    host-sync read into_data [N,{vocab}]  : {ms_read:8.3} ms  ({:5.1}%)", pct(ms_read));
-    println!("    host sampling/argmax (CPU)            : {ms_sample:8.3} ms  ({:5.1}%)", pct(ms_sample));
+    println!(
+        "    transformer fwd (all {layers} layers) : {ms_fwd:8.3} ms  ({:5.1}%)",
+        pct(ms_fwd)
+    );
+    println!(
+        "    logits proj  [N,h]@[h,{vocab}]        : {ms_logits:8.3} ms  ({:5.1}%)",
+        pct(ms_logits)
+    );
+    println!(
+        "    host-sync read into_data [N,{vocab}]  : {ms_read:8.3} ms  ({:5.1}%)",
+        pct(ms_read)
+    );
+    println!(
+        "    host sampling/argmax (CPU)            : {ms_sample:8.3} ms  ({:5.1}%)",
+        pct(ms_sample)
+    );
     println!("    ----------------------------------------------------------");
     println!("    TOTAL per decode step                 : {total:8.3} ms");
     println!();
     println!("  transformer-forward attribution (per-layer micro-bench x {layers} layers):");
     let sub = ms_attn + ms_proj + ms_mlp;
     let subpct = |x: f64| 100.0 * x / sub;
-    println!("    attention SDPA (Q@K^T, softmax, @V)   : {ms_attn:8.3} ms  ({:5.1}% of fwd-ops)", subpct(ms_attn));
-    println!("    projection linears (q,k,v,o)          : {ms_proj:8.3} ms  ({:5.1}% of fwd-ops)", subpct(ms_proj));
-    println!("    MLP linears (gate,up,down + SwiGLU)   : {ms_mlp:8.3} ms  ({:5.1}% of fwd-ops)", subpct(ms_mlp));
+    println!(
+        "    attention SDPA (Q@K^T, softmax, @V)   : {ms_attn:8.3} ms  ({:5.1}% of fwd-ops)",
+        subpct(ms_attn)
+    );
+    println!(
+        "    projection linears (q,k,v,o)          : {ms_proj:8.3} ms  ({:5.1}% of fwd-ops)",
+        subpct(ms_proj)
+    );
+    println!(
+        "    MLP linears (gate,up,down + SwiGLU)   : {ms_mlp:8.3} ms  ({:5.1}% of fwd-ops)",
+        subpct(ms_mlp)
+    );
     println!(
         "    (GEMM-op sum {sub:.3} ms << measured fwd {ms_fwd:.3} ms: the remaining ~{:.0}% of the \
          forward is NON-GEMM per-token overhead — RmsNorm/RoPE/embed/GQA-expand + kernel-launch latency \
@@ -348,7 +427,10 @@ fn decode_cost_breakdown(
     .into_iter()
     .fold(("", 0.0f64), |b, x| if x.1 > b.1 { x } else { b });
     let attn_step_pct = 100.0 * ms_attn / total;
-    println!("  DOMINATES (whole decode step): {} ({:.1} ms).", dominant.0, dominant.1);
+    println!(
+        "  DOMINATES (whole decode step): {} ({:.1} ms).",
+        dominant.0, dominant.1
+    );
     println!(
         "  Flash-Decode verdict: attention-SDPA is {:.1}% of the forward COMPUTE (T={ctx}) but only \
          ~{attn_step_pct:.0}% of the whole decode step. At production vocab the step is dominated by HOST \

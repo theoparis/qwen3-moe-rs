@@ -94,8 +94,7 @@ fn kernel_scaled_fp4_e4m3(
         #[unroll]
         for j in 0..line_size_c {
             let n_elem = i * line_size_c + j;
-            let (row, col) =
-                def.position_of_nth(lane_id, n_elem as u32, MatrixIdent::Accumulator);
+            let (row, col) = def.position_of_nth(lane_id, n_elem as u32, MatrixIdent::Accumulator);
             let idx = row as usize * N + col as usize;
             reg[j] = c[idx];
         }
@@ -116,8 +115,7 @@ fn kernel_scaled_fp4_e4m3(
         #[unroll]
         for j in 0..line_size_c {
             let n_elem = i * line_size_c + j;
-            let (row, col) =
-                def.position_of_nth(lane_id, n_elem as u32, MatrixIdent::Accumulator);
+            let (row, col) = def.position_of_nth(lane_id, n_elem as u32, MatrixIdent::Accumulator);
             let idx = row as usize * N + col as usize;
             out[idx] = reg[j];
         }
@@ -280,7 +278,7 @@ fn print_matrix(label: &str, data: &[f32]) {
 }
 
 fn main() {
-    let device = CudaDevice::default();
+    let device = Device::cuda(0);
     let client = R::client(&device);
 
     let config = chosen_config();

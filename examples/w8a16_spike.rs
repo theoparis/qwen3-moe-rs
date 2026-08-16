@@ -22,10 +22,10 @@
 //!   RUSTFLAGS="-C target-feature=+fp16" \
 //!     cargo run --release --features cuda --example w8a16_spike 2>&1 | tail -40
 
-use burn::backend::NdArray;
-use burn::backend::cuda::{Cuda, CudaDevice};
-use burn::prelude::Backend;
-use burn::tensor::{DType, Int, Tensor, TensorData};
+use burn::prelude::Device;
+use burn::prelude::Device;
+use burn::prelude::Device;
+use burn::tensor::{DType, Device, Int, Tensor, TensorData};
 
 use qwen3_burn::w8a16::{
     dequant_e4m3, e4m3_decode, e4m3_to_f32, quantize_e4m3_per_channel, w8a16_gemm,
@@ -43,7 +43,10 @@ impl Lcg {
     }
     /// Uniform f32 in [-amp, amp].
     fn next(&mut self, amp: f32) -> f32 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u = ((self.0 >> 33) as u32) as f32 / (u32::MAX as f32);
         (u * 2.0 - 1.0) * amp
     }
@@ -70,7 +73,10 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
 }
 
 fn max_abs(a: &[f32]) -> f32 {
@@ -107,7 +113,7 @@ fn step_a(cuda_dev: &CudaDevice) -> bool {
     // Carry the raw e4m3 bytes in a 1-byte I8 Int tensor (fp8 has no Burn float DType and Burn's Int
     // kind has no u8; `b as i8` is bit-preserving, and the kernel reinterprets the bits as e4m3).
     let bytes_i8: Vec<i8> = bytes.iter().map(|&b| b as i8).collect();
-    let q = Tensor::<Cuda, 1, Int>::from_data_dtype(
+    let q = Tensor::<1, Int>::from_data_dtype(
         TensorData::new(bytes_i8, [bytes.len()]),
         cuda_dev,
         DType::I8,
@@ -124,12 +130,20 @@ fn step_a(cuda_dev: &CudaDevice) -> bool {
         all_ok &= gpu_ok && host_ok;
         println!(
             "  0x{b:02X} -> gpu={g:<12} host={h:<12} golden={exp:<12} {} {name}",
-            if gpu_ok && host_ok { "[OK]" } else { "[MISMATCH]" },
+            if gpu_ok && host_ok {
+                "[OK]"
+            } else {
+                "[MISMATCH]"
+            },
         );
     }
     println!(
         "  STEP A: {}\n",
-        if all_ok { "PASS — GPU e4m3 decode == OCP golden == host codec" } else { "FAIL" }
+        if all_ok {
+            "PASS — GPU e4m3 decode == OCP golden == host codec"
+        } else {
+            "FAIL"
+        }
     );
     all_ok
 }
@@ -155,7 +169,7 @@ struct Row {
     ok: bool,
 }
 
-fn run_shape(s: Shape, cuda_dev: &CudaDevice, nd_dev: &<NdArray<f32> as Backend>::Device) -> Row {
+fn run_shape(s: Shape, cuda_dev: &Device, nd_dev: &Device) -> Row {
     let Shape { label, k, n, m } = s;
 
     // Same host data everywhere. Weights small-ish; activations ~N(0,1)-scale uniform.
@@ -166,21 +180,26 @@ fn run_shape(s: Shape, cuda_dev: &CudaDevice, nd_dev: &<NdArray<f32> as Backend>
     let (q_bytes, scale) = quantize_e4m3_per_channel(&w_data, k, n);
 
     // --- GPU fused W8A16 GEMM ---
-    let x_cu = Tensor::<Cuda, 2>::from_data(TensorData::new(x_data.clone(), [m, k]), cuda_dev);
+    let x_cu = Tensor::<2>::from_data(TensorData::new(x_data.clone(), [m, k]), cuda_dev);
     let q_i8: Vec<i8> = q_bytes.iter().map(|&b| b as i8).collect(); // bit-preserving e4m3 bytes
-    let q_cu = Tensor::<Cuda, 2, Int>::from_data_dtype(
-        TensorData::new(q_i8, [k, n]),
-        cuda_dev,
-        DType::I8,
-    );
-    let s_cu = Tensor::<Cuda, 1>::from_data(TensorData::new(scale.clone(), [n]), cuda_dev);
-    let gpu = w8a16_gemm(x_cu, q_cu, s_cu).into_data().to_vec::<f32>().unwrap();
+    let q_cu =
+        Tensor::<2, Int>::from_data_dtype(TensorData::new(q_i8, [k, n]), cuda_dev, DType::I8);
+    let s_cu = Tensor::<1>::from_data(TensorData::new(scale.clone(), [n]), cuda_dev);
+    let gpu = w8a16_gemm(x_cu, q_cu, s_cu)
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
 
     // --- NdArray (CPU f32) oracle: dequant the SAME bytes on the host, matmul on CPU ---
     let w_deq = dequant_e4m3(&q_bytes, &scale, k, n); // exact bytes the GPU kernel decodes
-    let x_nd = Tensor::<NdArray<f32>, 2>::from_data(TensorData::new(x_data.clone(), [m, k]), nd_dev);
-    let w_nd = Tensor::<NdArray<f32>, 2>::from_data(TensorData::new(w_deq, [k, n]), nd_dev);
-    let y_ref = x_nd.clone().matmul(w_nd).into_data().to_vec::<f32>().unwrap();
+    let x_nd = Tensor::<2>::from_data(TensorData::new(x_data.clone(), [m, k]), nd_dev);
+    let w_nd = Tensor::<2>::from_data(TensorData::new(w_deq, [k, n]), nd_dev);
+    let y_ref = x_nd
+        .clone()
+        .matmul(w_nd)
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
 
     let cos = cosine(&gpu, &y_ref);
     let mad = max_abs_diff(&gpu, &y_ref);
@@ -188,8 +207,7 @@ fn run_shape(s: Shape, cuda_dev: &CudaDevice, nd_dev: &<NdArray<f32> as Backend>
     let ok = gpu.len() == m * n && cos > 0.999 && !gpu.iter().any(|x| x.is_nan());
 
     // --- Informational: fp8 path vs full-precision f32 reference (x @ W_orig) ---
-    let w_orig_nd =
-        Tensor::<NdArray<f32>, 2>::from_data(TensorData::new(w_data.clone(), [k, n]), nd_dev);
+    let w_orig_nd = Tensor::<2>::from_data(TensorData::new(w_data.clone(), [k, n]), nd_dev);
     let y_full = x_nd.matmul(w_orig_nd).into_data().to_vec::<f32>().unwrap();
     let quant_cos = cosine(&gpu, &y_full);
     let quant_rel = max_abs_diff(&gpu, &y_full) / max_abs(&y_full).max(1e-9);
@@ -202,25 +220,64 @@ fn run_shape(s: Shape, cuda_dev: &CudaDevice, nd_dev: &<NdArray<f32> as Backend>
         100.0 * quant_rel,
     );
 
-    Row { label: lbl, cos, mad, quant_cos, quant_rel, ok }
+    Row {
+        label: lbl,
+        cos,
+        mad,
+        quant_cos,
+        quant_rel,
+        ok,
+    }
 }
 
 fn main() {
-    let cuda_dev = CudaDevice::default();
-    let nd_dev = <NdArray<f32> as Backend>::Device::default();
-    println!("device: {cuda_dev:?} | oracle: NdArray (CPU f32) | kernel: fused CubeCL W8A16 (e4m3)");
+    let cuda_dev = Device::cuda(0);
+    let nd_dev = Device::flex();
+    println!(
+        "device: {cuda_dev:?} | oracle: NdArray (CPU f32) | kernel: fused CubeCL W8A16 (e4m3)"
+    );
     println!("cross-backend law: oracle is an INDEPENDENT CPU backend (docs/VLLM_KERNELS.md §0)\n");
 
     let a_ok = step_a(&cuda_dev);
 
     println!("=== STEP C — fused W8A16 GEMM vs NdArray (CPU f32) oracle, real Qwen3 shapes ===");
     let shapes = [
-        Shape { label: "qkv/gate [decode]", k: 2048, n: 768, m: 1 },
-        Shape { label: "qkv/gate", k: 2048, n: 768, m: 64 },
-        Shape { label: "down     [decode]", k: 768, n: 2048, m: 1 },
-        Shape { label: "down", k: 768, n: 2048, m: 64 },
-        Shape { label: "mlp-up   [decode]", k: 1024, n: 3072, m: 1 },
-        Shape { label: "mlp-up", k: 1024, n: 3072, m: 64 },
+        Shape {
+            label: "qkv/gate [decode]",
+            k: 2048,
+            n: 768,
+            m: 1,
+        },
+        Shape {
+            label: "qkv/gate",
+            k: 2048,
+            n: 768,
+            m: 64,
+        },
+        Shape {
+            label: "down     [decode]",
+            k: 768,
+            n: 2048,
+            m: 1,
+        },
+        Shape {
+            label: "down",
+            k: 768,
+            n: 2048,
+            m: 64,
+        },
+        Shape {
+            label: "mlp-up   [decode]",
+            k: 1024,
+            n: 3072,
+            m: 1,
+        },
+        Shape {
+            label: "mlp-up",
+            k: 1024,
+            n: 3072,
+            m: 64,
+        },
     ];
     let mut rows = Vec::new();
     for s in shapes {
@@ -228,7 +285,10 @@ fn main() {
     }
 
     println!("\n================ SUMMARY (kernel vs NdArray CPU oracle) ================");
-    println!("{:30}  {:>9} {:>11} {:>10} {:>9}", "shape", "cos", "max_abs", "quant_rel", "quant_cos");
+    println!(
+        "{:30}  {:>9} {:>11} {:>10} {:>9}",
+        "shape", "cos", "max_abs", "quant_rel", "quant_cos"
+    );
     let mut all_ok = a_ok;
     for r in &rows {
         println!(
@@ -257,9 +317,16 @@ fn main() {
         );
     }
 
-    assert!(a_ok, "STEP A: GPU e4m3 decode did not match the OCP golden vectors");
+    assert!(
+        a_ok,
+        "STEP A: GPU e4m3 decode did not match the OCP golden vectors"
+    );
     for r in &rows {
-        assert!(r.ok, "STEP C: shape `{}` failed vs the NdArray oracle (cos={:.6})", r.label, r.cos);
+        assert!(
+            r.ok,
+            "STEP C: shape `{}` failed vs the NdArray oracle (cos={:.6})",
+            r.label, r.cos
+        );
     }
     println!("\nALL CHECKS PASSED.");
 }

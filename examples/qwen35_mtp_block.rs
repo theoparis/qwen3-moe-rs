@@ -10,12 +10,12 @@
 use std::{path::PathBuf, time::Instant};
 
 use burn::{
-    backend::cuda::{Cuda, CudaDevice},
+    prelude::Device,
     tensor::{DType, Int, Tensor},
 };
 use qwen3_burn::{
-    KVCache, Precision, Qwen3Tokenizer, Qwen3_5HybridCache, Qwen3_5HybridLayerCache,
-    Qwen3_5LayerType, Qwen3_5MoeConfig,
+    KVCache, Precision, Qwen3_5HybridCache, Qwen3_5HybridLayerCache, Qwen3_5LayerType,
+    Qwen3_5MoeConfig, Qwen3Tokenizer,
 };
 
 type B = Cuda;
@@ -81,22 +81,22 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn positions(start: usize, len: usize, device: &CudaDevice) -> Tensor<B, 2, Int> {
+fn positions(start: usize, len: usize, device: &CudaDevice) -> Tensor<2, Int> {
     if len == 1 {
-        Tensor::<B, 2, Int>::from_data([[start as i64]], device)
+        Tensor::<2, Int>::from_data([[start as i64]], device)
     } else {
-        Tensor::<B, 1, Int>::arange(start as i64..(start + len) as i64, device).unsqueeze()
+        Tensor::<1, Int>::arange(start as i64..(start + len) as i64, device).unsqueeze()
     }
 }
 
-fn last_hidden(hidden: &Tensor<B, 3>) -> Tensor<B, 3> {
+fn last_hidden(hidden: &Tensor<3>) -> Tensor<3> {
     let [batch, seq, hidden_size] = hidden.dims();
     hidden
         .clone()
         .slice([0..batch, (seq - 1)..seq, 0..hidden_size])
 }
 
-fn hidden_at(hidden: &Tensor<B, 3>, idx: usize) -> Tensor<B, 3> {
+fn hidden_at(hidden: &Tensor<3>, idx: usize) -> Tensor<3> {
     let [batch, seq, hidden_size] = hidden.dims();
     assert!(
         idx < seq,
@@ -107,7 +107,7 @@ fn hidden_at(hidden: &Tensor<B, 3>, idx: usize) -> Tensor<B, 3> {
         .slice([0..batch, idx..(idx + 1), 0..hidden_size])
 }
 
-fn assert_logits_all_finite(logits: &Tensor<B, 3>, what: &str) -> Result<(), String> {
+fn assert_logits_all_finite(logits: &Tensor<3>, what: &str) -> Result<(), String> {
     let [batch, seq, vocab] = logits.dims();
     let values = logits
         .clone()
@@ -127,7 +127,7 @@ fn assert_logits_all_finite(logits: &Tensor<B, 3>, what: &str) -> Result<(), Str
     Ok(())
 }
 
-fn assert_logits2_all_finite(logits: &Tensor<B, 2>, what: &str) -> Result<(), String> {
+fn assert_logits2_all_finite(logits: &Tensor<2>, what: &str) -> Result<(), String> {
     let [batch, vocab] = logits.dims();
     let values = logits
         .clone()
@@ -147,10 +147,10 @@ fn assert_logits2_all_finite(logits: &Tensor<B, 2>, what: &str) -> Result<(), St
     Ok(())
 }
 
-fn argmax_last(logits: &Tensor<B, 3>) -> Result<i64, String> {
+fn argmax_last(logits: &Tensor<3>) -> Result<i64, String> {
     assert_logits_all_finite(logits, "decode")?;
     let [batch, seq, vocab] = logits.dims();
-    let next: Tensor<B, 2, Int> = logits
+    let next: Tensor<2, Int> = logits
         .clone()
         .slice([0..batch, (seq - 1)..seq, 0..vocab])
         .reshape([batch, vocab])
@@ -165,7 +165,7 @@ fn argmax_last(logits: &Tensor<B, 3>) -> Result<i64, String> {
         .ok_or_else(|| "argmax returned no token".to_string())
 }
 
-fn argmax_each_position(logits: &Tensor<B, 3>) -> Result<Vec<i64>, String> {
+fn argmax_each_position(logits: &Tensor<3>) -> Result<Vec<i64>, String> {
     assert_logits_all_finite(logits, "verify")?;
     let [batch, seq, vocab] = logits.dims();
     if batch != 1 {
@@ -181,7 +181,7 @@ fn argmax_each_position(logits: &Tensor<B, 3>) -> Result<Vec<i64>, String> {
         .map_err(|e| format!("read verify argmax tokens: {e:?}"))
 }
 
-fn argmax_and_margin(logits: &Tensor<B, 2>) -> Result<(i64, f32), String> {
+fn argmax_and_margin(logits: &Tensor<2>) -> Result<(i64, f32), String> {
     assert_logits2_all_finite(logits, "mtp draft")?;
     let [batch, vocab] = logits.dims();
     if batch != 1 {
@@ -206,7 +206,7 @@ fn argmax_and_margin(logits: &Tensor<B, 2>) -> Result<(i64, f32), String> {
     Ok((best.0 as i64, best.1 - second.1))
 }
 
-fn full_attn_filled(cache: &Qwen3_5HybridCache<B>) -> Result<usize, String> {
+fn full_attn_filled(cache: &Qwen3_5HybridCache) -> Result<usize, String> {
     let mut filled = None;
     for (idx, layer) in cache.layers.iter().enumerate() {
         if let Qwen3_5HybridLayerCache::Full(kv) = layer {
@@ -226,7 +226,7 @@ fn full_attn_filled(cache: &Qwen3_5HybridCache<B>) -> Result<usize, String> {
 }
 
 fn assert_mtp_lockstep(
-    mtp_cache: &KVCache<B>,
+    mtp_cache: &KVCache,
     prompt_len: usize,
     generated_len: usize,
     context: &str,
@@ -259,7 +259,7 @@ fn compare_tokens(reference: &[i64], candidate: &[i64]) -> Option<usize> {
 }
 
 fn greedy_decode(
-    model: &qwen3_burn::Qwen3_5MoeForCausalLM<B>,
+    model: &qwen3_burn::Qwen3_5MoeForCausalLM,
     tokenizer: &Qwen3Tokenizer,
     prompt_ids: &[i64],
     max_new_tokens: usize,
@@ -268,7 +268,7 @@ fn greedy_decode(
 ) -> Result<GreedyRun, String> {
     let prompt_len = prompt_ids.len();
     let total = prompt_len + max_new_tokens;
-    let input = Tensor::<B, 1, Int>::from_data(prompt_ids, device).unsqueeze();
+    let input = Tensor::<1, Int>::from_data(prompt_ids, device).unsqueeze();
     let mut cache = model.model.new_cache_with_capacity(total);
 
     let pos0 = positions(0, prompt_len, device);
@@ -284,7 +284,7 @@ fn greedy_decode(
         new_ids.push(id);
 
         if step + 1 < max_new_tokens {
-            let tok = Tensor::<B, 2, Int>::from_data([[id]], device);
+            let tok = Tensor::<2, Int>::from_data([[id]], device);
             let pos = positions(prompt_len + step, 1, device);
             logits = model.forward_prec(tok, pos, &mut cache, prec);
         }
@@ -376,15 +376,15 @@ impl DraftMarginStats {
 }
 
 fn advance_mtp_for_committed(
-    model: &qwen3_burn::Qwen3_5MoeForCausalLM<B>,
-    mtp_cache: &mut KVCache<B>,
+    model: &qwen3_burn::Qwen3_5MoeForCausalLM,
+    mtp_cache: &mut KVCache,
     token_id: i64,
-    previous_hidden: Tensor<B, 3>,
+    previous_hidden: Tensor<3>,
     previous_pos: usize,
     prec: Precision,
     device: &CudaDevice,
 ) -> Result<(i64, f32), String> {
-    let tok_next = Tensor::<B, 2, Int>::from_data([[token_id]], device);
+    let tok_next = Tensor::<2, Int>::from_data([[token_id]], device);
     let pos = positions(previous_pos, 1, device);
     let (draft_logits, _mtp_hidden_out) = model.mtp.forward_draft(
         tok_next,
@@ -408,7 +408,7 @@ struct SpecRun {
 }
 
 fn spec_decode_mtp_block_correct(
-    model: &qwen3_burn::Qwen3_5MoeForCausalLM<B>,
+    model: &qwen3_burn::Qwen3_5MoeForCausalLM,
     tokenizer: &Qwen3Tokenizer,
     prompt_ids: &[i64],
     max_new_tokens: usize,
@@ -418,7 +418,7 @@ fn spec_decode_mtp_block_correct(
     let prompt_len = prompt_ids.len();
     let draft_limit = K.saturating_sub(1);
     let capacity = prompt_len + max_new_tokens + K.max(1);
-    let input = Tensor::<B, 1, Int>::from_data(prompt_ids, device).unsqueeze();
+    let input = Tensor::<1, Int>::from_data(prompt_ids, device).unsqueeze();
     let mut cache = model.model.new_cache_with_capacity(capacity);
     let mut mtp_cache = model.mtp_new_cache(capacity);
 
@@ -471,7 +471,7 @@ fn spec_decode_mtp_block_correct(
             stats.verify_batches += 1;
             stats.verify_tokens += 1;
 
-            let verify_input = Tensor::<B, 2, Int>::from_data([[committed_next]], device);
+            let verify_input = Tensor::<2, Int>::from_data([[committed_next]], device);
             let verify_pos = positions(generated.len(), 1, device);
             let verify_logits = model.forward_prec(verify_input, verify_pos, &mut cache, prec);
             let pred = argmax_each_position(&verify_logits)?;
@@ -520,7 +520,7 @@ fn spec_decode_mtp_block_correct(
             }
 
             let pos = positions(generated.len(), 1, device);
-            let tok = Tensor::<B, 2, Int>::from_data([[id]], device);
+            let tok = Tensor::<2, Int>::from_data([[id]], device);
             let (hidden, logits) = model.forward_hidden_prec(tok, pos, &mut cache, prec);
             last_logits = logits;
             last_committed_hidden = last_hidden(&hidden);
@@ -556,7 +556,7 @@ fn spec_decode_mtp_block_correct(
 }
 
 fn spec_decode_mtp_block_perf(
-    model: &qwen3_burn::Qwen3_5MoeForCausalLM<B>,
+    model: &qwen3_burn::Qwen3_5MoeForCausalLM,
     tokenizer: &Qwen3Tokenizer,
     prompt_ids: &[i64],
     max_new_tokens: usize,
@@ -566,7 +566,7 @@ fn spec_decode_mtp_block_perf(
     let prompt_len = prompt_ids.len();
     let draft_limit = K.saturating_sub(1);
     let capacity = prompt_len + max_new_tokens + K.max(1);
-    let input = Tensor::<B, 1, Int>::from_data(prompt_ids, device).unsqueeze();
+    let input = Tensor::<1, Int>::from_data(prompt_ids, device).unsqueeze();
     let mut cache = model.model.new_cache_with_capacity(capacity);
     let mut mtp_cache = model.mtp_new_cache(capacity);
 
@@ -618,7 +618,7 @@ fn spec_decode_mtp_block_perf(
             stats.verify_batches += 1;
             stats.verify_tokens += 2;
 
-            let verify_input = Tensor::<B, 2, Int>::from_data([[committed_next, draft1]], device);
+            let verify_input = Tensor::<2, Int>::from_data([[committed_next, draft1]], device);
             let verify_pos = positions(generated.len(), 2, device);
             let (verify_hidden, verify_logits) =
                 model.forward_hidden_prec(verify_input, verify_pos, &mut cache, prec);
@@ -667,7 +667,7 @@ fn spec_decode_mtp_block_perf(
                 cache.restore_gdn(gdn_snap);
 
                 let pos = positions(generated.len(), 1, device);
-                let tok = Tensor::<B, 2, Int>::from_data([[committed_next]], device);
+                let tok = Tensor::<2, Int>::from_data([[committed_next]], device);
                 let (hidden, logits) = model.forward_hidden_prec(tok, pos, &mut cache, prec);
                 last_logits = logits;
                 last_committed_hidden = last_hidden(&hidden);
@@ -682,7 +682,7 @@ fn spec_decode_mtp_block_perf(
             }
 
             let pos = positions(generated.len(), 1, device);
-            let tok = Tensor::<B, 2, Int>::from_data([[committed_next]], device);
+            let tok = Tensor::<2, Int>::from_data([[committed_next]], device);
             let (hidden, logits) = model.forward_hidden_prec(tok, pos, &mut cache, prec);
             last_logits = logits;
             last_committed_hidden = last_hidden(&hidden);
@@ -715,7 +715,7 @@ fn spec_decode_mtp_block_perf(
 }
 
 fn spec_decode_mtp_block(
-    model: &qwen3_burn::Qwen3_5MoeForCausalLM<B>,
+    model: &qwen3_burn::Qwen3_5MoeForCausalLM,
     tokenizer: &Qwen3Tokenizer,
     prompt_ids: &[i64],
     max_new_tokens: usize,
@@ -753,7 +753,7 @@ fn run() -> Result<(), String> {
     let quant_mode = QuantMode::parse(&env_string("QUANT", "bf16"))?;
     let prec = Precision::Bf16;
 
-    let device = CudaDevice::default();
+    let device = Device::cuda(0);
     println!("device: {device:?}");
     println!(
         "mtp block spec config: dir={dir:?} prompt={prompt:?} max_new_tokens={max_new_tokens} k={K} mode={mode:?} quant={}",
@@ -788,7 +788,7 @@ fn run() -> Result<(), String> {
     );
 
     let tokenizer = Qwen3Tokenizer::from_file(dir.join("tokenizer.json"))?;
-    let mut model = cfg.init_causal_lm::<B>(&device);
+    let mut model = cfg.init_causal_lm(&device);
 
     println!("loading sharded BF16 weights from {dir:?} ...");
     let load_start = Instant::now();

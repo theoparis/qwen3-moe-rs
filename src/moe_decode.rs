@@ -55,12 +55,12 @@
 //! notes and `docs/PERF_80TOKS_PLAN.md` §3 levers (D)/(E)/(F).
 
 use burn::{
-    prelude::Backend,
-    tensor::{activation::silu, DType, IndexingUpdateOp, Int, Tensor},
+    prelude::Device,
+    tensor::{DType, IndexingUpdateOp, Int, Tensor, activation::silu},
 };
 
-use crate::linear2d::Precision;
 use crate::Qwen3MoeSparseBlock;
+use crate::linear2d::Precision;
 
 #[cfg(feature = "cuda")]
 use crate::moe_grouped::FusedSwigluBackend;
@@ -72,13 +72,13 @@ use crate::moe_grouped::FusedSwigluBackend;
 /// the per-token path never re-stacks (the whole point — `stacked_experts` per-call copies hundreds of
 /// MB on the 30B every forward).
 #[derive(Debug, Clone)]
-pub struct MoeExpertCache<B: Backend> {
+pub struct MoeExpertCache {
     /// `[E, H, I]` — stacked `gate_proj` weights (Burn `Linear` `[d_in=H, d_out=I]`).
-    gate: Tensor<B, 3>,
+    gate: Tensor<3>,
     /// `[E, H, I]` — stacked `up_proj` weights.
-    up: Tensor<B, 3>,
+    up: Tensor<3>,
     /// `[E, I, H]` — stacked `down_proj` weights (Burn `Linear` `[d_in=I, d_out=H]`).
-    down: Tensor<B, 3>,
+    down: Tensor<3>,
     /// Number of experts `E`.
     e: usize,
     /// Hidden size `H`.
@@ -89,18 +89,26 @@ pub struct MoeExpertCache<B: Backend> {
     k: usize,
 }
 
-impl<B: Backend> MoeExpertCache<B> {
+impl MoeExpertCache {
     /// Build a thin gather handle over a sparse block's expert stacks. The block now OWNS the contiguous
     /// `gate [E,H,I]`/`up [E,H,I]`/`down [E,I,H]` stacks (the vLLM `FusedMoE` single-owner layout), so
     /// `stacked_experts_pub` returns refcounted handles that SHARE those buffers — this cache holds the
     /// shared handles, it does NOT allocate a second copy. (The old path `cat`-built a fresh ~58 GB
     /// duplicate here, which OOM'd the 30B; see `docs/WAVE2_STATIC_DECODE.md`.) Gather-ready, never
     /// rebuilt per forward.
-    pub fn from_block(block: &Qwen3MoeSparseBlock<B>) -> Self {
+    pub fn from_block(block: &Qwen3MoeSparseBlock) -> Self {
         let (gate, up, down) = block.stacked_experts_pub(); // [E,H,I],[E,H,I],[E,I,H]
         let [e, h, i] = gate.dims();
         debug_assert_eq!(down.dims(), [e, i, h], "down must be [E,I,H]");
-        MoeExpertCache { gate, up, down, e, h, i, k: block.top_k() }
+        MoeExpertCache {
+            gate,
+            up,
+            down,
+            e,
+            h,
+            i,
+            k: block.top_k(),
+        }
     }
 
     /// Number of experts `E` in the cache.
@@ -128,7 +136,12 @@ impl<B: Backend> MoeExpertCache<B> {
     /// host-side grouping replaced by an on-device expert-axis gather — so there is no `into_data`/
     /// `to_vec` anywhere on this path. `prec` selects the SwiGLU GEMM compute precision (f32 default;
     /// f32 is the parity-validated path).
-    pub fn decode_topk(&self, block: &Qwen3MoeSparseBlock<B>, x: Tensor<B, 3>, prec: Precision) -> Tensor<B, 3> {
+    pub fn decode_topk(
+        &self,
+        block: &Qwen3MoeSparseBlock,
+        x: Tensor<3>,
+        prec: Precision,
+    ) -> Tensor<3> {
         let [b, s, _h] = x.dims();
         let t = b * s;
         let device = x.device();
@@ -143,8 +156,11 @@ impl<B: Backend> MoeExpertCache<B> {
     /// inside a CUDA graph), so the CAPTURED static decode must precompute this ONCE outside the capture
     /// region (hoisted into [`crate::MoeStaticDecode`], exactly like the RoPE `freqs`/`arange_tmax`) and
     /// pass it to [`Self::decode_topk_pre`]. For the single-token decode (`T=1`) this is just `[0; k]`.
-    pub fn assign_tok(t: usize, k: usize, device: &B::Device) -> Tensor<B, 1, Int> {
-        Tensor::<B, 1, Int>::arange(0..t as i64, device).reshape([t, 1]).repeat(&[1, k]).reshape([t * k])
+    pub fn assign_tok(t: usize, k: usize, device: &Device) -> Tensor<1, Int> {
+        Tensor::<1, Int>::arange(0..t as i64, device)
+            .reshape([t, 1])
+            .repeat(&[1, k])
+            .reshape([t * k])
     }
 
     /// CAPTURABLE core of [`Self::decode_topk`] with the `arange`-built per-assignment token index
@@ -153,11 +169,11 @@ impl<B: Backend> MoeExpertCache<B> {
     /// is supplied instead of built per call. This is the entry point the CUDA-graph static decode captures.
     pub fn decode_topk_pre(
         &self,
-        block: &Qwen3MoeSparseBlock<B>,
-        x: Tensor<B, 3>,
+        block: &Qwen3MoeSparseBlock,
+        x: Tensor<3>,
         prec: Precision,
-        assign_tok: &Tensor<B, 1, Int>,
-    ) -> Tensor<B, 3> {
+        assign_tok: &Tensor<1, Int>,
+    ) -> Tensor<3> {
         let [b, s, h] = x.dims();
         assert_eq!(h, self.h, "x hidden {h} != cache H {}", self.h);
         let t = b * s;
@@ -166,7 +182,8 @@ impl<B: Backend> MoeExpertCache<B> {
         let device = x.device();
         let dtype = x.dtype();
         assert_eq!(
-            assign_tok.dims()[0], n,
+            assign_tok.dims()[0],
+            n,
             "assign_tok len {} != N=T*k={n} (T={t}, k={k}) — rebuild via MoeExpertCache::assign_tok(T, k)",
             assign_tok.dims()[0],
         );
@@ -192,6 +209,7 @@ impl<B: Backend> MoeExpertCache<B> {
         let comp = match prec {
             Precision::F32 => DType::F32,
             Precision::Bf16 => DType::BF16,
+            Precision::F16 => DType::F16,
         };
         let xc = x_sel.cast(comp); // [N,1,H]
         let g = silu(xc.clone().matmul(gate_sel.cast(comp))); // [N,1,I] true batched matmul (not broadcast)
@@ -203,7 +221,7 @@ impl<B: Backend> MoeExpertCache<B> {
         //    distinct experts accumulate by Add — exactly the oracle's weighted top-k sum.
         let w = sel_w.reshape([n, 1]).cast(dtype); // [N,1]
         let y_w = y * w; // [N,H]
-        let acc = Tensor::<B, 2>::zeros([t, h], &device)
+        let acc = Tensor::<2>::zeros([t, h], &device)
             .cast(dtype)
             .select_assign(0, assign_tok, y_w, IndexingUpdateOp::Add); // [T,H]
         acc.reshape([b, s, h])
@@ -213,7 +231,7 @@ impl<B: Backend> MoeExpertCache<B> {
     /// leading dim is the number of expert weight slabs the decode reads — `k` at `T=1`, i.e. ONLY the
     /// routed experts, never the full `E`. Used by `decode_reads_only_topk_experts` to prove the read set.
     #[cfg(test)]
-    fn gathered_gate_slabs(&self, block: &Qwen3MoeSparseBlock<B>, x: Tensor<B, 3>) -> Tensor<B, 3> {
+    fn gathered_gate_slabs(&self, block: &Qwen3MoeSparseBlock, x: Tensor<3>) -> Tensor<3> {
         let [b, s, _h] = x.dims();
         let n = b * s * self.k;
         let (sel_idx, _sel_w) = block.route_topk(x);
@@ -222,7 +240,7 @@ impl<B: Backend> MoeExpertCache<B> {
 }
 
 #[cfg(feature = "cuda")]
-impl<B: FusedSwigluBackend> MoeExpertCache<B> {
+impl MoeExpertCache {
     /// LEVER (c) of `docs/PERF_80TOKS_PLAN.md`: the FUSED gather-GEMV decode. Numerically EQUAL to
     /// [`Self::decode_topk_pre`] (the materializing oracle) for both `T=1` and `T>1`, but instead of
     /// `select(0, ids)`-materializing the `k` expert weight slabs `[N,H,I]`/`[N,I,H]` (a write +
@@ -239,11 +257,11 @@ impl<B: FusedSwigluBackend> MoeExpertCache<B> {
     /// MAC — never widened to a full bf16/f32 weight tensor.
     pub fn decode_topk_fused(
         &self,
-        block: &Qwen3MoeSparseBlock<B>,
-        x: Tensor<B, 3>,
+        block: &Qwen3MoeSparseBlock,
+        x: Tensor<3>,
         prec: Precision,
-        assign_tok: &Tensor<B, 1, Int>,
-    ) -> Tensor<B, 3> {
+        assign_tok: &Tensor<1, Int>,
+    ) -> Tensor<3> {
         // PRECISION CONTRACT: the fused kernel always reads bf16/f32 weights into an f32 MAC (f32
         // accumulation), matching the oracle ONLY at `Precision::F32`. A `Bf16` caller would silently
         // diverge from `decode_topk_pre`'s bf16-matmul path — the GRPO rollout-vs-recompute trap. Fail
@@ -265,7 +283,8 @@ impl<B: FusedSwigluBackend> MoeExpertCache<B> {
         let device = x.device();
         let dtype = x.dtype();
         assert_eq!(
-            assign_tok.dims()[0], n,
+            assign_tok.dims()[0],
+            n,
             "assign_tok len {} != N=T*k={n} (T={t}, k={k}) — rebuild via MoeExpertCache::assign_tok(T, k)",
             assign_tok.dims()[0],
         );
@@ -280,7 +299,7 @@ impl<B: FusedSwigluBackend> MoeExpertCache<B> {
         // 3. FUSED gather-GEMV: reads gate/up/down ONCE by expert id from the persistent stacks (no
         //    `[N,H,I]` slab, no re-stack), returns the router-WEIGHTED per-assignment output [N,H] f32.
         let x2 = x.reshape([t, h]).cast(DType::F32); // [T,H] f32 (tiny — activations, not weights)
-        let y = B::fused_gather_swiglu(
+        let y = crate::moe_grouped::fused_gather_swiglu(
             x2,
             self.gate.clone(),
             self.up.clone(),
@@ -295,7 +314,7 @@ impl<B: FusedSwigluBackend> MoeExpertCache<B> {
         let y = y.cast(dtype); // back to the model dtype for the combine
 
         // 4. SCATTER-ADD per token — exactly the oracle combine `out[t]=Σ_{e∈topk(t)} w·SwiGLU_e(x_t)`.
-        let acc = Tensor::<B, 2>::zeros([t, h], &device)
+        let acc = Tensor::<2>::zeros([t, h], &device)
             .cast(dtype)
             .select_assign(0, assign_tok.clone(), y, IndexingUpdateOp::Add); // [T,H]
         acc.reshape([b, s, h])
@@ -307,9 +326,7 @@ mod tests {
     use super::*;
     use burn::tensor::Distribution;
 
-    type B = burn::backend::NdArray;
-
-    fn dev() -> <B as Backend>::Device {
+    fn dev() -> Device {
         Default::default()
     }
 
@@ -321,21 +338,27 @@ mod tests {
     fn decode_topk_equals_oracle() {
         let device = dev();
         let (h, i, e, k) = (32usize, 16usize, 8usize, 3usize);
-        let block = Qwen3MoeSparseBlock::<B>::new(h, i, e, k, true, &device);
+        let block = Qwen3MoeSparseBlock::new(h, i, e, k, true, &device);
         let cache = MoeExpertCache::from_block(&block);
 
         // T=1: the single-token decode shape (reads exactly k experts).
-        let x1 = Tensor::<B, 3>::random([1, 1, h], Distribution::Normal(0.0, 1.0), &device);
+        let x1 = Tensor::<3>::random([1, 1, h], Distribution::Normal(0.0, 1.0), &device);
         let oracle1 = block.forward_oracle(x1.clone(), Precision::F32);
         let routed1 = block.forward_routed(x1.clone(), Precision::F32);
         let decode1 = cache.decode_topk(&block, x1, Precision::F32);
-        let d_o1: f32 = (oracle1.clone() - decode1.clone()).abs().max().into_scalar();
+        let d_o1: f32 = (oracle1.clone() - decode1.clone())
+            .abs()
+            .max()
+            .into_scalar();
         let d_r1: f32 = (routed1 - decode1).abs().max().into_scalar();
         assert!(d_o1 < 1e-4, "T=1 decode != oracle: max|diff|={d_o1}");
-        assert!(d_r1 < 1e-4, "T=1 decode != forward_routed: max|diff|={d_r1}");
+        assert!(
+            d_r1 < 1e-4,
+            "T=1 decode != forward_routed: max|diff|={d_r1}"
+        );
 
         // T>1: several token rows (B=2,S=5 => T=10).
-        let x = Tensor::<B, 3>::random([2, 5, h], Distribution::Normal(0.0, 1.0), &device);
+        let x = Tensor::<3>::random([2, 5, h], Distribution::Normal(0.0, 1.0), &device);
         let oracle = block.forward_oracle(x.clone(), Precision::F32);
         let decode = cache.decode_topk(&block, x, Precision::F32);
         let d_o: f32 = (oracle - decode).abs().max().into_scalar();
@@ -350,26 +373,32 @@ mod tests {
     fn decode_topk_pre_equals_decode_topk() {
         let device = dev();
         let (h, i, e, k) = (32usize, 16usize, 8usize, 3usize);
-        let block = Qwen3MoeSparseBlock::<B>::new(h, i, e, k, true, &device);
+        let block = Qwen3MoeSparseBlock::new(h, i, e, k, true, &device);
         let cache = MoeExpertCache::from_block(&block);
 
         // T=1: assign_tok = [0; k]. decode_topk (arange-built) must equal decode_topk_pre (hoisted).
-        let x1 = Tensor::<B, 3>::random([1, 1, h], Distribution::Normal(0.0, 1.0), &device);
-        let at1 = MoeExpertCache::<B>::assign_tok(1, k, &device);
+        let x1 = Tensor::<3>::random([1, 1, h], Distribution::Normal(0.0, 1.0), &device);
+        let at1 = MoeExpertCache::assign_tok(1, k, &device);
         let eager1 = cache.decode_topk(&block, x1.clone(), Precision::F32);
         let pre1 = cache.decode_topk_pre(&block, x1, Precision::F32, &at1);
         let d1: f32 = (eager1 - pre1).abs().max().into_scalar();
-        assert!(d1 == 0.0, "T=1 decode_topk_pre != decode_topk: max|diff|={d1} (must be bit-identical)");
+        assert!(
+            d1 == 0.0,
+            "T=1 decode_topk_pre != decode_topk: max|diff|={d1} (must be bit-identical)"
+        );
 
         // T>1 (B=2,S=5 => T=10): same with the full repeated index.
         let (b, s) = (2usize, 5usize);
         let t = b * s;
-        let x = Tensor::<B, 3>::random([b, s, h], Distribution::Normal(0.0, 1.0), &device);
-        let at = MoeExpertCache::<B>::assign_tok(t, k, &device);
+        let x = Tensor::<3>::random([b, s, h], Distribution::Normal(0.0, 1.0), &device);
+        let at = MoeExpertCache::assign_tok(t, k, &device);
         let eager = cache.decode_topk(&block, x.clone(), Precision::F32);
         let pre = cache.decode_topk_pre(&block, x, Precision::F32, &at);
         let d: f32 = (eager - pre).abs().max().into_scalar();
-        assert!(d == 0.0, "T>1 decode_topk_pre != decode_topk: max|diff|={d} (must be bit-identical)");
+        assert!(
+            d == 0.0,
+            "T>1 decode_topk_pre != decode_topk: max|diff|={d} (must be bit-identical)"
+        );
     }
 
     /// PROOF the decode reads ONLY the top-k experts at T=1 (the bandwidth claim): poison every NON-routed
@@ -381,14 +410,19 @@ mod tests {
     fn decode_reads_only_topk_experts() {
         let device = dev();
         let (h, i, e, k) = (24usize, 12usize, 16usize, 4usize); // 12 of 16 experts are UNROUTED at T=1
-        let block = Qwen3MoeSparseBlock::<B>::new(h, i, e, k, true, &device);
+        let block = Qwen3MoeSparseBlock::new(h, i, e, k, true, &device);
         let clean = MoeExpertCache::from_block(&block);
 
-        let x = Tensor::<B, 3>::random([1, 1, h], Distribution::Normal(0.0, 1.0), &device);
+        let x = Tensor::<3>::random([1, 1, h], Distribution::Normal(0.0, 1.0), &device);
 
         // The gather materializes exactly N = T*k = k slabs (NOT E) — the structural read-set proof.
         let slabs = clean.gathered_gate_slabs(&block, x.clone());
-        assert_eq!(slabs.dims()[0], k, "decode gathered {} expert slabs, want k={k}", slabs.dims()[0]);
+        assert_eq!(
+            slabs.dims()[0],
+            k,
+            "decode gathered {} expert slabs, want k={k}",
+            slabs.dims()[0]
+        );
 
         // Which experts are routed (host read is fine in a test; the DECODE path itself never syncs).
         let (sel_idx, _w) = block.route_topk(x.clone());
@@ -396,9 +430,16 @@ mod tests {
         let routed_set: std::collections::HashSet<i64> = routed.iter().copied().collect();
 
         // Poison mask over the E axis: 1.0 for routed experts, NaN for the rest.
-        let mask_vals: Vec<f32> =
-            (0..e).map(|ei| if routed_set.contains(&(ei as i64)) { 1.0 } else { f32::NAN }).collect();
-        let mask = Tensor::<B, 1>::from_data(mask_vals.as_slice(), &device).reshape([e, 1, 1]); // [E,1,1]
+        let mask_vals: Vec<f32> = (0..e)
+            .map(|ei| {
+                if routed_set.contains(&(ei as i64)) {
+                    1.0
+                } else {
+                    f32::NAN
+                }
+            })
+            .collect();
+        let mask = Tensor::<1>::from_data(mask_vals.as_slice(), &device).reshape([e, 1, 1]); // [E,1,1]
         let poisoned = MoeExpertCache {
             gate: clean.gate.clone() * mask.clone(),
             up: clean.up.clone() * mask.clone(),
@@ -414,9 +455,15 @@ mod tests {
 
         // 1) finite (no NaN leaked from an unrouted, NaN-poisoned expert) and 2) equals the clean oracle.
         let finite: f32 = decode.clone().mul_scalar(0.0f32).sum().into_scalar(); // 0*NaN = NaN => nonzero
-        assert!(finite == 0.0, "decode read a poisoned (unrouted) expert: non-finite output");
+        assert!(
+            finite == 0.0,
+            "decode read a poisoned (unrouted) expert: non-finite output"
+        );
         let d: f32 = (oracle - decode).abs().max().into_scalar();
-        assert!(d < 1e-4, "poisoned-cache decode != clean oracle: max|diff|={d} (read an unrouted expert?)");
+        assert!(
+            d < 1e-4,
+            "poisoned-cache decode != clean oracle: max|diff|={d} (read an unrouted expert?)"
+        );
     }
 
     /// top_k = 1 sanity: the decode must equal the single selected expert's output (weight renormalizes
@@ -425,9 +472,9 @@ mod tests {
     fn decode_top1_equals_selected_expert() {
         let device = dev();
         let (h, i, e) = (32usize, 16usize, 8usize);
-        let block = Qwen3MoeSparseBlock::<B>::new(h, i, e, 1, true, &device);
+        let block = Qwen3MoeSparseBlock::new(h, i, e, 1, true, &device);
         let cache = MoeExpertCache::from_block(&block);
-        let x = Tensor::<B, 3>::random([2, 3, h], Distribution::Normal(0.0, 1.0), &device);
+        let x = Tensor::<3>::random([2, 3, h], Distribution::Normal(0.0, 1.0), &device);
         let oracle = block.forward_oracle(x.clone(), Precision::F32);
         let decode = cache.decode_topk(&block, x, Precision::F32);
         let d: f32 = (oracle - decode).abs().max().into_scalar();
@@ -438,9 +485,9 @@ mod tests {
     #[test]
     fn decode_shape_and_deterministic() {
         let device = dev();
-        let block = Qwen3MoeSparseBlock::<B>::new(32, 16, 8, 2, true, &device);
+        let block = Qwen3MoeSparseBlock::new(32, 16, 8, 2, true, &device);
         let cache = MoeExpertCache::from_block(&block);
-        let x = Tensor::<B, 3>::random([1, 1, 32], Distribution::Normal(0.0, 1.0), &device);
+        let x = Tensor::<3>::random([1, 1, 32], Distribution::Normal(0.0, 1.0), &device);
         let y1 = cache.decode_topk(&block, x.clone(), Precision::F32);
         let y2 = cache.decode_topk(&block, x, Precision::F32);
         assert_eq!(y1.dims(), [1, 1, 32]);
@@ -455,7 +502,7 @@ mod tests {
 #[cfg(all(test, feature = "cuda"))]
 mod cuda_tests {
     use super::*;
-    use burn::backend::cuda::{Cuda, CudaDevice};
+    use burn::prelude::Device;
     use burn::tensor::Distribution;
 
     type C = Cuda;
@@ -465,7 +512,7 @@ mod cuda_tests {
     /// scatter-add combine; only the per-assignment SwiGLU kernel differs (no `[N,H,I]` materialization).
     #[test]
     fn decode_topk_fused_equals_oracle_cuda() {
-        let device = CudaDevice::default();
+        let device = Device::cuda(0);
         let (h, i, e, k) = (64usize, 48usize, 16usize, 4usize);
         let block = Qwen3MoeSparseBlock::<C>::new(h, i, e, k, true, &device);
         let cache = MoeExpertCache::from_block(&block);
@@ -493,7 +540,7 @@ mod cuda_tests {
     /// (the router weight renormalizes to 1.0) — catches a wrong expert id or a mis-scattered token.
     #[test]
     fn decode_topk_fused_top1_cuda() {
-        let device = CudaDevice::default();
+        let device = Device::cuda(0);
         let (h, i, e) = (48usize, 32usize, 8usize);
         let block = Qwen3MoeSparseBlock::<C>::new(h, i, e, 1, true, &device);
         let cache = MoeExpertCache::from_block(&block);

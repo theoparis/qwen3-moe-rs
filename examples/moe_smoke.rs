@@ -6,24 +6,28 @@
 //! Build/run:
 //!   RUSTFLAGS="-C target-feature=+fp16" cargo run --release --features cuda --example moe_smoke
 
-use burn::backend::cuda::{Cuda, CudaDevice};
-use burn::tensor::{Int, Tensor};
+use burn::prelude::Device;
+use burn::tensor::{Device, Int, Tensor};
 use qwen3_burn::Qwen3MoeConfig;
 
 type B = Cuda;
 
 fn main() {
-    let device = CudaDevice::default();
+    let device = Device::cuda(0);
     println!("device: {device:?}");
 
     let cfg = Qwen3MoeConfig::tiny();
     println!(
         "tiny Qwen3-MoE: {} layers, hidden {}, {} experts top-{}, moe_inter {}",
-        cfg.num_hidden_layers, cfg.hidden_size, cfg.num_experts, cfg.num_experts_per_tok, cfg.moe_intermediate_size
+        cfg.num_hidden_layers,
+        cfg.hidden_size,
+        cfg.num_experts,
+        cfg.num_experts_per_tok,
+        cfg.moe_intermediate_size
     );
-    let model = cfg.init_causal_lm::<B>(&device);
+    let model = cfg.init_causal_lm(&device);
 
-    let ids = Tensor::<B, 2, Int>::from_data([[1i64, 5, 9, 3, 7]], &device);
+    let ids = Tensor::<2, Int>::from_data([[1i64, 5, 9, 3, 7]], &device);
 
     // Full MoE forward (no cache) -> vocab logits.
     let logits = model.forward(ids.clone(), None);
@@ -36,5 +40,7 @@ fn main() {
     let out = model.generate_greedy(ids, 8, &[]);
     println!("generate_greedy OK: {:?}", out.dims());
 
-    println!("===== Qwen3-MoE on GB10/sm_121: on-device routing (argmax/gather/scatter-Add/softmax) + per-expert SwiGLU OK =====");
+    println!(
+        "===== Qwen3-MoE on GB10/sm_121: on-device routing (argmax/gather/scatter-Add/softmax) + per-expert SwiGLU OK ====="
+    );
 }

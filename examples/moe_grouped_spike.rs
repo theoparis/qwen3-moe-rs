@@ -20,16 +20,14 @@
 //!   RUSTFLAGS="-C target-feature=+fp16" \
 //!     cargo run --release --features cuda --example moe_grouped_spike 2>&1 | tail -50
 
-use burn::backend::cuda::{Cuda, CudaDevice};
-use burn::backend::NdArray;
-use burn::prelude::Backend;
-use burn::tensor::{activation::silu, DType, Distribution, Tensor, TensorData};
+use burn::prelude::Device;
+use burn::prelude::Device;
+use burn::prelude::Device;
+use burn::tensor::{DType, Device, Distribution, Tensor, TensorData, activation::silu};
 
-use qwen3_burn::moe_grouped::{dropless_align, forward_grouped};
-use qwen3_burn::Qwen3MoeSparseBlock;
 use qwen3_burn::Precision;
-
-type Nd = NdArray<f32>;
+use qwen3_burn::Qwen3MoeSparseBlock;
+use qwen3_burn::moe_grouped::{dropless_align, forward_grouped};
 
 const BLOCK_M: usize = 16;
 
@@ -50,7 +48,10 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
 }
 
 // ----------------------------------------------------------------------------------------------- //
@@ -60,23 +61,32 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 // ----------------------------------------------------------------------------------------------- //
 #[allow(clippy::too_many_arguments)]
 fn ndarray_oracle(
-    x_host: &[f32],   // [T,H]
-    gate: &[f32],     // [E,H,I]
-    up: &[f32],       // [E,H,I]
-    down: &[f32],     // [E,I,H]
-    gate_w: &[f32],   // [T,E] dense router gate
+    x_host: &[f32], // [T,H]
+    gate: &[f32],   // [E,H,I]
+    up: &[f32],     // [E,H,I]
+    down: &[f32],   // [E,I,H]
+    gate_w: &[f32], // [T,E] dense router gate
     t: usize,
     h: usize,
     i: usize,
     e: usize,
 ) -> Vec<f32> {
-    let dev = <Nd as Backend>::Device::default();
+    let dev = Device::flex();
     let x = Tensor::<Nd, 2>::from_data(TensorData::new(x_host.to_vec(), [t, h]), &dev);
     let mut acc = Tensor::<Nd, 2>::zeros([t, h], &dev);
     for ei in 0..e {
-        let ge = Tensor::<Nd, 2>::from_data(TensorData::new(gate[ei * h * i..(ei + 1) * h * i].to_vec(), [h, i]), &dev);
-        let ue = Tensor::<Nd, 2>::from_data(TensorData::new(up[ei * h * i..(ei + 1) * h * i].to_vec(), [h, i]), &dev);
-        let de = Tensor::<Nd, 2>::from_data(TensorData::new(down[ei * i * h..(ei + 1) * i * h].to_vec(), [i, h]), &dev);
+        let ge = Tensor::<Nd, 2>::from_data(
+            TensorData::new(gate[ei * h * i..(ei + 1) * h * i].to_vec(), [h, i]),
+            &dev,
+        );
+        let ue = Tensor::<Nd, 2>::from_data(
+            TensorData::new(up[ei * h * i..(ei + 1) * h * i].to_vec(), [h, i]),
+            &dev,
+        );
+        let de = Tensor::<Nd, 2>::from_data(
+            TensorData::new(down[ei * i * h..(ei + 1) * i * h].to_vec(), [i, h]),
+            &dev,
+        );
         let g = silu(x.clone().matmul(ge)); // [T,I]
         let u = x.clone().matmul(ue); // [T,I]
         let y = (g * u).matmul(de); // [T,H]
@@ -101,17 +111,31 @@ struct ShapeResult {
     ok: bool,
 }
 
-fn run_shape(label: &str, b: usize, s: usize, h: usize, i: usize, e: usize, k: usize, drop_c: usize) -> ShapeResult {
-    let device = CudaDevice::default();
+fn run_shape(
+    label: &str,
+    b: usize,
+    s: usize,
+    h: usize,
+    i: usize,
+    e: usize,
+    k: usize,
+    drop_c: usize,
+) -> ShapeResult {
+    let device = Device::cuda(0);
     let t = b * s;
     let n = t * k;
 
     let block = Qwen3MoeSparseBlock::<Cuda>::new(h, i, e, k, true, &device);
-    let x = Tensor::<Cuda, 3>::random([b, s, h], Distribution::Normal(0.0, 1.0), &device);
+    let x = Tensor::<3>::random([b, s, h], Distribution::Normal(0.0, 1.0), &device);
 
     // -------- routing (read to host; deterministic, so identical to forward_grouped's own call) --
     let (sel_idx, sel_w) = block.route_topk(x.clone());
-    let sel_idx_host: Vec<i64> = sel_idx.clone().cast(DType::I64).into_data().to_vec().unwrap(); // [T*k]
+    let sel_idx_host: Vec<i64> = sel_idx
+        .clone()
+        .cast(DType::I64)
+        .into_data()
+        .to_vec()
+        .unwrap(); // [T*k]
     let sel_w_host: Vec<f32> = sel_w.clone().into_data().to_vec().unwrap(); // [T*k]
 
     // dense router gate [T,E] from the compact routing (for the oracle's weighted combine).
@@ -125,9 +149,27 @@ fn run_shape(label: &str, b: usize, s: usize, h: usize, i: usize, e: usize, k: u
 
     // -------- 1. DROPLESS align: device counts + sorted layout vs a host reference --------------
     let lay = dropless_align(sel_idx, sel_w, e, k, BLOCK_M);
-    let count_dev: Vec<i64> = lay.count_e.clone().cast(DType::I64).into_data().to_vec().unwrap(); // [E]
-    let sorted_tok: Vec<i64> = lay.sorted_token.clone().cast(DType::I64).into_data().to_vec().unwrap(); // [buffer]
-    let sorted_exp: Vec<i64> = lay.sorted_expert.clone().cast(DType::I64).into_data().to_vec().unwrap(); // [buffer]
+    let count_dev: Vec<i64> = lay
+        .count_e
+        .clone()
+        .cast(DType::I64)
+        .into_data()
+        .to_vec()
+        .unwrap(); // [E]
+    let sorted_tok: Vec<i64> = lay
+        .sorted_token
+        .clone()
+        .cast(DType::I64)
+        .into_data()
+        .to_vec()
+        .unwrap(); // [buffer]
+    let sorted_exp: Vec<i64> = lay
+        .sorted_expert
+        .clone()
+        .cast(DType::I64)
+        .into_data()
+        .to_vec()
+        .unwrap(); // [buffer]
 
     // host per-expert counts + per-expert token multiset from the routing.
     let mut count_host = vec![0i64; e];
@@ -174,24 +216,39 @@ fn run_shape(label: &str, b: usize, s: usize, h: usize, i: usize, e: usize, k: u
     let gate_host: Vec<f32> = gate_s.into_data().to_vec().unwrap(); // [E,H,I]
     let up_host: Vec<f32> = up_s.into_data().to_vec().unwrap(); // [E,H,I]
     let down_host: Vec<f32> = down_s.into_data().to_vec().unwrap(); // [E,I,H]
-    let oracle = ndarray_oracle(&x_host, &gate_host, &up_host, &down_host, &gate_w, t, h, i, e);
+    let oracle = ndarray_oracle(
+        &x_host, &gate_host, &up_host, &down_host, &gate_w, t, h, i, e,
+    );
 
     let cos = cosine(&gpu_host, &oracle);
     let mad = max_abs_diff(&gpu_host, &oracle);
 
     // same-device forward_oracle cross-check.
-    let dev_oracle: Vec<f32> = block.forward_oracle(x.clone(), Precision::F32).into_data().to_vec().unwrap();
+    let dev_oracle: Vec<f32> = block
+        .forward_oracle(x.clone(), Precision::F32)
+        .into_data()
+        .to_vec()
+        .unwrap();
     let cos_dev = cosine(&gpu_host, &dev_oracle);
     let grouped_oracle_diff = max_abs_diff(&gpu_host, &oracle);
 
     // -------- forward_routed_ondevice at a small capacity DROPS where grouped does not -----------
-    let ondevice_small: Vec<f32> =
-        block.forward_routed_ondevice(x.clone(), drop_c).into_data().to_vec().unwrap();
+    let ondevice_small: Vec<f32> = block
+        .forward_routed_ondevice(x.clone(), drop_c)
+        .into_data()
+        .to_vec()
+        .unwrap();
     let ondevice_drop_diff = max_abs_diff(&ondevice_small, &oracle);
 
-    let ok = counts_match && no_drop && cos > 0.99999 && grouped_total == n && !gpu_host.iter().any(|v| v.is_nan());
+    let ok = counts_match
+        && no_drop
+        && cos > 0.99999
+        && grouped_total == n
+        && !gpu_host.iter().any(|v| v.is_nan());
 
-    println!("--- {label}  (B={b} S={s} → T={t}, E={e}, k={k}, H={h}, I={i}, N=T*k={n}, BLOCK_M={BLOCK_M}) ---");
+    println!(
+        "--- {label}  (B={b} S={s} → T={t}, E={e}, k={k}, H={h}, I={i}, N=T*k={n}, BLOCK_M={BLOCK_M}) ---"
+    );
     println!(
         "  exact-no-drop : counts_match={counts_match}  no_drop={no_drop}  grouped_total={grouped_total}/{n}  buffer={} num_blocks={}",
         lay.buffer, lay.num_blocks
@@ -220,8 +277,10 @@ fn run_shape(label: &str, b: usize, s: usize, h: usize, i: usize, e: usize, k: u
 }
 
 fn main() {
-    let device = CudaDevice::default();
-    println!("device: {device:?} | oracle: NdArray (CPU f32) | kernel: DROPLESS CubeCL grouped SwiGLU GEMM");
+    let device = Device::cuda(0);
+    println!(
+        "device: {device:?} | oracle: NdArray (CPU f32) | kernel: DROPLESS CubeCL grouped SwiGLU GEMM"
+    );
     println!("cross-backend law: oracle is an INDEPENDENT CPU backend (docs/VLLM_KERNELS.md §0)\n");
 
     let mut rows = Vec::new();
@@ -269,10 +328,30 @@ fn main() {
     }
 
     for r in &rows {
-        assert!(r.counts_match, "shape `{}`: device per-expert counts != host reference", r.label);
-        assert!(r.no_drop, "shape `{}`: sorted layout dropped/misgrouped an assignment", r.label);
-        assert!(r.grouped_total == r.n, "shape `{}`: grouped_total {} != N {}", r.label, r.grouped_total, r.n);
-        assert!(r.cos > 0.99999, "shape `{}`: grouped vs NdArray oracle cos={:.7} (max_abs_diff={:.3e})", r.label, r.cos, r.mad);
+        assert!(
+            r.counts_match,
+            "shape `{}`: device per-expert counts != host reference",
+            r.label
+        );
+        assert!(
+            r.no_drop,
+            "shape `{}`: sorted layout dropped/misgrouped an assignment",
+            r.label
+        );
+        assert!(
+            r.grouped_total == r.n,
+            "shape `{}`: grouped_total {} != N {}",
+            r.label,
+            r.grouped_total,
+            r.n
+        );
+        assert!(
+            r.cos > 0.99999,
+            "shape `{}`: grouped vs NdArray oracle cos={:.7} (max_abs_diff={:.3e})",
+            r.label,
+            r.cos,
+            r.mad
+        );
     }
     println!("\nALL CHECKS PASSED.");
 }

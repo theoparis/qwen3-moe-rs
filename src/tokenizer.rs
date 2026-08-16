@@ -20,8 +20,8 @@ pub struct Qwen3Tokenizer {
 impl Qwen3Tokenizer {
     /// Load the tokenizer from a tokenizer.json file.
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, String> {
-        let tokenizer = Tokenizer::from_file(path)
-            .map_err(|e| format!("Failed to load tokenizer: {e}"))?;
+        let tokenizer =
+            Tokenizer::from_file(path).map_err(|e| format!("Failed to load tokenizer: {e}"))?;
 
         Ok(Qwen3Tokenizer {
             tokenizer,
@@ -44,9 +44,7 @@ impl Qwen3Tokenizer {
     ///
     /// Note: Does NOT include <think> token - that's for text generation, not image generation.
     pub fn apply_chat_template(&self, prompt: &str) -> String {
-        format!(
-            "{IM_START}user\n{prompt}{IM_END}\n{IM_START}assistant\n"
-        )
+        format!("{IM_START}user\n{prompt}{IM_END}\n{IM_START}assistant\n")
     }
 
     /// Tokenize a prompt and return input IDs and attention mask.
@@ -55,14 +53,12 @@ impl Qwen3Tokenizer {
     /// # Returns
     /// A tuple of (input_ids, attention_mask) where both are Vec<i64>.
     pub fn encode(&self, text: &str) -> Result<(Vec<i64>, Vec<bool>), String> {
-        let encoding = self.tokenizer
+        let encoding = self
+            .tokenizer
             .encode(text, true)
             .map_err(|e| format!("Failed to encode text: {e}"))?;
 
-        let mut input_ids: Vec<i64> = encoding.get_ids()
-            .iter()
-            .map(|&id| id as i64)
-            .collect();
+        let mut input_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
 
         let mut attention_mask: Vec<bool> = vec![true; input_ids.len()];
 
@@ -87,7 +83,8 @@ impl Qwen3Tokenizer {
     /// # Returns
     /// A tuple of (input_ids, attention_mask) where both are Vec<u32>.
     pub fn encode_no_pad(&self, text: &str) -> Result<(Vec<u32>, Vec<bool>), String> {
-        let encoding = self.tokenizer
+        let encoding = self
+            .tokenizer
             .encode(text, true)
             .map_err(|e| format!("Failed to encode text: {e}"))?;
 

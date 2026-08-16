@@ -54,7 +54,7 @@ fn check(k: usize, n: usize, m: usize) {
     let w_deq = dequant_e4m3(&q_bytes, &scale, k, n);
     let want = cpu_matmul(&x_host, &w_deq, m, k, n);
 
-    let x = Tensor::<B, 2>::from_data(TensorData::new(x_host, [m, k]), &dev);
+    let x = Tensor::<2>::from_data(TensorData::new(x_host, [m, k]), &dev);
     let q_i8: Vec<i8> = q_bytes.iter().map(|&b| b as i8).collect();
     let got = w8a16_gemv_raw(x, &q_i8, &scale, k, n)
         .into_data()

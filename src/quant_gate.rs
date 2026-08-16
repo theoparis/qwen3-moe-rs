@@ -7,7 +7,6 @@
 use burn::{
     module::{Param, ParamId},
     nn::Linear,
-    prelude::Backend,
     tensor::{DType, Tensor, TensorData},
 };
 
@@ -93,10 +92,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 
 /// Round-trip one normal Burn `Linear` weight through the requested codec, then store the dequantized
 /// weight back into the same `Linear`.
-pub fn fake_quant_linear<B: Backend>(
-    lin: &mut Linear<B>,
-    prec: QuantPrecision,
-) -> Option<FakeQuantLinearStats> {
+pub fn fake_quant_linear(lin: &mut Linear, prec: QuantPrecision) -> Option<FakeQuantLinearStats> {
     if prec == QuantPrecision::Nvfp4Hadamard {
         println!(
             "fake_quant_linear: WARNING Nvfp4Hadamard requires a layer/site context; keeping BF16"
@@ -106,8 +102,8 @@ pub fn fake_quant_linear<B: Backend>(
     fake_quant_linear_inner(lin, prec, None)
 }
 
-fn fake_quant_linear_inner<B: Backend>(
-    lin: &mut Linear<B>,
+fn fake_quant_linear_inner(
+    lin: &mut Linear,
     prec: QuantPrecision,
     hadamard: Option<HadamardContext>,
 ) -> Option<FakeQuantLinearStats> {
@@ -135,7 +131,7 @@ fn fake_quant_linear_inner<B: Backend>(
     let deq = dequant_matrix(&wv, k, n, prec, hadamard);
 
     let cos = cosine(&wv, &deq);
-    let t = Tensor::<B, 2>::from_data(TensorData::new(deq, [k, n]), &device).cast(dtype);
+    let t = Tensor::<2>::from_data(TensorData::new(deq, [k, n]), &device).cast(dtype);
     lin.weight = Param::initialized(ParamId::new(), t);
     println!("fake_quant_linear: {prec:?} K={k} N={n} roundtrip_cos={cos:.9}");
     Some(FakeQuantLinearStats { k, n, cosine: cos })
@@ -236,8 +232,8 @@ fn dense_hadamard_context(role: &str, prec: QuantPrecision) -> Option<HadamardCo
     Some(HadamardContext { layer_idx, site })
 }
 
-fn fake_quant_expert_stack<B: Backend>(
-    t: &mut Param<Tensor<B, 3>>,
+fn fake_quant_expert_stack(
+    t: &mut Param<Tensor<3>>,
     role: &'static str,
     prec: QuantPrecision,
     layer_idx: usize,
@@ -321,7 +317,7 @@ fn fake_quant_expert_stack<B: Backend>(
     }
 
     let quantized =
-        Tensor::<B, 3>::from_data(TensorData::new(dst, [experts, out_dim, in_dim]), &device)
+        Tensor::<3>::from_data(TensorData::new(dst, [experts, out_dim, in_dim]), &device)
             .cast(dtype);
     *t = Param::initialized(ParamId::new(), quantized);
 
@@ -334,8 +330,8 @@ fn fake_quant_expert_stack<B: Backend>(
     })
 }
 
-fn fake_quant_experts_inner<B: Backend>(
-    experts: &mut Qwen3_5FusedExperts<B>,
+fn fake_quant_experts_inner(
+    experts: &mut Qwen3_5FusedExperts,
     prec: QuantPrecision,
     layer_idx: usize,
 ) -> Vec<FakeQuantExpertStats> {
@@ -393,7 +389,7 @@ fn par_to_f32<T: Sync>(src: &[T], f: impl Fn(&T) -> f32 + Sync) -> Vec<f32> {
 }
 
 #[cfg(feature = "cuda")]
-fn tensor3_host_f32<B: Backend>(t: Tensor<B, 3>, label: &str) -> Vec<f32> {
+fn tensor3_host_f32(t: Tensor<3>, label: &str) -> Vec<f32> {
     let dtype = t.dtype();
     let data = t.into_data();
     match dtype {
@@ -414,12 +410,12 @@ fn tensor3_host_f32<B: Backend>(t: Tensor<B, 3>, label: &str) -> Vec<f32> {
     }
 }
 
-pub fn fake_quant_experts<B: Backend>(experts: &mut Qwen3_5FusedExperts<B>, prec: QuantPrecision) {
+pub fn fake_quant_experts(experts: &mut Qwen3_5FusedExperts, prec: QuantPrecision) {
     let stats = fake_quant_experts_inner(experts, prec, 0);
     summarize_expert_stats("fake_quant_experts", prec, &stats);
 }
 
-pub fn fake_quant_all_experts<B: Backend>(m: &mut Qwen3_5MoeForCausalLM<B>, prec: QuantPrecision) {
+pub fn fake_quant_all_experts(m: &mut Qwen3_5MoeForCausalLM, prec: QuantPrecision) {
     let mut all_stats = Vec::new();
     for (layer_idx, layer) in m.model.layers.iter_mut().enumerate() {
         let layer_stats = match layer {
@@ -436,8 +432,8 @@ pub fn fake_quant_all_experts<B: Backend>(m: &mut Qwen3_5MoeForCausalLM<B>, prec
 }
 
 #[cfg(feature = "cuda")]
-fn quantize_expert_stack_fp8<B: Backend>(
-    experts: &mut Qwen3_5FusedExperts<B>,
+fn quantize_expert_stack_fp8(
+    experts: &mut Qwen3_5FusedExperts,
     role: &'static str,
 ) -> (Vec<i8>, Vec<f32>, [usize; 3]) {
     let w = match role {
@@ -500,10 +496,7 @@ fn quantize_expert_stack_fp8<B: Backend>(
 /// This is an inference-only terminal load step. The BF16 expert `Param`s are intentionally kept
 /// intact in this brick so dimensions and records continue to behave like the loaded model.
 #[cfg(feature = "cuda")]
-fn quantize_expert_block_fp8<B: Qwen3_5DenseQuantBackend>(
-    experts: &mut Qwen3_5FusedExperts<B>,
-    role: &str,
-) {
+fn quantize_expert_block_fp8(experts: &mut Qwen3_5FusedExperts, role: &str) {
     let device = experts.gate_up_proj.val().device();
     let gu_dims = experts.gate_up_proj.val().dims();
     let dn_dims = experts.down_proj.val().dims();
@@ -538,18 +531,15 @@ fn quantize_expert_block_fp8<B: Qwen3_5DenseQuantBackend>(
         "quantize_experts_fp8: non-finite expert fp8 scale in {role}"
     );
 
-    let q_gu = Tensor::<B, 3, burn::tensor::Int>::from_data_dtype(
-        TensorData::new(q_gu_i8, [e, h, two_i]),
+    let q_gu = Tensor::<3, Int>::from_data(
+        TensorData::new(q_gu_i8, ([e, h, two_i])),
         &device,
         DType::I8,
     );
-    let s_gu = Tensor::<B, 2>::from_data(TensorData::new(s_gu, [e, two_i]), &device);
-    let q_dn = Tensor::<B, 3, burn::tensor::Int>::from_data_dtype(
-        TensorData::new(q_dn_i8, [e, i, h]),
-        &device,
-        DType::I8,
-    );
-    let s_dn = Tensor::<B, 2>::from_data(TensorData::new(s_dn, [e, h]), &device);
+    let s_gu = Tensor::<2>::from_data(TensorData::new(s_gu, [e, two_i]), &device);
+    let q_dn =
+        Tensor::<3, Int>::from_data(TensorData::new(q_dn_i8, ([e, i, h])), &device, DType::I8);
+    let s_dn = Tensor::<2>::from_data(TensorData::new(s_dn, [e, h]), &device);
 
     experts.fp8 = ExpertQuantSidecar(Some(ExpertFp8 {
         q_gu,
@@ -571,16 +561,13 @@ fn quantize_expert_block_fp8<B: Qwen3_5DenseQuantBackend>(
     // Params (replace with tiny [1,1,1] placeholders). The fp8 branch of `expert_forward` reads dims
     // from the SIDECAR (never these placeholders), so this is safe. Peak stays ~72GB and DECREASES as
     // the bf16 model shrinks layer-by-layer. (Full memory win; also fixes the near-ceiling thrash.)
-    let placeholder = Tensor::<B, 3>::zeros([1, 1, 1], &device);
+    let placeholder = Tensor::<3>::zeros([1, 1, 1], &device);
     experts.gate_up_proj = Param::initialized(ParamId::new(), placeholder.clone());
     experts.down_proj = Param::initialized(ParamId::new(), placeholder);
 }
 
 #[cfg(feature = "cuda")]
-pub fn quantize_experts_fp8<B: Qwen3_5DenseQuantBackend>(
-    m: &mut Qwen3_5MoeForCausalLM<B>,
-    skip_extra: &[&str],
-) -> QuantCoverage {
+pub fn quantize_experts_fp8(m: &mut Qwen3_5MoeForCausalLM, skip_extra: &[&str]) -> QuantCoverage {
     let mut skipped = Vec::new();
     let mut targets = Vec::new();
     let mut quantized = 0usize;
@@ -659,7 +646,7 @@ fn push_mlp_roles(out: &mut Vec<String>, prefix: &str) {
 }
 
 /// Stable role names for every dense `Linear` touched by this fake-quant gate.
-pub fn dense_linear_roles<B: Backend>(m: &Qwen3_5MoeForCausalLM<B>) -> Vec<String> {
+pub fn dense_linear_roles(m: &Qwen3_5MoeForCausalLM) -> Vec<String> {
     let mut out = Vec::new();
     for (i, layer) in m.model.layers.iter().enumerate() {
         match layer {
@@ -692,10 +679,10 @@ pub fn dense_linear_roles<B: Backend>(m: &Qwen3_5MoeForCausalLM<B>) -> Vec<Strin
     out
 }
 
-pub fn linear_by_role_mut<'a, B: Backend>(
-    m: &'a mut Qwen3_5MoeForCausalLM<B>,
+pub fn linear_by_role_mut<'a>(
+    m: &'a mut Qwen3_5MoeForCausalLM,
     role: &str,
-) -> Option<&'a mut Linear<B>> {
+) -> Option<&'a mut Linear> {
     if role == "lm_head" {
         return Some(&mut m.lm_head);
     }
@@ -723,10 +710,10 @@ fn parse_mtp_layer_role(role: &str) -> Option<(usize, &str)> {
     Some((idx.parse::<usize>().ok()?, tail))
 }
 
-fn linear_gdn_by_tail_mut<'a, B: Backend>(
-    layer: &'a mut Qwen3_5GdnLayer<B>,
+fn linear_gdn_by_tail_mut<'a>(
+    layer: &'a mut Qwen3_5GdnLayer,
     tail: &str,
-) -> Option<&'a mut Linear<B>> {
+) -> Option<&'a mut Linear> {
     match tail {
         "gdn.in_proj_qkv" => Some(&mut layer.linear_attn.in_proj_qkv),
         "gdn.in_proj_a" => Some(&mut layer.linear_attn.in_proj_a),
@@ -737,10 +724,10 @@ fn linear_gdn_by_tail_mut<'a, B: Backend>(
     }
 }
 
-fn linear_full_by_tail_mut<'a, B: Backend>(
-    layer: &'a mut Qwen3_5FullAttnLayer<B>,
+fn linear_full_by_tail_mut<'a>(
+    layer: &'a mut Qwen3_5FullAttnLayer,
     tail: &str,
-) -> Option<&'a mut Linear<B>> {
+) -> Option<&'a mut Linear> {
     match tail {
         "attn.q_proj" => Some(&mut layer.self_attn.q_proj),
         "attn.k_proj" => Some(&mut layer.self_attn.k_proj),
@@ -750,10 +737,10 @@ fn linear_full_by_tail_mut<'a, B: Backend>(
     }
 }
 
-fn linear_mlp_by_tail_mut<'a, B: Backend>(
-    mlp: &'a mut Qwen3_5SharedMoeBlock<B>,
+fn linear_mlp_by_tail_mut<'a>(
+    mlp: &'a mut Qwen3_5SharedMoeBlock,
     tail: &str,
-) -> Option<&'a mut Linear<B>> {
+) -> Option<&'a mut Linear> {
     match tail {
         "moe.gate" => Some(&mut mlp.gate),
         "moe.shared_gate" => Some(&mut mlp.shared_expert_gate),
@@ -765,10 +752,10 @@ fn linear_mlp_by_tail_mut<'a, B: Backend>(
 }
 
 #[cfg(feature = "cuda")]
-pub fn sidecar_by_role_mut<'a, B: Backend>(
-    m: &'a mut Qwen3_5MoeForCausalLM<B>,
+pub fn sidecar_by_role_mut<'a>(
+    m: &'a mut Qwen3_5MoeForCausalLM,
     role: &str,
-) -> Option<&'a mut Option<crate::nvfp4_linear::QuantLinear<B>>> {
+) -> Option<&'a mut Option<crate::nvfp4_linear::QuantLinear>> {
     if role == "lm_head" {
         return Some(&mut m.lm_head_quant.0);
     }
@@ -791,10 +778,10 @@ pub fn sidecar_by_role_mut<'a, B: Backend>(
 }
 
 #[cfg(feature = "cuda")]
-fn sidecar_gdn_by_tail_mut<'a, B: Backend>(
-    layer: &'a mut Qwen3_5GdnLayer<B>,
+fn sidecar_gdn_by_tail_mut<'a>(
+    layer: &'a mut Qwen3_5GdnLayer,
     tail: &str,
-) -> Option<&'a mut Option<crate::nvfp4_linear::QuantLinear<B>>> {
+) -> Option<&'a mut Option<crate::nvfp4_linear::QuantLinear>> {
     match tail {
         "gdn.in_proj_qkv" => Some(&mut layer.linear_attn.in_proj_qkv_fp8.0),
         "gdn.in_proj_a" => Some(&mut layer.linear_attn.in_proj_a_fp8.0),
@@ -806,10 +793,10 @@ fn sidecar_gdn_by_tail_mut<'a, B: Backend>(
 }
 
 #[cfg(feature = "cuda")]
-fn sidecar_full_by_tail_mut<'a, B: Backend>(
-    layer: &'a mut Qwen3_5FullAttnLayer<B>,
+fn sidecar_full_by_tail_mut<'a>(
+    layer: &'a mut Qwen3_5FullAttnLayer,
     tail: &str,
-) -> Option<&'a mut Option<crate::nvfp4_linear::QuantLinear<B>>> {
+) -> Option<&'a mut Option<crate::nvfp4_linear::QuantLinear>> {
     match tail {
         "attn.q_proj" => Some(&mut layer.self_attn.q_proj_fp8.0),
         "attn.k_proj" => Some(&mut layer.self_attn.k_proj_fp8.0),
@@ -820,10 +807,10 @@ fn sidecar_full_by_tail_mut<'a, B: Backend>(
 }
 
 #[cfg(feature = "cuda")]
-fn sidecar_mlp_by_tail_mut<'a, B: Backend>(
-    mlp: &'a mut Qwen3_5SharedMoeBlock<B>,
+fn sidecar_mlp_by_tail_mut<'a>(
+    mlp: &'a mut Qwen3_5SharedMoeBlock,
     tail: &str,
-) -> Option<&'a mut Option<crate::nvfp4_linear::QuantLinear<B>>> {
+) -> Option<&'a mut Option<crate::nvfp4_linear::QuantLinear>> {
     match tail {
         "moe.shared.gate_proj" => Some(&mut mlp.shared_expert.gate_proj_fp8.0),
         "moe.shared.up_proj" => Some(&mut mlp.shared_expert.up_proj_fp8.0),
@@ -838,10 +825,7 @@ fn sidecar_mlp_by_tail_mut<'a, B: Backend>(
 /// placement, immediately before decode. The sidecars are intentionally not parameters/records and
 /// are not moved by `to_device`/`fork`; reloading weights also invalidates them.
 #[cfg(feature = "cuda")]
-pub fn quantize_dense_fp8<B: Qwen3_5DenseQuantBackend>(
-    m: &mut Qwen3_5MoeForCausalLM<B>,
-    skip_extra: &[&str],
-) -> QuantCoverage {
+pub fn quantize_dense_fp8(m: &mut Qwen3_5MoeForCausalLM, skip_extra: &[&str]) -> QuantCoverage {
     let roles = dense_linear_roles(m);
     let mut skip = DEFAULT_DENSE_SKIP.to_vec();
     skip.extend_from_slice(skip_extra);
@@ -897,8 +881,8 @@ pub fn quantize_dense_fp8<B: Qwen3_5DenseQuantBackend>(
 }
 
 /// Quantize exactly one dense `Linear` identified by its stable role name.
-pub fn fake_quant_one<B: Backend>(
-    m: &mut Qwen3_5MoeForCausalLM<B>,
+pub fn fake_quant_one(
+    m: &mut Qwen3_5MoeForCausalLM,
     role: &str,
     prec: QuantPrecision,
 ) -> Option<f32> {
@@ -917,11 +901,7 @@ pub fn fake_quant_one<B: Backend>(
 }
 
 /// Fake-quantize all dense linears except skipped roles. Rank-3 MoE expert tensors are not touched.
-pub fn fake_quant_all_dense<B: Backend>(
-    m: &mut Qwen3_5MoeForCausalLM<B>,
-    prec: QuantPrecision,
-    skip: &[&str],
-) {
+pub fn fake_quant_all_dense(m: &mut Qwen3_5MoeForCausalLM, prec: QuantPrecision, skip: &[&str]) {
     let roles = dense_linear_roles(m);
     let mut skipped = Vec::new();
     let mut cosines = Vec::new();
@@ -952,11 +932,11 @@ pub fn fake_quant_all_dense<B: Backend>(
 mod role_tests {
     use super::*;
     use crate::qwen3_5::{Qwen3_5LayerType, Qwen3_5MoeConfig};
-    use burn::backend::NdArray;
+    use burn::prelude::Device;
 
     #[test]
     fn dense_linear_roles_enumerates_mtp_block_roles() {
-        let device = <NdArray as Backend>::Device::default();
+        let device = Device::flex();
         let cfg = Qwen3_5MoeConfig {
             vocab_size: 32,
             hidden_size: 16,
@@ -984,7 +964,7 @@ mod role_tests {
             linear_conv_kernel_dim: 4,
             mtp_num_hidden_layers: 1,
         };
-        let model = cfg.init_causal_lm::<NdArray>(&device);
+        let model = cfg.init_causal_lm(&device);
 
         let roles = dense_linear_roles(&model);
         assert_eq!(
@@ -1014,18 +994,18 @@ mod tests {
     use super::*;
     use crate::qwen3_5::ExpertNvfp4Sidecar;
     use burn::{
-        backend::cuda::{Cuda, CudaDevice},
         module::{Param, ParamId},
         nn::LinearConfig,
+        prelude::Device,
         tensor::{Distribution, Tensor},
     };
 
     #[test]
     fn cuda_fake_quant_linear_nvfp4_mse_tracks_original_output() {
-        let dev = CudaDevice::default();
+        let dev = Device::cuda(0);
         let (m, k, n) = (4usize, 128usize, 96usize);
         let mut lin = LinearConfig::new(k, n).with_bias(false).init::<Cuda>(&dev);
-        let x = Tensor::<Cuda, 2>::random([m, k], Distribution::Normal(0.0, 1.0), &dev);
+        let x = Tensor::<2>::random([m, k], Distribution::Normal(0.0, 1.0), &dev);
 
         let reference = lin
             .forward(x.clone())
@@ -1052,12 +1032,12 @@ mod tests {
 
     #[test]
     fn cuda_fake_quant_experts_fp8_tracks_original_weights() {
-        let dev = CudaDevice::default();
+        let dev = Device::cuda(0);
         let (experts_n, hidden, inner) = (2usize, 4usize, 4usize);
         let mut experts = Qwen3_5FusedExperts {
             gate_up_proj: Param::initialized(
                 ParamId::new(),
-                Tensor::<Cuda, 3>::random(
+                Tensor::<3>::random(
                     [experts_n, inner * 2, hidden],
                     Distribution::Normal(0.0, 1.0),
                     &dev,
@@ -1065,7 +1045,7 @@ mod tests {
             ),
             down_proj: Param::initialized(
                 ParamId::new(),
-                Tensor::<Cuda, 3>::random(
+                Tensor::<3>::random(
                     [experts_n, hidden, inner],
                     Distribution::Normal(0.0, 1.0),
                     &dev,

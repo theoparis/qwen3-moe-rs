@@ -239,7 +239,11 @@ fn raise_exception(msg: String) -> Result<Value, MjError> {
 struct PyFormatter;
 
 impl serde_json::ser::Formatter for PyFormatter {
-    fn write_f64<W: ?Sized + std::io::Write>(&mut self, w: &mut W, value: f64) -> std::io::Result<()> {
+    fn write_f64<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        value: f64,
+    ) -> std::io::Result<()> {
         w.write_all(py_format_f64(value).as_bytes())
     }
 
@@ -248,11 +252,7 @@ impl serde_json::ser::Formatter for PyFormatter {
         w: &mut W,
         first: bool,
     ) -> std::io::Result<()> {
-        if first {
-            Ok(())
-        } else {
-            w.write_all(b", ")
-        }
+        if first { Ok(()) } else { w.write_all(b", ") }
     }
 
     fn begin_object_key<W: ?Sized + std::io::Write>(
@@ -260,11 +260,7 @@ impl serde_json::ser::Formatter for PyFormatter {
         w: &mut W,
         first: bool,
     ) -> std::io::Result<()> {
-        if first {
-            Ok(())
-        } else {
-            w.write_all(b", ")
-        }
+        if first { Ok(()) } else { w.write_all(b", ") }
     }
 
     fn begin_object_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
@@ -548,8 +544,10 @@ impl Object for ToolValue {
     fn enumerate(self: &Arc<Self>) -> Enumerator {
         match &self.0 {
             OrderedJson::Object(entries) => {
-                let keys: Vec<Value> =
-                    entries.iter().map(|(k, _)| Value::from(k.clone())).collect();
+                let keys: Vec<Value> = entries
+                    .iter()
+                    .map(|(k, _)| Value::from(k.clone()))
+                    .collect();
                 Enumerator::Values(keys)
             }
             OrderedJson::Array(items) => Enumerator::Seq(items.len()),

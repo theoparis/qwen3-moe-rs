@@ -30,11 +30,11 @@
 //!   RUSTFLAGS="-C target-feature=+fp16" \
 //!     cargo run --release --features cuda --example cudagraph_p3_rng_bench 2>&1 | tail -30
 
+use cubecl::Runtime;
 use cubecl::cuda::CudaRuntime;
 use cubecl::prelude::*;
-use cubecl::Runtime;
-use cubek_random::{random_uniform_with_seeds, N_SEEDS};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use cubek_random::{N_SEEDS, random_uniform_with_seeds};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 
 type Client = cubecl::client::ComputeClient<CudaRuntime>;
 type Handle = cubecl::server::Handle;
@@ -205,9 +205,7 @@ fn main() {
     // Independent seeds -> essentially every element differs. Require a strong margin.
     let t3 = min_frac > 0.99;
     all_ok &= t3;
-    println!(
-        "[3] decorrelation (fresh seed per replay, {n_replays} replays):"
-    );
+    println!("[3] decorrelation (fresh seed per replay, {n_replays} replays):");
     println!(
         "      consecutive-replay differing-element fraction: min = {:.4}, avg = {:.4}  -> {}",
         min_frac,
@@ -262,21 +260,42 @@ fn main() {
         eager_differ,
         in_range,
         mean,
-        if t4 { "OK (fresh per call, uniform)" } else { "BROKEN" }
+        if t4 {
+            "OK (fresh per call, uniform)"
+        } else {
+            "BROKEN"
+        }
     );
 
     println!("\n=== SUMMARY ===");
-    println!("  [1] captured replay == eager draw (parity)      : {}", yn(t1));
-    println!("  [2] no-rewrite replay is frozen-identical        : {}", yn(t2));
-    println!("  [3] fresh-seed replay DECORRELATES (the C3 fix)  : {}", yn(t3 && !any_pair_identical));
-    println!("  [4] eager RNG unchanged (fresh per call, uniform): {}", yn(t4));
+    println!(
+        "  [1] captured replay == eager draw (parity)      : {}",
+        yn(t1)
+    );
+    println!(
+        "  [2] no-rewrite replay is frozen-identical        : {}",
+        yn(t2)
+    );
+    println!(
+        "  [3] fresh-seed replay DECORRELATES (the C3 fix)  : {}",
+        yn(t3 && !any_pair_identical)
+    );
+    println!(
+        "  [4] eager RNG unchanged (fresh per call, uniform): {}",
+        yn(t4)
+    );
 
     assert!(t1, "parity (captured replay vs eager) failed");
     assert!(t2, "frozen-replay invariant failed (pointer not stable?)");
-    assert!(t3 && !any_pair_identical, "decorrelation failed — seed still frozen under capture");
+    assert!(
+        t3 && !any_pair_identical,
+        "decorrelation failed — seed still frozen under capture"
+    );
     assert!(t4, "eager RNG behavior changed");
     assert!(all_ok);
-    println!("\nPHASE 3 (C3 device-seed RNG) GATE: GO — captured Tensor::random DECORRELATES across replays.");
+    println!(
+        "\nPHASE 3 (C3 device-seed RNG) GATE: GO — captured Tensor::random DECORRELATES across replays."
+    );
 }
 
 fn yn(b: bool) -> &'static str {

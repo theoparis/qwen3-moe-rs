@@ -2,7 +2,7 @@
 //! oracle (stable-softmax causal GQA attention). Confirms the A3 raw-launch port preserves the
 //! proven FA-2 numerics. Run:
 //!   RUSTFLAGS="-C target-feature=+fp16" cargo run --release --features cuda --example flash_raw_smoke
-use burn::tensor::{Tensor, TensorData};
+use burn::tensor::{Device, Tensor, TensorData};
 use qwen3_burn::capture::CaptureBackend;
 use qwen3_burn::flash_attn::flash_attention_raw;
 use qwen3_burn::flash_decode::flash_decode_raw;
@@ -76,9 +76,9 @@ fn check(hq: usize, hkv: usize, sq: usize, sk: usize, d: usize) {
     let kd = pseudo(hkv * sk * d, 2);
     let vd = pseudo(hkv * sk * d, 3);
 
-    let q = Tensor::<B, 4>::from_data(TensorData::new(qd.clone(), [1, hq, sq, d]), &dev);
-    let k = Tensor::<B, 4>::from_data(TensorData::new(kd.clone(), [1, hkv, sk, d]), &dev);
-    let v = Tensor::<B, 4>::from_data(TensorData::new(vd.clone(), [1, hkv, sk, d]), &dev);
+    let q = Tensor::<4>::from_data(TensorData::new(qd.clone(), [1, hq, sq, d]), &dev);
+    let k = Tensor::<4>::from_data(TensorData::new(kd.clone(), [1, hkv, sk, d]), &dev);
+    let v = Tensor::<4>::from_data(TensorData::new(vd.clone(), [1, hkv, sk, d]), &dev);
     let got = flash_attention_raw(q, k, v, scale)
         .into_data()
         .to_vec::<f32>()
@@ -112,9 +112,9 @@ fn check_decode(hq: usize, hkv: usize, sk: usize, d: usize, n_splits: usize) {
     let kd = pseudo(hkv * sk * d, 2);
     let vd = pseudo(hkv * sk * d, 3);
 
-    let q = Tensor::<B, 4>::from_data(TensorData::new(qd.clone(), [1, hq, 1, d]), &dev);
-    let k = Tensor::<B, 4>::from_data(TensorData::new(kd.clone(), [1, hkv, sk, d]), &dev);
-    let v = Tensor::<B, 4>::from_data(TensorData::new(vd.clone(), [1, hkv, sk, d]), &dev);
+    let q = Tensor::<4>::from_data(TensorData::new(qd.clone(), [1, hq, 1, d]), &dev);
+    let k = Tensor::<4>::from_data(TensorData::new(kd.clone(), [1, hkv, sk, d]), &dev);
+    let v = Tensor::<4>::from_data(TensorData::new(vd.clone(), [1, hkv, sk, d]), &dev);
     let got = flash_decode_raw(q, k, v, scale, n_splits)
         .into_data()
         .to_vec::<f32>()
@@ -148,10 +148,10 @@ fn check_decode_bf16(hq: usize, hkv: usize, sk: usize, d: usize, n_splits: usize
     let kd = pseudo(hkv * sk * d, 2);
     let vd = pseudo(hkv * sk * d, 3);
 
-    let q = Tensor::<B, 4>::from_data(TensorData::new(qd.clone(), [1, hq, 1, d]), &dev);
-    let k = Tensor::<B, 4>::from_data(TensorData::new(kd.clone(), [1, hkv, sk, d]), &dev)
+    let q = Tensor::<4>::from_data(TensorData::new(qd.clone(), [1, hq, 1, d]), &dev);
+    let k = Tensor::<4>::from_data(TensorData::new(kd.clone(), [1, hkv, sk, d]), &dev)
         .cast(burn::tensor::DType::BF16);
-    let v = Tensor::<B, 4>::from_data(TensorData::new(vd.clone(), [1, hkv, sk, d]), &dev)
+    let v = Tensor::<4>::from_data(TensorData::new(vd.clone(), [1, hkv, sk, d]), &dev)
         .cast(burn::tensor::DType::BF16);
     let got = flash_decode_raw(q, k, v, scale, n_splits)
         .into_data()

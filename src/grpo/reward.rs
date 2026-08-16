@@ -89,7 +89,9 @@ impl ManimReward {
         if !self.allow_render {
             cmd.arg("--no-render");
         }
-        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -116,7 +118,11 @@ impl ManimReward {
                     if let Some(mut so) = stdout.take() {
                         let _ = so.read_to_string(&mut buf);
                     }
-                    return buf.trim().parse::<f32>().map(|s| s.clamp(0.0, 1.0)).unwrap_or(0.0);
+                    return buf
+                        .trim()
+                        .parse::<f32>()
+                        .map(|s| s.clamp(0.0, 1.0))
+                        .unwrap_or(0.0);
                 }
                 Ok(None) => {
                     if Instant::now() >= deadline {
@@ -145,7 +151,11 @@ mod tests {
     use super::*;
 
     fn python_available() -> bool {
-        Command::new("python3").arg("--version").output().map(|o| o.status.success()).unwrap_or(false)
+        Command::new("python3")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     }
 
     fn harness() -> ManimReward {
@@ -155,7 +165,8 @@ mod tests {
     }
 
     const VALID: &str = "from manim import *\nclass S(Scene):\n    def construct(self):\n        self.play(Create(Square()))\n";
-    const MALICIOUS: &str = "import os\nos.system('rm -rf /tmp/x')\nclass S(Scene):\n    def construct(self): pass\n";
+    const MALICIOUS: &str =
+        "import os\nos.system('rm -rf /tmp/x')\nclass S(Scene):\n    def construct(self): pass\n";
     const GARBAGE: &str = "this is not python at all !!! (((";
 
     #[test]
@@ -167,9 +178,21 @@ mod tests {
         let r = harness();
         let scores = r.score_batch(&[VALID.into(), MALICIOUS.into(), GARBAGE.into()]);
         assert_eq!(scores.len(), 3);
-        assert!(scores[0] >= 0.6, "valid scene should score high, got {}", scores[0]);
-        assert_eq!(scores[1], 0.0, "malicious code must score 0 (safety gate), got {}", scores[1]);
-        assert!(scores[2] < 0.05, "garbage should score ~0, got {}", scores[2]);
+        assert!(
+            scores[0] >= 0.6,
+            "valid scene should score high, got {}",
+            scores[0]
+        );
+        assert_eq!(
+            scores[1], 0.0,
+            "malicious code must score 0 (safety gate), got {}",
+            scores[1]
+        );
+        assert!(
+            scores[2] < 0.05,
+            "garbage should score ~0, got {}",
+            scores[2]
+        );
         // intra-group variance (GRPO needs this)
         assert!(scores[0] > scores[2], "rewards must spread across a group");
     }
@@ -183,20 +206,26 @@ mod tests {
         // a fake harness that ignores stdin and sleeps far longer than the timeout
         let script = std::env::temp_dir().join("grpo_hang_reward_test.py");
         std::fs::write(&script, "import time\ntime.sleep(30)\n").unwrap();
-        let r = ManimReward::new().with_script(&script).with_timeout(Duration::from_millis(300));
+        let r = ManimReward::new()
+            .with_script(&script)
+            .with_timeout(Duration::from_millis(300));
         let t = Instant::now();
         let s = r.score_one("anything");
         let _ = std::fs::remove_file(&script);
         assert_eq!(s, 0.0, "a hung subprocess must score 0.0");
-        assert!(t.elapsed() < Duration::from_secs(5), "must return promptly after timeout, took {:?}", t.elapsed());
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "must return promptly after timeout, took {:?}",
+            t.elapsed()
+        );
     }
 
     #[test]
     fn missing_python_is_failsafe_zero() {
         // a non-existent interpreter must yield 0.0, never panic
-        let r = ManimReward::new().with_python("definitely-not-a-real-python-xyz").with_script(
-            concat!(env!("CARGO_MANIFEST_DIR"), "/a0/manim_reward.py"),
-        );
+        let r = ManimReward::new()
+            .with_python("definitely-not-a-real-python-xyz")
+            .with_script(concat!(env!("CARGO_MANIFEST_DIR"), "/a0/manim_reward.py"));
         assert_eq!(r.score_one(VALID), 0.0);
     }
 }

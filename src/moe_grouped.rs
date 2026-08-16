@@ -78,20 +78,20 @@
 //!  case to exercise the empty-`padded_e=0` / partial-last-block paths the real model hits.
 
 use burn::backend::cuda::Cuda;
-use burn::prelude::Backend;
-use burn::tensor::{DType, IndexingUpdateOp, Int, Tensor, TensorPrimitive};
+use burn::prelude::Device;
+use burn::tensor::{DType, Device, IndexingUpdateOp, Int, Tensor, TensorPrimitive};
 
 use cubecl::cuda::CudaRuntime;
 use cubecl::prelude::ScalarArg;
 use cubecl::tensor_line_size_parallel;
 use cubecl::{CubeCount, CubeDim};
 
+use burn_cubecl::CubeBackend;
 use burn_cubecl::kernel::into_contiguous;
 use burn_cubecl::tensor::CubeTensor;
-use burn_cubecl::CubeBackend;
 
-use crate::cube_custom_op::CubeCustomOp;
 use crate::Qwen3MoeSparseBlock;
+use crate::cube_custom_op::CubeCustomOp;
 
 // =================================================================================================
 // GPU kernel. Own module so `cubecl::prelude::Tensor` (GPU-side) does not clash with
@@ -1292,15 +1292,15 @@ mod gpu {
 /// The vLLM `moe_align_block_size` layout, built fully on-device (no host sync).
 pub struct DroplessLayout {
     /// `[buffer]` i32 — token id per slot, `−1` for padding slots.
-    pub sorted_token: Tensor<Cuda, 1, Int>,
+    pub sorted_token: Tensor<1, Int>,
     /// `[buffer]` f32 — router weight per slot, `0` for padding slots.
-    pub sorted_weight: Tensor<Cuda, 1>,
+    pub sorted_weight: Tensor<1>,
     /// `[buffer]` i32 — expert id per slot, `−1` for padding slots.
-    pub sorted_expert: Tensor<Cuda, 1, Int>,
+    pub sorted_expert: Tensor<1, Int>,
     /// `[num_blocks]` i32 — expert id per `BLOCK_M`-block, `−1` for empty/tail blocks.
-    pub expert_ids: Tensor<Cuda, 1, Int>,
+    pub expert_ids: Tensor<1, Int>,
     /// `[E]` i32 — per-expert assignment count (the dropless invariant: `Σ count_e == N`).
-    pub count_e: Tensor<Cuda, 1, Int>,
+    pub count_e: Tensor<1, Int>,
     /// Number of `BLOCK_M`-blocks launched (a safe host upper bound `E + ceil(N/BLOCK_M)`).
     pub num_blocks: usize,
     /// `num_blocks * BLOCK_M`.
@@ -1312,8 +1312,8 @@ pub struct DroplessLayout {
 /// Build the DROPLESS `moe_align_block_size` layout from the compact top-k routing
 /// `(sel_idx [T,k], sel_w [T,k])`. `block_m` is the segment alignment (vLLM `BLOCK_M`).
 pub fn dropless_align(
-    sel_idx: Tensor<Cuda, 2, Int>,
-    sel_w: Tensor<Cuda, 2>,
+    sel_idx: Tensor<2, Int>,
+    sel_w: Tensor<2>,
     num_experts: usize,
     top_k: usize,
     block_m: usize,
@@ -1327,14 +1327,14 @@ pub fn dropless_align(
 
     // Flatten the N=T*k assignments.
     let assign_e = sel_idx.reshape([n]); // [N] expert id per assignment
-    let assign_tok = Tensor::<Cuda, 1, Int>::arange(0..t as i64, &device)
+    let assign_tok = Tensor::<1, Int>::arange(0..t as i64, &device)
         .reshape([t, 1])
         .repeat(&[1, k])
         .reshape([n]); // [N] token per assignment
     let assign_w = sel_w.reshape([n]); // [N] router weight
 
     // On-device one-hot via (arange == expert) — NOT Tensor::one_hot (host round-trip).
-    let experts_row = Tensor::<Cuda, 1, Int>::arange(0..e as i64, &device).reshape([1, e]); // [1,E]
+    let experts_row = Tensor::<1, Int>::arange(0..e as i64, &device).reshape([1, e]); // [1,E]
     let oh = assign_e.clone().reshape([n, 1]).equal(experts_row).int(); // [N,E] 0/1
 
     // count_e[E], padded_e[E] = round_up(count_e, BLOCK_M), base_e[E] = ExclusiveCumsum(padded_e).
@@ -1363,7 +1363,7 @@ pub fn dropless_align(
 
     // Scatter into the buffer. Store token+1 / expert+1 so an UNWRITTEN slot reads 0 → −1 sentinel
     // after the shift (distinguishable from a real token/expert 0). Dests are unique → Add == assign.
-    let sorted_token = Tensor::<Cuda, 1, Int>::zeros([buffer], &device)
+    let sorted_token = Tensor::<1, Int>::zeros([buffer], &device)
         .select_assign(
             0,
             dest.clone(),
@@ -1371,13 +1371,13 @@ pub fn dropless_align(
             IndexingUpdateOp::Add,
         )
         .add_scalar(-1i64); // real = token, empty = −1
-    let sorted_weight = Tensor::<Cuda, 1>::zeros([buffer], &device).select_assign(
+    let sorted_weight = Tensor::<1>::zeros([buffer], &device).select_assign(
         0,
         dest.clone(),
         assign_w,
         IndexingUpdateOp::Add,
     ); // real = weight, empty = 0
-    let sorted_expert = Tensor::<Cuda, 1, Int>::zeros([buffer], &device)
+    let sorted_expert = Tensor::<1, Int>::zeros([buffer], &device)
         .select_assign(0, dest, assign_e.add_scalar(1i64), IndexingUpdateOp::Add)
         .add_scalar(-1i64); // real = expert, empty = −1
 
@@ -1423,18 +1423,18 @@ fn alloc_f32(like: &CubeTensor<CudaRuntime>, shape: &[usize]) -> CubeTensor<Cuda
 /// (padding rows = 0); the caller scatter-ADDs it back to `out[token]`.
 #[allow(clippy::too_many_arguments)]
 pub fn grouped_swiglu(
-    x: Tensor<Cuda, 2>,                 // [T, H]
-    gate: Tensor<Cuda, 3>,              // [E, H, I]
-    up: Tensor<Cuda, 3>,                // [E, H, I]
-    down: Tensor<Cuda, 3>,              // [E, I, H]
-    sorted_token: Tensor<Cuda, 1, Int>, // [buffer]
-    sorted_weight: Tensor<Cuda, 1>,     // [buffer]
-    expert_ids: Tensor<Cuda, 1, Int>,   // [num_blocks]
+    x: Tensor<2>,                 // [T, H]
+    gate: Tensor<3>,              // [E, H, I]
+    up: Tensor<3>,                // [E, H, I]
+    down: Tensor<3>,              // [E, I, H]
+    sorted_token: Tensor<1, Int>, // [buffer]
+    sorted_weight: Tensor<1>,     // [buffer]
+    expert_ids: Tensor<1, Int>,   // [num_blocks]
     h: usize,
     i: usize,
     block_m: usize,
     num_blocks: usize,
-) -> Tensor<Cuda, 2> {
+) -> Tensor<2> {
     let buffer = num_blocks * block_m;
     assert_eq!(
         x.dtype(),
@@ -1524,11 +1524,7 @@ pub fn grouped_swiglu(
 /// Mirrors [`Qwen3MoeSparseBlock::forward_oracle`]'s math — `out[t] = Σ_{e∈topk(t)} w_{t,e} ·
 /// SwiGLU_e(x_t)` — but computes ONLY the `k*T` routed pairs (no per-expert dense pass, no capacity
 /// drop). `block_m` is the vLLM `BLOCK_M` segment alignment (e.g. 16).
-pub fn forward_grouped(
-    block: &Qwen3MoeSparseBlock<Cuda>,
-    x: Tensor<Cuda, 3>,
-    block_m: usize,
-) -> Tensor<Cuda, 3> {
+pub fn forward_grouped(block: &Qwen3MoeSparseBlock, x: Tensor<3>, block_m: usize) -> Tensor<3> {
     let [b, s, h] = x.dims();
     let t = b * s;
     let e = block.num_experts();
@@ -1564,7 +1560,7 @@ pub fn forward_grouped(
     //    reduction; the k contributions of a token accumulate by Add.
     let mask_pad = lay.sorted_token.clone().lower_elem(0i64);
     let tokens_remap = lay.sorted_token.mask_fill(mask_pad, t as i64); // [buffer], −1 → T
-    let out_pad = Tensor::<Cuda, 2>::zeros([t + 1, h], &device)
+    let out_pad = Tensor::<2>::zeros([t + 1, h], &device)
         .cast(DType::F32)
         .select_assign(0, tokens_remap, y_sorted, IndexingUpdateOp::Add);
     out_pad.slice([0..t, 0..h]).reshape([b, s, h])
@@ -1780,14 +1776,14 @@ fn debug_report_line_sizes(v_g: usize, v_d: usize, wdtype: DType) {
 
 /// Shared shape/dtype validation for [`FusedSwigluBackend::fused_gather_swiglu`] (both backends).
 #[allow(clippy::too_many_arguments)]
-fn assert_fused_shapes<B: Backend>(
-    x: &Tensor<B, 2>,
-    gate: &Tensor<B, 3>,
-    up: &Tensor<B, 3>,
-    down: &Tensor<B, 3>,
-    assign_e: &Tensor<B, 1, Int>,
-    assign_tok: &Tensor<B, 1, Int>,
-    sel_w: &Tensor<B, 1>,
+fn assert_fused_shapes(
+    x: &Tensor<2>,
+    gate: &Tensor<3>,
+    up: &Tensor<3>,
+    down: &Tensor<3>,
+    assign_e: &Tensor<1, Int>,
+    assign_tok: &Tensor<1, Int>,
+    sel_w: &Tensor<1>,
     h: usize,
     i: usize,
     n: usize,
@@ -1839,32 +1835,32 @@ pub trait FusedSwigluBackend: Backend {
     /// routing `assign_e/assign_tok:[N]` + `sel_w:[N]` → weighted per-assignment output `[N,H]` (f32).
     #[allow(clippy::too_many_arguments)]
     fn fused_gather_swiglu(
-        x: Tensor<Self, 2>,
-        gate: Tensor<Self, 3>,
-        up: Tensor<Self, 3>,
-        down: Tensor<Self, 3>,
-        assign_e: Tensor<Self, 1, Int>,
-        assign_tok: Tensor<Self, 1, Int>,
-        sel_w: Tensor<Self, 1>,
+        x: Tensor<2>,
+        gate: Tensor<3>,
+        up: Tensor<3>,
+        down: Tensor<3>,
+        assign_e: Tensor<1, Int>,
+        assign_tok: Tensor<1, Int>,
+        sel_w: Tensor<1>,
         h: usize,
         i: usize,
         n: usize,
-    ) -> Tensor<Self, 2>;
+    ) -> Tensor<2>;
 }
 
 impl FusedSwigluBackend for Cuda {
     fn fused_gather_swiglu(
-        x: Tensor<Cuda, 2>,
-        gate: Tensor<Cuda, 3>,
-        up: Tensor<Cuda, 3>,
-        down: Tensor<Cuda, 3>,
-        assign_e: Tensor<Cuda, 1, Int>,
-        assign_tok: Tensor<Cuda, 1, Int>,
-        sel_w: Tensor<Cuda, 1>,
+        x: Tensor<2>,
+        gate: Tensor<3>,
+        up: Tensor<3>,
+        down: Tensor<3>,
+        assign_e: Tensor<1, Int>,
+        assign_tok: Tensor<1, Int>,
+        sel_w: Tensor<1>,
         h: usize,
         i: usize,
         n: usize,
-    ) -> Tensor<Cuda, 2> {
+    ) -> Tensor<2> {
         assert_fused_shapes(
             &x,
             &gate,
@@ -1908,17 +1904,17 @@ impl FusedSwigluBackend for Cuda {
 
 impl FusedSwigluBackend for CubeBackend<CudaRuntime, f32, i32, u8> {
     fn fused_gather_swiglu(
-        x: Tensor<Self, 2>,
-        gate: Tensor<Self, 3>,
-        up: Tensor<Self, 3>,
-        down: Tensor<Self, 3>,
-        assign_e: Tensor<Self, 1, Int>,
-        assign_tok: Tensor<Self, 1, Int>,
-        sel_w: Tensor<Self, 1>,
+        x: Tensor<2>,
+        gate: Tensor<3>,
+        up: Tensor<3>,
+        down: Tensor<3>,
+        assign_e: Tensor<1, Int>,
+        assign_tok: Tensor<1, Int>,
+        sel_w: Tensor<1>,
         h: usize,
         i: usize,
         n: usize,
-    ) -> Tensor<Self, 2> {
+    ) -> Tensor<2> {
         assert_fused_shapes(
             &x,
             &gate,
@@ -2064,7 +2060,7 @@ fn run_e4m3_line_decode_probe(
 }
 
 #[cfg(feature = "cuda")]
-pub fn e4m3_line_decode_probe(q: Tensor<Cuda, 1, Int>) -> Tensor<Cuda, 1> {
+pub fn e4m3_line_decode_probe(q: Tensor<1, Int>) -> Tensor<1> {
     assert_eq!(
         q.dtype(),
         DType::I8,
@@ -2106,7 +2102,7 @@ fn run_e2m1_marlin_decode_probe(
 }
 
 #[cfg(feature = "cuda")]
-pub fn e2m1_marlin_decode_probe(q: Tensor<Cuda, 1, Int>) -> Tensor<Cuda, 1> {
+pub fn e2m1_marlin_decode_probe(q: Tensor<1, Int>) -> Tensor<1> {
     assert_eq!(
         q.dtype(),
         DType::I8,
@@ -2171,15 +2167,15 @@ fn run_fused35_nvfp4_projection_probe(
 #[cfg(all(test, feature = "cuda"))]
 #[allow(clippy::too_many_arguments)]
 fn fused35_nvfp4_projection_probe_cuda(
-    x: Tensor<Cuda, 2>,
-    q_gu: Tensor<Cuda, 3, Int>,
-    bs_gu: Tensor<Cuda, 3, Int>,
-    gscale_gu: Tensor<Cuda, 2>,
-    assign_e: Tensor<Cuda, 1, Int>,
+    x: Tensor<2>,
+    q_gu: Tensor<3, Int>,
+    bs_gu: Tensor<3, Int>,
+    gscale_gu: Tensor<2>,
+    assign_e: Tensor<1, Int>,
     h: usize,
     i: usize,
     n: usize,
-) -> (Tensor<Cuda, 2>, Tensor<Cuda, 2>) {
+) -> (Tensor<2>, Tensor<2>) {
     assert_eq!(
         x.dtype(),
         DType::F32,
@@ -2631,12 +2627,12 @@ fn debug_report_35_fp8_line_sizes(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn assert_fused35_shapes<B: Backend>(
-    x: &Tensor<B, 2>,
-    gate_up: &Tensor<B, 3>,
-    down: &Tensor<B, 3>,
-    assign_e: &Tensor<B, 1, Int>,
-    sel_w: &Tensor<B, 1>,
+fn assert_fused35_shapes(
+    x: &Tensor<2>,
+    gate_up: &Tensor<3>,
+    down: &Tensor<3>,
+    assign_e: &Tensor<1, Int>,
+    sel_w: &Tensor<1>,
     h: usize,
     i: usize,
     n: usize,
@@ -2667,14 +2663,14 @@ fn assert_fused35_shapes<B: Backend>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn assert_fused35_fp8_shapes<B: Backend>(
-    x: &Tensor<B, 2>,
-    q_gu: &Tensor<B, 3, Int>,
-    s_gu: &Tensor<B, 2>,
-    q_dn: &Tensor<B, 3, Int>,
-    s_dn: &Tensor<B, 2>,
-    assign_e: &Tensor<B, 1, Int>,
-    sel_w: &Tensor<B, 1>,
+fn assert_fused35_fp8_shapes(
+    x: &Tensor<2>,
+    q_gu: &Tensor<3, Int>,
+    s_gu: &Tensor<2>,
+    q_dn: &Tensor<3, Int>,
+    s_dn: &Tensor<2>,
+    assign_e: &Tensor<1, Int>,
+    sel_w: &Tensor<1>,
     h: usize,
     i: usize,
     n: usize,
@@ -2710,16 +2706,16 @@ fn assert_fused35_fp8_shapes<B: Backend>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn assert_fused35_nvfp4_shapes<B: Backend>(
-    x: &Tensor<B, 2>,
-    q_gu: &Tensor<B, 3, Int>,
-    bs_gu: &Tensor<B, 3, Int>,
-    gscale_gu: &Tensor<B, 2>,
-    q_dn: &Tensor<B, 3, Int>,
-    bs_dn: &Tensor<B, 3, Int>,
-    gscale_dn: &Tensor<B, 1>,
-    assign_e: &Tensor<B, 1, Int>,
-    sel_w: &Tensor<B, 1>,
+fn assert_fused35_nvfp4_shapes(
+    x: &Tensor<2>,
+    q_gu: &Tensor<3, Int>,
+    bs_gu: &Tensor<3, Int>,
+    gscale_gu: &Tensor<2>,
+    q_dn: &Tensor<3, Int>,
+    bs_dn: &Tensor<3, Int>,
+    gscale_dn: &Tensor<1>,
+    assign_e: &Tensor<1, Int>,
+    sel_w: &Tensor<1>,
     h: usize,
     i: usize,
     n: usize,
@@ -2795,58 +2791,58 @@ fn assert_fused35_nvfp4_shapes<B: Backend>(
 pub trait Fused35MoeBackend: Backend {
     #[allow(clippy::too_many_arguments)]
     fn fused_moe_gu2_down_bf16(
-        x: Tensor<Self, 2>,
-        gate_up: Tensor<Self, 3>,
-        down: Tensor<Self, 3>,
-        assign_e: Tensor<Self, 1, Int>,
-        sel_w: Tensor<Self, 1>,
+        x: Tensor<2>,
+        gate_up: Tensor<3>,
+        down: Tensor<3>,
+        assign_e: Tensor<1, Int>,
+        sel_w: Tensor<1>,
         h: usize,
         i: usize,
         n: usize,
-    ) -> Tensor<Self, 2>;
+    ) -> Tensor<2>;
 
     #[allow(clippy::too_many_arguments)]
     fn fused_moe_gu2_down_fp8(
-        x: Tensor<Self, 2>,
-        q_gu: Tensor<Self, 3, Int>,
-        s_gu: Tensor<Self, 2>,
-        q_dn: Tensor<Self, 3, Int>,
-        s_dn: Tensor<Self, 2>,
-        assign_e: Tensor<Self, 1, Int>,
-        sel_w: Tensor<Self, 1>,
+        x: Tensor<2>,
+        q_gu: Tensor<3, Int>,
+        s_gu: Tensor<2>,
+        q_dn: Tensor<3, Int>,
+        s_dn: Tensor<2>,
+        assign_e: Tensor<1, Int>,
+        sel_w: Tensor<1>,
         h: usize,
         i: usize,
         n: usize,
-    ) -> Tensor<Self, 2>;
+    ) -> Tensor<2>;
 
     #[allow(clippy::too_many_arguments)]
     fn fused_moe_gu2_down_nvfp4(
-        x: Tensor<Self, 2>,
-        q_gu: Tensor<Self, 3, Int>,
-        bs_gu: Tensor<Self, 3, Int>,
-        gscale_gu: Tensor<Self, 2>,
-        q_dn: Tensor<Self, 3, Int>,
-        bs_dn: Tensor<Self, 3, Int>,
-        gscale_dn: Tensor<Self, 1>,
-        assign_e: Tensor<Self, 1, Int>,
-        sel_w: Tensor<Self, 1>,
+        x: Tensor<2>,
+        q_gu: Tensor<3, Int>,
+        bs_gu: Tensor<3, Int>,
+        gscale_gu: Tensor<2>,
+        q_dn: Tensor<3, Int>,
+        bs_dn: Tensor<3, Int>,
+        gscale_dn: Tensor<1>,
+        assign_e: Tensor<1, Int>,
+        sel_w: Tensor<1>,
         h: usize,
         i: usize,
         n: usize,
-    ) -> Tensor<Self, 2>;
+    ) -> Tensor<2>;
 }
 
 impl Fused35MoeBackend for Cuda {
     fn fused_moe_gu2_down_bf16(
-        x: Tensor<Cuda, 2>,
-        gate_up: Tensor<Cuda, 3>,
-        down: Tensor<Cuda, 3>,
-        assign_e: Tensor<Cuda, 1, Int>,
-        sel_w: Tensor<Cuda, 1>,
+        x: Tensor<2>,
+        gate_up: Tensor<3>,
+        down: Tensor<3>,
+        assign_e: Tensor<1, Int>,
+        sel_w: Tensor<1>,
         h: usize,
         i: usize,
         n: usize,
-    ) -> Tensor<Cuda, 2> {
+    ) -> Tensor<2> {
         assert_fused35_shapes(&x, &gate_up, &down, &assign_e, &sel_w, h, i, n);
 
         let x_prim = x.into_primitive().tensor();
@@ -2870,17 +2866,17 @@ impl Fused35MoeBackend for Cuda {
     }
 
     fn fused_moe_gu2_down_fp8(
-        x: Tensor<Cuda, 2>,
-        q_gu: Tensor<Cuda, 3, Int>,
-        s_gu: Tensor<Cuda, 2>,
-        q_dn: Tensor<Cuda, 3, Int>,
-        s_dn: Tensor<Cuda, 2>,
-        assign_e: Tensor<Cuda, 1, Int>,
-        sel_w: Tensor<Cuda, 1>,
+        x: Tensor<2>,
+        q_gu: Tensor<3, Int>,
+        s_gu: Tensor<2>,
+        q_dn: Tensor<3, Int>,
+        s_dn: Tensor<2>,
+        assign_e: Tensor<1, Int>,
+        sel_w: Tensor<1>,
         h: usize,
         i: usize,
         n: usize,
-    ) -> Tensor<Cuda, 2> {
+    ) -> Tensor<2> {
         assert_fused35_fp8_shapes(&x, &q_gu, &s_gu, &q_dn, &s_dn, &assign_e, &sel_w, h, i, n);
 
         let x_prim = x.into_primitive().tensor();
@@ -2908,19 +2904,19 @@ impl Fused35MoeBackend for Cuda {
     }
 
     fn fused_moe_gu2_down_nvfp4(
-        x: Tensor<Cuda, 2>,
-        q_gu: Tensor<Cuda, 3, Int>,
-        bs_gu: Tensor<Cuda, 3, Int>,
-        gscale_gu: Tensor<Cuda, 2>,
-        q_dn: Tensor<Cuda, 3, Int>,
-        bs_dn: Tensor<Cuda, 3, Int>,
-        gscale_dn: Tensor<Cuda, 1>,
-        assign_e: Tensor<Cuda, 1, Int>,
-        sel_w: Tensor<Cuda, 1>,
+        x: Tensor<2>,
+        q_gu: Tensor<3, Int>,
+        bs_gu: Tensor<3, Int>,
+        gscale_gu: Tensor<2>,
+        q_dn: Tensor<3, Int>,
+        bs_dn: Tensor<3, Int>,
+        gscale_dn: Tensor<1>,
+        assign_e: Tensor<1, Int>,
+        sel_w: Tensor<1>,
         h: usize,
         i: usize,
         n: usize,
-    ) -> Tensor<Cuda, 2> {
+    ) -> Tensor<2> {
         assert_fused35_nvfp4_shapes(
             &x, &q_gu, &bs_gu, &gscale_gu, &q_dn, &bs_dn, &gscale_dn, &assign_e, &sel_w, h, i, n,
         );
@@ -2957,20 +2953,20 @@ impl Fused35MoeBackend for Cuda {
 #[cfg(all(test, feature = "cuda"))]
 #[allow(clippy::too_many_arguments)]
 fn fused_moe_gu2_down_nvfp4_forced_cuda(
-    x: Tensor<Cuda, 2>,
-    q_gu: Tensor<Cuda, 3, Int>,
-    bs_gu: Tensor<Cuda, 3, Int>,
-    gscale_gu: Tensor<Cuda, 2>,
-    q_dn: Tensor<Cuda, 3, Int>,
-    bs_dn: Tensor<Cuda, 3, Int>,
-    gscale_dn: Tensor<Cuda, 1>,
-    assign_e: Tensor<Cuda, 1, Int>,
-    sel_w: Tensor<Cuda, 1>,
+    x: Tensor<2>,
+    q_gu: Tensor<3, Int>,
+    bs_gu: Tensor<3, Int>,
+    gscale_gu: Tensor<2>,
+    q_dn: Tensor<3, Int>,
+    bs_dn: Tensor<3, Int>,
+    gscale_dn: Tensor<1>,
+    assign_e: Tensor<1, Int>,
+    sel_w: Tensor<1>,
     h: usize,
     i: usize,
     n: usize,
     path: Nvfp4LaunchPath,
-) -> Tensor<Cuda, 2> {
+) -> Tensor<2> {
     assert!(
         matches!(path, Nvfp4LaunchPath::Scalar | Nvfp4LaunchPath::SplitK),
         "test helper must force a concrete nvfp4 path, got {path:?}"
@@ -3009,15 +3005,15 @@ fn fused_moe_gu2_down_nvfp4_forced_cuda(
 
 impl Fused35MoeBackend for CubeBackend<CudaRuntime, f32, i32, u8> {
     fn fused_moe_gu2_down_bf16(
-        x: Tensor<Self, 2>,
-        gate_up: Tensor<Self, 3>,
-        down: Tensor<Self, 3>,
-        assign_e: Tensor<Self, 1, Int>,
-        sel_w: Tensor<Self, 1>,
+        x: Tensor<2>,
+        gate_up: Tensor<3>,
+        down: Tensor<3>,
+        assign_e: Tensor<1, Int>,
+        sel_w: Tensor<1>,
         h: usize,
         i: usize,
         n: usize,
-    ) -> Tensor<Self, 2> {
+    ) -> Tensor<2> {
         assert_fused35_shapes(&x, &gate_up, &down, &assign_e, &sel_w, h, i, n);
 
         let inputs = [
@@ -3032,17 +3028,17 @@ impl Fused35MoeBackend for CubeBackend<CudaRuntime, f32, i32, u8> {
     }
 
     fn fused_moe_gu2_down_fp8(
-        x: Tensor<Self, 2>,
-        q_gu: Tensor<Self, 3, Int>,
-        s_gu: Tensor<Self, 2>,
-        q_dn: Tensor<Self, 3, Int>,
-        s_dn: Tensor<Self, 2>,
-        assign_e: Tensor<Self, 1, Int>,
-        sel_w: Tensor<Self, 1>,
+        x: Tensor<2>,
+        q_gu: Tensor<3, Int>,
+        s_gu: Tensor<2>,
+        q_dn: Tensor<3, Int>,
+        s_dn: Tensor<2>,
+        assign_e: Tensor<1, Int>,
+        sel_w: Tensor<1>,
         h: usize,
         i: usize,
         n: usize,
-    ) -> Tensor<Self, 2> {
+    ) -> Tensor<2> {
         assert_fused35_fp8_shapes(&x, &q_gu, &s_gu, &q_dn, &s_dn, &assign_e, &sel_w, h, i, n);
         let inputs = [
             x.into_primitive().tensor(),
@@ -3058,19 +3054,19 @@ impl Fused35MoeBackend for CubeBackend<CudaRuntime, f32, i32, u8> {
     }
 
     fn fused_moe_gu2_down_nvfp4(
-        x: Tensor<Self, 2>,
-        q_gu: Tensor<Self, 3, Int>,
-        bs_gu: Tensor<Self, 3, Int>,
-        gscale_gu: Tensor<Self, 2>,
-        q_dn: Tensor<Self, 3, Int>,
-        bs_dn: Tensor<Self, 3, Int>,
-        gscale_dn: Tensor<Self, 1>,
-        assign_e: Tensor<Self, 1, Int>,
-        sel_w: Tensor<Self, 1>,
+        x: Tensor<2>,
+        q_gu: Tensor<3, Int>,
+        bs_gu: Tensor<3, Int>,
+        gscale_gu: Tensor<2>,
+        q_dn: Tensor<3, Int>,
+        bs_dn: Tensor<3, Int>,
+        gscale_dn: Tensor<1>,
+        assign_e: Tensor<1, Int>,
+        sel_w: Tensor<1>,
         h: usize,
         i: usize,
         n: usize,
-    ) -> Tensor<Self, 2> {
+    ) -> Tensor<2> {
         assert_fused35_nvfp4_shapes(
             &x, &q_gu, &bs_gu, &gscale_gu, &q_dn, &bs_dn, &gscale_dn, &assign_e, &sel_w, h, i, n,
         );
@@ -3129,25 +3125,19 @@ mod nvfp4_host_tests {
 #[cfg(all(test, feature = "cuda"))]
 mod fp8_tests {
     use super::*;
-    use burn::{
-        backend::cuda::{Cuda, CudaDevice},
-        tensor::TensorData,
-    };
+    use burn::{prelude::Device, tensor::TensorData};
 
     #[test]
     fn e4m3_line_reinterpret_matches_scalar_decode_cuda() {
-        let device = CudaDevice::default();
+        let device = Device::cuda(0);
         let bytes: Vec<u8> = vec![
             0x00, 0x01, 0x07, 0x08, 0x10, 0x20, 0x30, 0x38, 0x3f, 0x40, 0x48, 0x50, 0x58, 0x60,
             0x70, 0x7e, 0x80, 0x81, 0x87, 0x88, 0x90, 0xa0, 0xb0, 0xb8, 0xbf, 0xc0, 0xc8, 0xd0,
             0xd8, 0xe0, 0xf0, 0xfe,
         ];
         let q_i8: Vec<i8> = bytes.iter().map(|&b| b as i8).collect();
-        let q = Tensor::<Cuda, 1, Int>::from_data_dtype(
-            TensorData::new(q_i8, [bytes.len()]),
-            &device,
-            DType::I8,
-        );
+        let q =
+            Tensor::<1, Int>::from_data(TensorData::new(q_i8, ([bytes.len()]), &device, DType::I8));
         let got = e4m3_line_decode_probe(q)
             .into_data()
             .to_vec::<f32>()
@@ -3170,10 +3160,7 @@ mod fp8_tests {
 #[cfg(all(test, feature = "cuda"))]
 mod nvfp4_decode_tests {
     use super::*;
-    use burn::{
-        backend::cuda::{Cuda, CudaDevice},
-        tensor::TensorData,
-    };
+    use burn::{prelude::Device, tensor::TensorData};
 
     fn marlin_e4m3_byte_for_e2m1(code: u8) -> u8 {
         let top = (code & 0x0f) << 4;
@@ -3185,14 +3172,11 @@ mod nvfp4_decode_tests {
         assert_eq!(marlin_e4m3_byte_for_e2m1(0x1), 0x04);
         assert_eq!(marlin_e4m3_byte_for_e2m1(0x9), 0x84);
 
-        let device = CudaDevice::default();
+        let device = Device::cuda(0);
         let bytes: Vec<u8> = (0u16..=255).map(|b| b as u8).collect();
         let q_i8: Vec<i8> = bytes.iter().map(|&b| b as i8).collect();
-        let q = Tensor::<Cuda, 1, Int>::from_data_dtype(
-            TensorData::new(q_i8, [bytes.len()]),
-            &device,
-            DType::I8,
-        );
+        let q =
+            Tensor::<1, Int>::from_data(TensorData::new(q_i8, ([bytes.len()]), &device, DType::I8));
 
         let got = e2m1_marlin_decode_probe(q)
             .into_data()
@@ -3219,10 +3203,7 @@ mod nvfp4_decode_tests {
 #[cfg(all(test, feature = "cuda"))]
 mod nvfp4_fused_tests {
     use super::*;
-    use burn::{
-        backend::cuda::{Cuda, CudaDevice},
-        tensor::TensorData,
-    };
+    use burn::{prelude::Device, tensor::TensorData};
 
     use crate::nvfp4::{dequant_nvfp4_outmajor, quantize_nvfp4, repack_kmajor_to_outmajor};
 
@@ -3242,12 +3223,12 @@ mod nvfp4_fused_tests {
 
     struct Nvfp4Fixture {
         experts: Vec<Nvfp4ExpertFixture>,
-        q_gu: Tensor<Cuda, 3, Int>,
-        bs_gu: Tensor<Cuda, 3, Int>,
-        gscale_gu: Tensor<Cuda, 2>,
-        q_dn: Tensor<Cuda, 3, Int>,
-        bs_dn: Tensor<Cuda, 3, Int>,
-        gscale_dn: Tensor<Cuda, 1>,
+        q_gu: Tensor<3, Int>,
+        bs_gu: Tensor<3, Int>,
+        gscale_gu: Tensor<2>,
+        q_dn: Tensor<3, Int>,
+        bs_dn: Tensor<3, Int>,
+        gscale_dn: Tensor<1>,
     }
 
     fn synth(seed: u64, idx: usize, scale: f32) -> f32 {
@@ -3353,28 +3334,28 @@ mod nvfp4_fused_tests {
 
         Nvfp4Fixture {
             experts,
-            q_gu: Tensor::<Cuda, 3, Int>::from_data_dtype(
-                TensorData::new(q_gu_all, [e, H, I]),
+            q_gu: Tensor::<3, Int>::from_data(
+                TensorData::new(q_gu_all, ([e, H, I])),
                 device,
                 DType::I8,
             ),
-            bs_gu: Tensor::<Cuda, 3, Int>::from_data_dtype(
-                TensorData::new(bs_gu_all, [e, 2 * I, H / 16]),
+            bs_gu: Tensor::<3, Int>::from_data(
+                TensorData::new(bs_gu_all, ([e, 2 * I, H / 16])),
                 device,
                 DType::I8,
             ),
-            gscale_gu: Tensor::<Cuda, 2>::from_data(TensorData::new(gscale_gu_all, [e, 2]), device),
-            q_dn: Tensor::<Cuda, 3, Int>::from_data_dtype(
-                TensorData::new(q_dn_all, [e, I, H / 2]),
+            gscale_gu: Tensor::<2>::from_data(TensorData::new(gscale_gu_all, [e, 2]), device),
+            q_dn: Tensor::<3, Int>::from_data(
+                TensorData::new(q_dn_all, ([e, I, H / 2])),
                 device,
                 DType::I8,
             ),
-            bs_dn: Tensor::<Cuda, 3, Int>::from_data_dtype(
-                TensorData::new(bs_dn_all, [e, H, I / 16]),
+            bs_dn: Tensor::<3, Int>::from_data(
+                TensorData::new(bs_dn_all, ([e, H, I / 16])),
                 device,
                 DType::I8,
             ),
-            gscale_dn: Tensor::<Cuda, 1>::from_data(TensorData::new(gscale_dn_all, [e]), device),
+            gscale_dn: Tensor::<1>::from_data(TensorData::new(gscale_dn_all, [e]), device),
         }
     }
 
@@ -3494,13 +3475,14 @@ mod nvfp4_fused_tests {
         path: Nvfp4LaunchPath,
     ) -> Vec<f32> {
         let n = t * TOP_K;
-        let x_t = Tensor::<Cuda, 2>::from_data(TensorData::new(x.to_vec(), [t, H]), device);
-        let assign_t = Tensor::<Cuda, 1, Int>::from_data_dtype(
-            TensorData::new(assign_e.to_vec(), [n]),
+        let x_t = Tensor::<2>::from_data(TensorData::new(x.to_vec(), [t, H]), device);
+        let assign_t = Tensor::<1, Int>::from_data(TensorData::new(
+            assign_e.to_vec(),
+            ([n]),
             device,
             DType::I32,
-        );
-        let sel_t = Tensor::<Cuda, 1>::from_data(TensorData::new(sel_w.to_vec(), [n]), device);
+        ));
+        let sel_t = Tensor::<1>::from_data(TensorData::new(sel_w.to_vec(), [n]), device);
         fused_moe_gu2_down_nvfp4_forced_cuda(
             x_t,
             fixture.q_gu.clone(),
@@ -3523,7 +3505,7 @@ mod nvfp4_fused_tests {
 
     #[test]
     fn fused35_nvfp4_kernel_vs_host_parity_splitk_and_scalar_cuda() {
-        let device = CudaDevice::default();
+        let device = Device::cuda(0);
         for e in [8usize, 32] {
             let fixture = build_fixture(&device, e);
             for t in [1usize, 2, 8, 16] {
@@ -3546,7 +3528,7 @@ mod nvfp4_fused_tests {
 
     #[test]
     fn fused35_nvfp4_gate_up_projection_offsets_match_unfused_gemv_cuda() {
-        let device = CudaDevice::default();
+        let device = Device::cuda(0);
         let e = 8usize;
         let t = 2usize;
         let n = t * TOP_K;
@@ -3555,12 +3537,9 @@ mod nvfp4_fused_tests {
         let (assign_e, _) = routing(e, t);
         let (gate_want, up_want) = host_gate_up_projection(&fixture, &x, &assign_e, t);
 
-        let x_t = Tensor::<Cuda, 2>::from_data(TensorData::new(x, [t, H]), &device);
-        let assign_t = Tensor::<Cuda, 1, Int>::from_data_dtype(
-            TensorData::new(assign_e, [n]),
-            &device,
-            DType::I32,
-        );
+        let x_t = Tensor::<2>::from_data(TensorData::new(x, [t, H]), &device);
+        let assign_t =
+            Tensor::<1, Int>::from_data(TensorData::new(assign_e, ([n]), &device, DType::I32));
         let (gate_got, up_got) = fused35_nvfp4_projection_probe_cuda(
             x_t,
             fixture.q_gu,

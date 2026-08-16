@@ -9,8 +9,7 @@
 use std::{path::PathBuf, time::Instant};
 
 use burn::{
-    backend::cuda::{Cuda, CudaDevice},
-    prelude::Backend,
+    prelude::Device,
     tensor::{Int, Tensor},
 };
 use cubecl::{Runtime, cuda::CudaRuntime};
@@ -46,20 +45,19 @@ fn print_mem(label: &str) {
     println!("{label}: VmRSS={rss}, VmHWM={hwm}");
 }
 
-fn positions<B>(start: usize, len: usize, device: &CudaDevice) -> Tensor<B, 2, Int>
+fn positions<B>(start: usize, len: usize, device: &CudaDevice) -> Tensor<2, Int>
 where
     B: Backend<Device = CudaDevice>,
 {
     if len == 1 {
-        Tensor::<B, 2, Int>::from_data([[start as i64]], device)
+        Tensor::<2, Int>::from_data([[start as i64]], device)
     } else {
-        Tensor::<B, 1, Int>::arange(start as i64..(start + len) as i64, device).unsqueeze()
+        Tensor::<1, Int>::arange(start as i64..(start + len) as i64, device).unsqueeze()
     }
 }
 
-fn logits_last_row<B>(logits: &Tensor<B, 3>, what: &str) -> Result<Vec<f32>, String>
+fn logits_last_row<B>(logits: &Tensor<3>, what: &str) -> Result<Vec<f32>, String>
 where
-    B: Backend,
 {
     let [batch, seq, vocab] = logits.dims();
     let values = logits
@@ -81,9 +79,8 @@ where
     Ok(values)
 }
 
-fn assert_logits_all_finite<B>(logits: &Tensor<B, 3>, what: &str) -> Result<(), String>
+fn assert_logits_all_finite<B>(logits: &Tensor<3>, what: &str) -> Result<(), String>
 where
-    B: Backend,
 {
     logits_last_row(logits, what).map(|_| ())
 }
@@ -95,9 +92,8 @@ fn top5(row: &[f32]) -> Vec<(usize, f32)> {
     idxv
 }
 
-fn argmax_last<B>(logits: &Tensor<B, 3>) -> Result<i64, String>
+fn argmax_last<B>(logits: &Tensor<3>) -> Result<i64, String>
 where
-    B: Backend,
 {
     let row = logits_last_row(logits, "decode")?;
     let (id, _) = top5(&row)
@@ -116,7 +112,7 @@ struct GreedyRun {
 }
 
 fn greedy_decode<B>(
-    model: &qwen3_burn::Qwen3_5MoeForCausalLM<B>,
+    model: &qwen3_burn::Qwen3_5MoeForCausalLM,
     tokenizer: &Qwen3Tokenizer,
     prompt_ids: &[i64],
     max_new_tokens: usize,
@@ -133,7 +129,7 @@ where
 
     let prompt_len = prompt_ids.len();
     let total = prompt_len + max_new_tokens;
-    let input = Tensor::<B, 1, Int>::from_data(prompt_ids, device).unsqueeze();
+    let input = Tensor::<1, Int>::from_data(prompt_ids, device).unsqueeze();
     let mut cache = model.model.new_cache_with_capacity(total);
     let gen_start = Instant::now();
     let pos0 = positions::<B>(0, prompt_len, device);
@@ -162,7 +158,7 @@ where
         new_ids.push(id);
 
         if step + 1 < max_new_tokens {
-            let tok = Tensor::<B, 2, Int>::from_data([[id]], device);
+            let tok = Tensor::<2, Int>::from_data([[id]], device);
             let pos = positions::<B>(prompt_len + step, 1, device);
             logits = model.forward_prec(tok, pos, &mut cache, prec);
         }
@@ -181,7 +177,7 @@ where
 }
 
 fn teacher_force_decode<B>(
-    model: &qwen3_burn::Qwen3_5MoeForCausalLM<B>,
+    model: &qwen3_burn::Qwen3_5MoeForCausalLM,
     backend: &str,
     device: &CudaDevice,
 ) -> Result<(), String>
@@ -199,7 +195,7 @@ where
         ));
     }
 
-    let input = Tensor::<B, 1, Int>::from_data(&FORCED[..prompt_len], device).unsqueeze();
+    let input = Tensor::<1, Int>::from_data(&FORCED[..prompt_len], device).unsqueeze();
     let mut cache = model.model.new_cache_with_capacity(FORCED.len());
     let pos0 = positions::<B>(0, prompt_len, device);
     let mut logits = model.forward_prec(input, pos0, &mut cache, Precision::Bf16);
@@ -233,7 +229,7 @@ where
         );
 
         if step + 1 < MAX_NEW_TOKENS {
-            let tok = Tensor::<B, 2, Int>::from_data([[forced]], device);
+            let tok = Tensor::<2, Int>::from_data([[forced]], device);
             let step_pos = positions::<B>(pos, 1, device);
             logits = model.forward_prec(tok, step_pos, &mut cache, Precision::Bf16);
         }
@@ -286,7 +282,7 @@ where
 {
     let dir = PathBuf::from(std::env::var("QWEN35_DIR").unwrap_or_else(|_| MODEL_DIR.to_string()));
     let mode = std::env::var("MODE").unwrap_or_else(|_| "freerun".to_string());
-    let device = CudaDevice::default();
+    let device = Device::cuda(0);
     let quant = std::env::var("QUANT").unwrap_or_else(|_| "bf16".to_string());
     let quant_mode = if quant.eq_ignore_ascii_case("fp8") {
         println!("QUANT=fp8 requested; skipping T1 raw parity gate (fp8-under-capture is later)");
@@ -320,7 +316,7 @@ where
     );
 
     let tokenizer = Qwen3Tokenizer::from_file(dir.join("tokenizer.json"))?;
-    let mut model = cfg.init_causal_lm::<B>(&device);
+    let mut model = cfg.init_causal_lm(&device);
 
     println!("loading sharded BF16 weights from {dir:?} ...");
     let load_start = Instant::now();

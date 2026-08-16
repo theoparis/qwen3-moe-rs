@@ -8,8 +8,8 @@
 //!
 //!   RUSTFLAGS="-C target-feature=+fp16" cargo run --release --features cuda --example fp8_probe
 
-use burn::backend::cuda::{Cuda, CudaDevice};
-use burn::tensor::{Distribution, Tensor};
+use burn::prelude::Device;
+use burn::tensor::{Device, Distribution, Tensor};
 
 type B = Cuda;
 
@@ -19,7 +19,7 @@ const LN2: f32 = std::f32::consts::LN_2;
 /// Faithful E4M3 fake-quant: round to the float8-e4m3 grid (3 mantissa bits, exponent in [-6, 8]).
 /// Input is assumed pre-scaled into roughly [-448, 448]. Done in f32 tensor ops (the storage error is
 /// what we measure; the real path dequantizes to bf16 before a bf16 MMA).
-fn fake_e4m3<const D: usize>(x: Tensor<B, D>) -> Tensor<B, D> {
+fn fake_e4m3<const D: usize>(x: Tensor<D>) -> Tensor<D> {
     let sign = x.clone().sign();
     let absx = x.abs().clamp(1e-12, E4M3_MAX); // guard log(0); clamp to max
     let e = (absx.clone().log() / LN2).floor().clamp(-6.0, 8.0); // exponent = floor(log2|x|), e4m3 range
@@ -29,9 +29,11 @@ fn fake_e4m3<const D: usize>(x: Tensor<B, D>) -> Tensor<B, D> {
 }
 
 fn main() {
-    let device = CudaDevice::default();
+    let device = Device::cuda(0);
     println!("device: {device:?}");
-    println!("E4M3 weight-storage probe: per-channel symmetric scale, round to e4m3, vs full precision\n");
+    println!(
+        "E4M3 weight-storage probe: per-channel symmetric scale, round to e4m3, vs full precision\n"
+    );
 
     // Representative Qwen3 Linear shapes [d_in, d_out] (Burn Linear stores [in, out]).
     let shapes: &[(usize, usize, &str)] = &[
@@ -44,8 +46,8 @@ fn main() {
 
     for &(d_in, d_out, name) in shapes {
         // Weights ~ N(0, 0.02) (typical init/trained scale); activations ~ N(0,1).
-        let w = Tensor::<B, 2>::random([d_in, d_out], Distribution::Normal(0.0, 0.02), &device);
-        let x = Tensor::<B, 2>::random([tokens, d_in], Distribution::Normal(0.0, 1.0), &device);
+        let w = Tensor::<2>::random([d_in, d_out], Distribution::Normal(0.0, 0.02), &device);
+        let x = Tensor::<2>::random([tokens, d_in], Distribution::Normal(0.0, 1.0), &device);
 
         // Per-OUTPUT-channel symmetric scale (amax over the input dim) -> bring each column to ~[-448,448].
         let amax = w.clone().abs().max_dim(0); // [1, d_out]
@@ -76,7 +78,13 @@ fn main() {
         );
     }
 
-    println!("\nVERDICT: cosine > 0.9999 and rel-err of a few % per layer means E4M3 weight-storage is");
-    println!("parity-safe for the rollout (the small per-layer error is far below the bf16<->fp8 sampling");
-    println!("margin, and sampling stays bf16). The ~2x weight-bandwidth win needs NO fp8 tensor cores.");
+    println!(
+        "\nVERDICT: cosine > 0.9999 and rel-err of a few % per layer means E4M3 weight-storage is"
+    );
+    println!(
+        "parity-safe for the rollout (the small per-layer error is far below the bf16<->fp8 sampling"
+    );
+    println!(
+        "margin, and sampling stays bf16). The ~2x weight-bandwidth win needs NO fp8 tensor cores."
+    );
 }

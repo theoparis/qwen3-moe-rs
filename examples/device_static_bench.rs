@@ -23,23 +23,23 @@
 //!
 //!   RUSTFLAGS="-C target-feature=+fp16" cargo run --release --features cuda --example device_static_bench
 
-use burn::backend::cuda::{Cuda, CudaDevice};
-use burn::tensor::backend::Backend;
-use burn::tensor::{Int, Tensor};
-use qwen3_burn::grpo::{
-    group_sample_cached_device_loop, group_sample_cached_device_static, RolloutConfig,
-};
+use burn::prelude::Device;
+
+use burn::tensor::{Device, Int, Tensor};
 use qwen3_burn::Qwen3Config;
+use qwen3_burn::grpo::{
+    RolloutConfig, group_sample_cached_device_loop, group_sample_cached_device_static,
+};
 use std::time::Instant;
 
 type B = Cuda;
 
 /// Force the device queue to drain so `Instant` brackets measure real GPU work (not just enqueue).
 fn sync(d: &CudaDevice) {
-    let _ = Tensor::<B, 1>::zeros([1], d).sum().into_scalar();
+    let _ = Tensor::<1>::zeros([1], d).sum().into_scalar();
 }
 
-fn build_model(device: &CudaDevice, vocab: usize, layers: usize) -> qwen3_burn::Qwen3ForCausalLM<B> {
+fn build_model(device: &CudaDevice, vocab: usize, layers: usize) -> qwen3_burn::Qwen3ForCausalLM {
     let cfg = Qwen3Config::new()
         .with_vocab_size(vocab)
         .with_hidden_size(1024)
@@ -48,11 +48,11 @@ fn build_model(device: &CudaDevice, vocab: usize, layers: usize) -> qwen3_burn::
         .with_num_attention_heads(16)
         .with_num_key_value_heads(8)
         .with_head_dim(Some(128));
-    cfg.init_causal_lm::<B>(device)
+    cfg.init_causal_lm(device)
 }
 
 fn main() {
-    let device = CudaDevice::default();
+    let device = Device::cuda(0);
     println!("device: {device:?} | backend: Cuda (sm_121 / GB10)\n");
 
     let vocab = 151936usize; // the real Qwen3 vocab
@@ -62,15 +62,23 @@ fn main() {
     // unlikely EOS id -> BOTH drivers run the FULL max_new steps (so the delta is purely per-step work).
     let eos_set: Vec<i64> = vec![vocab as i64 - 1];
 
-    <B as Backend>::seed(&device, 7);
+    device.seed(7);
     let model = build_model(&device, vocab, layers);
 
-    let prompt_ids: Vec<i64> = (0..(p * lp) as i64).map(|i| (i * 131 + 17) % vocab as i64).collect();
-    let prompt = Tensor::<B, 1, Int>::from_data(prompt_ids.as_slice(), &device).reshape([p, lp]);
+    let prompt_ids: Vec<i64> = (0..(p * lp) as i64)
+        .map(|i| (i * 131 + 17) % vocab as i64)
+        .collect();
+    let prompt = Tensor::<1, Int>::from_data(prompt_ids.as_slice(), &device).reshape([p, lp]);
 
     println!("=== (1) GREEDY id-PARITY  (vocab={vocab}, N={n}, lp={lp}, max_new={max_new}) ===");
     {
-        let rc = RolloutConfig { group_size: g, max_new_tokens: max_new, temperature: 0.0, top_p: 1.0, top_k: 0 };
+        let rc = RolloutConfig {
+            group_size: g,
+            max_new_tokens: max_new,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+        };
         let a = group_sample_cached_device_loop(&model, prompt.clone(), &rc, &eos_set); // host-`t` indexed
         let b = group_sample_cached_device_static(&model, prompt.clone(), &rc, &eos_set); // device-`pos` indexed
         // Cuda Int = i32. Both run the full length -> identical [N, lp+max_new] shapes.
@@ -86,20 +94,39 @@ fn main() {
         for (x, y) in al.iter().zip(bl.iter()) {
             maxe = maxe.max((x - y).abs());
         }
-        println!("  seq_ids bit-identical: {ids_eq} | completion_mask bit-identical: {mask_eq} | raw logp max-err: {maxe:.2e}");
+        println!(
+            "  seq_ids bit-identical: {ids_eq} | completion_mask bit-identical: {mask_eq} | raw logp max-err: {maxe:.2e}"
+        );
         println!(
             "  => device-`pos`-indexed static == host-`t`-indexed loop (the masked full-T_max attention\n     \
              matches the growing-prefix attention; greedy argmax stable on sm_121).\n"
         );
-        assert!(ids_eq, "GREEDY PARITY FAILED: static seq_ids differ from loop seq_ids");
-        assert!(mask_eq, "GREEDY PARITY FAILED: static completion_mask differs from loop");
-        assert!(maxe < 1e-2, "GREEDY logp drift {maxe} too large (argmax-stable but logp diverged)");
+        assert!(
+            ids_eq,
+            "GREEDY PARITY FAILED: static seq_ids differ from loop seq_ids"
+        );
+        assert!(
+            mask_eq,
+            "GREEDY PARITY FAILED: static completion_mask differs from loop"
+        );
+        assert!(
+            maxe < 1e-2,
+            "GREEDY logp drift {maxe} too large (argmax-stable but logp diverged)"
+        );
     }
 
-    println!("=== (2) END-TO-END DECODE WALL-CLOCK  (vocab={vocab}, N={n}, lp={lp}, max_new={max_new}) ===");
+    println!(
+        "=== (2) END-TO-END DECODE WALL-CLOCK  (vocab={vocab}, N={n}, lp={lp}, max_new={max_new}) ==="
+    );
     let e2e_reps = 5usize;
     let bench_e2e = |temp: f32| {
-        let rc = RolloutConfig { group_size: g, max_new_tokens: max_new, temperature: temp, top_p: 1.0, top_k: 0 };
+        let rc = RolloutConfig {
+            group_size: g,
+            max_new_tokens: max_new,
+            temperature: temp,
+            top_p: 1.0,
+            top_k: 0,
+        };
         // warmup (JIT-compile kernels) both paths
         let _ = group_sample_cached_device_loop(&model, prompt.clone(), &rc, &eos_set);
         let _ = group_sample_cached_device_static(&model, prompt.clone(), &rc, &eos_set);
@@ -120,7 +147,11 @@ fn main() {
         ms_loop /= e2e_reps as f64;
         ms_static /= e2e_reps as f64;
 
-        let tag = if temp <= 0.0 { "GREEDY     " } else { "TEMPERATURE" };
+        let tag = if temp <= 0.0 {
+            "GREEDY     "
+        } else {
+            "TEMPERATURE"
+        };
         println!(
             "  {tag} (temp={temp}): loop (host-`t`) {ms_loop:8.1} ms | static (device-`pos`) {ms_static:8.1} ms \
              | static/loop {:.3}x  (avg of {e2e_reps})",

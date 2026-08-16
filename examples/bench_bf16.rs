@@ -11,23 +11,25 @@
 
 use std::time::Instant;
 
-use burn::backend::cuda::{Cuda, CudaDevice};
 use burn::nn::loss::CrossEntropyLoss;
 use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
-use burn::tensor::{Int, Tensor};
+use burn::prelude::Device;
+use burn::tensor::{Device, Int, Tensor};
 use qwen3_burn::{Precision, Qwen3Config, Qwen3ForCausalLM};
 
 type Backend = burn::backend::Autodiff<Cuda>;
 
 fn env(k: &str, d: usize) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+    std::env::var(k)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(d)
 }
 
 /// Run `steps` forward+backward+step iterations and return tokens/sec (after 2 warmup steps).
 fn bench(prec: Precision, batch: usize, seq: usize, steps: usize, device: &CudaDevice) -> f64 {
     let config = Qwen3Config::qwen3_0_6b();
-    let mut model: Qwen3ForCausalLM<Backend> =
-        config.init_causal_lm(device).with_train_precision(prec);
+    let mut model: Qwen3ForCausalLM = config.init_causal_lm(device).with_train_precision(prec);
     let mut optim = AdamWConfig::new().init();
     let vocab = config.vocab_size;
 
@@ -36,16 +38,18 @@ fn bench(prec: Precision, batch: usize, seq: usize, steps: usize, device: &CudaD
     let data: Vec<i64> = (0..batch * seq)
         .map(|i| ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) % vocab as u64) as i64)
         .collect();
-    let tokens: Tensor<Backend, 2, Int> =
-        Tensor::<Backend, 1, Int>::from_data(data.as_slice(), device).reshape([batch, seq]);
+    let tokens: Tensor<2, Int> =
+        Tensor::<1, Int>::from_data(data.as_slice(), device).reshape([batch, seq]);
     let inputs = tokens.clone().slice([0..batch, 0..seq - 1]);
     let targets = tokens.slice([0..batch, 1..seq]);
     let s = seq - 1;
 
-    let mut run = |model: Qwen3ForCausalLM<Backend>| {
+    let mut run = |model: Qwen3ForCausalLM| {
         let logits = model.forward(inputs.clone(), None);
-        let loss = CrossEntropyLoss::new(None, device)
-            .forward(logits.reshape([batch * s, vocab]), targets.clone().reshape([batch * s]));
+        let loss = CrossEntropyLoss::new(None, device).forward(
+            logits.reshape([batch * s, vocab]),
+            targets.clone().reshape([batch * s]),
+        );
         let grads = GradientsParams::from_grads(loss.backward(), &model);
         optim.step(1e-9, model, grads)
     };
@@ -67,7 +71,7 @@ fn bench(prec: Precision, batch: usize, seq: usize, steps: usize, device: &CudaD
 }
 
 fn main() {
-    let device = CudaDevice::default();
+    let device = Device::cuda(0);
     let batch = env("BATCH", 8);
     let seq = env("SEQ", 512);
     let steps = env("STEPS", 10);
@@ -75,5 +79,8 @@ fn main() {
     let f32_tps = bench(Precision::F32, batch, seq, steps, &device);
     let bf16_tps = bench(Precision::Bf16, batch, seq, steps, &device);
     println!("f32  : {f32_tps:9.0} tok/s");
-    println!("bf16 : {bf16_tps:9.0} tok/s   ({:.2}x f32)", bf16_tps / f32_tps);
+    println!(
+        "bf16 : {bf16_tps:9.0} tok/s   ({:.2}x f32)",
+        bf16_tps / f32_tps
+    );
 }

@@ -50,7 +50,10 @@ fn first_diff_report(model: &str, name: &str, got: &str, want: &str) -> String {
         let end = (at + 80).min(s.len());
         // Snap to char boundaries so slicing never panics on multi-byte input.
         let start = (start..=at).find(|&i| s.is_char_boundary(i)).unwrap_or(at);
-        let end = (at..=end).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(at);
+        let end = (at..=end)
+            .rev()
+            .find(|&i| s.is_char_boundary(i))
+            .unwrap_or(at);
         s[start..end].to_string()
     };
     format!(

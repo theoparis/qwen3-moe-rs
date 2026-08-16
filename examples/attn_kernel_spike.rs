@@ -30,11 +30,11 @@
 //!   RUSTFLAGS="-C target-feature=+fp16" \
 //!     cargo run --release --features cuda --example attn_kernel_spike 2>&1 | tail -40
 
-use burn::backend::NdArray;
-use burn::backend::cuda::{Cuda, CudaDevice};
-use burn::prelude::Backend;
+use burn::prelude::Device;
+use burn::prelude::Device;
+use burn::prelude::Device;
 use burn::tensor::{
-    Bool, Tensor, TensorData, activation::softmax, module::attention_fallback,
+    Bool, Device, Tensor, TensorData, activation::softmax, module::attention_fallback,
     ops::AttentionModuleOptions,
 };
 
@@ -55,7 +55,10 @@ impl Lcg {
     /// Uniform f32 in [-amp, amp].
     fn next(&mut self, amp: f32) -> f32 {
         // Numerical Recipes LCG constants.
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u = ((self.0 >> 33) as u32) as f32 / (u32::MAX as f32); // [0,1]
         (u * 2.0 - 1.0) * amp
     }
@@ -67,7 +70,7 @@ fn make_data(n: usize, seed: u64, amp: f32) -> Vec<f32> {
 }
 
 /// Expand GQA K/V from Hkv heads to Hq heads by repeat-interleave (head h -> kv head h / n_rep).
-fn expand_kv<B: Backend>(t: Tensor<B, 4>, n_rep: usize) -> Tensor<B, 4> {
+fn expand_kv(t: Tensor<4>, n_rep: usize) -> Tensor<4> {
     if n_rep == 1 {
         return t;
     }
@@ -79,20 +82,14 @@ fn expand_kv<B: Backend>(t: Tensor<B, 4>, n_rep: usize) -> Tensor<B, 4> {
 
 /// Causal mask [B, Hq, Sq, Sk], `true` = mask out (future). Key j masked iff j > q_offset + i,
 /// q_offset = Sk - Sq (KV-cache global offset). Expanded to full shape (no reliance on broadcast).
-fn causal_mask<B: Backend>(
-    b: usize,
-    hq: usize,
-    sq: usize,
-    sk: usize,
-    device: &B::Device,
-) -> Tensor<B, 4, Bool> {
+fn causal_mask(b: usize, hq: usize, sq: usize, sk: usize, device: &Device) -> Tensor<4, Bool> {
     let q_offset = sk - sq;
     let rows: Vec<f32> = (0..sq).map(|i| (q_offset + i) as f32).collect();
     let cols: Vec<f32> = (0..sk).map(|j| j as f32).collect();
-    let r = Tensor::<B, 1>::from_floats(rows.as_slice(), device)
+    let r = Tensor::<1>::from_floats(rows.as_slice(), device)
         .unsqueeze_dim::<2>(1)
         .repeat(&[1, sk]); // [Sq, Sk]
-    let c = Tensor::<B, 1>::from_floats(cols.as_slice(), device)
+    let c = Tensor::<1>::from_floats(cols.as_slice(), device)
         .unsqueeze_dim::<2>(0)
         .repeat(&[sq, 1]); // [Sq, Sk]
     // true where row < col  <=>  (q_offset+i) < j  <=>  j > q_offset+i  (future -> mask).
@@ -103,14 +100,14 @@ fn causal_mask<B: Backend>(
 
 /// Pure-Burn reference attention (the trusted math; run on NdArray for the oracle). f32 throughout.
 /// Q:[B,Hq,Sq,D], k_kv/v_kv:[B,Hkv,Sk,D].
-fn reference_attention<B: Backend>(
-    q: Tensor<B, 4>,
-    k_kv: Tensor<B, 4>,
-    v_kv: Tensor<B, 4>,
+fn reference_attention(
+    q: Tensor<4>,
+    k_kv: Tensor<4>,
+    v_kv: Tensor<4>,
     scale: f32,
     n_rep: usize,
-    device: &B::Device,
-) -> Tensor<B, 4> {
+    device: &Device,
+) -> Tensor<4> {
     let [b, hq, sq, _d] = q.dims();
     let sk = k_kv.dims()[2];
     let k = expand_kv(k_kv, n_rep); // [B,Hq,Sk,D]
@@ -126,13 +123,13 @@ fn reference_attention<B: Backend>(
 /// Burn's EXISTING fused-attention reference path (`attention_fallback`) on a given backend, with an
 /// explicit GQA expansion + explicit causal mask (same scale = 1/sqrt(D)). This is the path the
 /// model actually uses; running it on CUDA vs the NdArray oracle is the corruption check.
-fn sdpa_fallback<B: Backend>(
-    q: Tensor<B, 4>,
-    k_kv: Tensor<B, 4>,
-    v_kv: Tensor<B, 4>,
+fn sdpa_fallback(
+    q: Tensor<4>,
+    k_kv: Tensor<4>,
+    v_kv: Tensor<4>,
     n_rep: usize,
-    device: &B::Device,
-) -> Tensor<B, 4> {
+    device: &Device,
+) -> Tensor<4> {
     let [b, hq, sq, _d] = q.dims();
     let sk = k_kv.dims()[2];
     let k = expand_kv(k_kv, n_rep);
@@ -158,7 +155,10 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
 }
 
 fn has_nan(a: &[f32]) -> bool {
@@ -185,7 +185,7 @@ struct Row {
     flash_ok: bool,
 }
 
-fn run_shape(s: Shape, cuda_dev: &CudaDevice, nd_dev: &<NdArray<f32> as Backend>::Device) -> Row {
+fn run_shape(s: Shape, cuda_dev: &Device, nd_dev: &Device) -> Row {
     let n_rep = s.hq / s.hkv;
     let scale = 1.0f32 / (s.d as f32).sqrt();
 
@@ -198,25 +198,31 @@ fn run_shape(s: Shape, cuda_dev: &CudaDevice, nd_dev: &<NdArray<f32> as Backend>
     let kv_shape = [s.b, s.hkv, s.sk, s.d];
 
     // --- NdArray (CPU f32) oracle ---
-    let q_nd = Tensor::<NdArray<f32>, 4>::from_data(TensorData::new(q_data.clone(), q_shape), nd_dev);
-    let k_nd = Tensor::<NdArray<f32>, 4>::from_data(TensorData::new(k_data.clone(), kv_shape), nd_dev);
-    let v_nd = Tensor::<NdArray<f32>, 4>::from_data(TensorData::new(v_data.clone(), kv_shape), nd_dev);
+    let q_nd = Tensor::<4>::from_data(TensorData::new(q_data.clone(), q_shape), nd_dev);
+    let k_nd = Tensor::<4>::from_data(TensorData::new(k_data.clone(), kv_shape), nd_dev);
+    let v_nd = Tensor::<4>::from_data(TensorData::new(v_data.clone(), kv_shape), nd_dev);
     let oracle = reference_attention(q_nd, k_nd, v_nd, scale, n_rep, nd_dev)
         .into_data()
         .to_vec::<f32>()
         .unwrap();
 
     // --- Custom CUDA flash kernel ---
-    let q_cu = Tensor::<Cuda, 4>::from_data(TensorData::new(q_data.clone(), q_shape), cuda_dev);
-    let k_cu = Tensor::<Cuda, 4>::from_data(TensorData::new(k_data.clone(), kv_shape), cuda_dev);
-    let v_cu = Tensor::<Cuda, 4>::from_data(TensorData::new(v_data.clone(), kv_shape), cuda_dev);
-    let flash = flash_attention(q_cu, k_cu, v_cu, scale).into_data().to_vec::<f32>().unwrap();
+    let q_cu = Tensor::<4>::from_data(TensorData::new(q_data.clone(), q_shape), cuda_dev);
+    let k_cu = Tensor::<4>::from_data(TensorData::new(k_data.clone(), kv_shape), cuda_dev);
+    let v_cu = Tensor::<4>::from_data(TensorData::new(v_data.clone(), kv_shape), cuda_dev);
+    let flash = flash_attention(q_cu, k_cu, v_cu, scale)
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
 
     // --- Existing CUDA reference-SDPA (attention_fallback) — the corruption check ---
-    let q_cu2 = Tensor::<Cuda, 4>::from_data(TensorData::new(q_data, q_shape), cuda_dev);
-    let k_cu2 = Tensor::<Cuda, 4>::from_data(TensorData::new(k_data, kv_shape), cuda_dev);
-    let v_cu2 = Tensor::<Cuda, 4>::from_data(TensorData::new(v_data, kv_shape), cuda_dev);
-    let sdpa = sdpa_fallback(q_cu2, k_cu2, v_cu2, n_rep, cuda_dev).into_data().to_vec::<f32>().unwrap();
+    let q_cu2 = Tensor::<4>::from_data(TensorData::new(q_data, q_shape), cuda_dev);
+    let k_cu2 = Tensor::<4>::from_data(TensorData::new(k_data, kv_shape), cuda_dev);
+    let v_cu2 = Tensor::<4>::from_data(TensorData::new(v_data, kv_shape), cuda_dev);
+    let sdpa = sdpa_fallback(q_cu2, k_cu2, v_cu2, n_rep, cuda_dev)
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
 
     let flash_cos = cosine(&flash, &oracle);
     let flash_mad = max_abs_diff(&flash, &oracle);
@@ -234,25 +240,88 @@ fn run_shape(s: Shape, cuda_dev: &CudaDevice, nd_dev: &<NdArray<f32> as Backend>
         if flash_ok { "  [PASS]" } else { "  [FAIL]" },
     );
 
-    Row { label, flash_cos, flash_mad, sdpa_cos, sdpa_mad, flash_ok }
+    Row {
+        label,
+        flash_cos,
+        flash_mad,
+        sdpa_cos,
+        sdpa_mad,
+        flash_ok,
+    }
 }
 
 fn main() {
-    let cuda_dev = CudaDevice::default();
-    let nd_dev = <NdArray<f32> as Backend>::Device::default();
+    let cuda_dev = Device::cuda(0);
+    let nd_dev = Device::flex();
     println!("device: {cuda_dev:?} | oracle: NdArray (CPU f32) | kernel: custom CubeCL flash_attn");
     println!("cross-backend law: oracle is an INDEPENDENT CPU backend (docs/VLLM_KERNELS.md §0)\n");
 
     // Decode (Sq=1): the rollout-dominant case; one query attends the whole KV. GQA ratio 4, batch 2.
     // Prefill (Sq=Sk): one cube per query row. Short (64, 512) AND long (2048) context; head_dim 64+128.
     let shapes = [
-        Shape { label: "decode", b: 2, hq: 8, hkv: 2, sq: 1, sk: 64, d: 128 },
-        Shape { label: "decode", b: 2, hq: 8, hkv: 2, sq: 1, sk: 512, d: 128 },
-        Shape { label: "decode", b: 2, hq: 8, hkv: 2, sq: 1, sk: 2048, d: 128 },
-        Shape { label: "prefill", b: 2, hq: 8, hkv: 2, sq: 64, sk: 64, d: 128 },
-        Shape { label: "prefill", b: 2, hq: 8, hkv: 2, sq: 512, sk: 512, d: 128 },
-        Shape { label: "prefill", b: 1, hq: 8, hkv: 2, sq: 2048, sk: 2048, d: 128 },
-        Shape { label: "prefill", b: 2, hq: 4, hkv: 2, sq: 128, sk: 128, d: 64 },
+        Shape {
+            label: "decode",
+            b: 2,
+            hq: 8,
+            hkv: 2,
+            sq: 1,
+            sk: 64,
+            d: 128,
+        },
+        Shape {
+            label: "decode",
+            b: 2,
+            hq: 8,
+            hkv: 2,
+            sq: 1,
+            sk: 512,
+            d: 128,
+        },
+        Shape {
+            label: "decode",
+            b: 2,
+            hq: 8,
+            hkv: 2,
+            sq: 1,
+            sk: 2048,
+            d: 128,
+        },
+        Shape {
+            label: "prefill",
+            b: 2,
+            hq: 8,
+            hkv: 2,
+            sq: 64,
+            sk: 64,
+            d: 128,
+        },
+        Shape {
+            label: "prefill",
+            b: 2,
+            hq: 8,
+            hkv: 2,
+            sq: 512,
+            sk: 512,
+            d: 128,
+        },
+        Shape {
+            label: "prefill",
+            b: 1,
+            hq: 8,
+            hkv: 2,
+            sq: 2048,
+            sk: 2048,
+            d: 128,
+        },
+        Shape {
+            label: "prefill",
+            b: 2,
+            hq: 4,
+            hkv: 2,
+            sq: 128,
+            sk: 128,
+            d: 64,
+        },
     ];
 
     let mut rows = Vec::new();
@@ -302,5 +371,8 @@ fn main() {
         );
     }
 
-    assert!(all_flash_ok, "custom flash kernel failed validation vs the NdArray CPU oracle");
+    assert!(
+        all_flash_ok,
+        "custom flash kernel failed validation vs the NdArray CPU oracle"
+    );
 }

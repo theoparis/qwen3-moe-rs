@@ -11,8 +11,7 @@
 //! the returned byte buffers directly.
 
 use burn::nn::Linear;
-use burn::prelude::Backend;
-use burn::tensor::{DType, Int, Tensor, TensorData};
+use burn::tensor::{DType, Device, Int, Tensor, TensorData};
 
 use crate::nvfp4::quantize_nvfp4;
 
@@ -23,15 +22,15 @@ use crate::nvfp4::quantize_nvfp4;
 /// The stored NVFP4 tensors are column-major because [`quantize_nvfp4`] performs that transpose.
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
-pub struct Nvfp4Linear<B: Backend> {
+pub struct Nvfp4Linear {
     /// Packed E2M1x2 weight bytes `[N, K/2]`, carried as `DType::I8` raw bytes.
-    qw: Tensor<B, 2, Int>,
+    qw: Tensor<2, Int>,
     /// E4M3 block-scale bytes `[N, K/16]`, carried as `DType::I8` raw bytes.
-    bs: Tensor<B, 2, Int>,
+    bs: Tensor<2, Int>,
     /// Global f32 scale `[1]`.
-    gscale: Tensor<B, 1>,
+    gscale: Tensor<1>,
     /// Optional bias `[N]`, added after the GEMV.
-    bias: Option<Tensor<B, 1>>,
+    bias: Option<Tensor<1>>,
     /// Input dim (columns of the activation / rows of the Burn weight).
     k: usize,
     /// Output dim (columns of the Burn weight).
@@ -40,12 +39,12 @@ pub struct Nvfp4Linear<B: Backend> {
     m_max: usize,
 }
 
-impl<B: Backend> Nvfp4Linear<B> {
+impl Nvfp4Linear {
     /// Quantize-on-load from a Burn Linear weight `W:[K,N]` and optional bias `[N]`.
     ///
     /// The NVFP4 codec returns the already-transposed kernel layout (`qw:[N,K/2]`, `bs:[N,K/16]`),
     /// so no additional transpose is performed here.
-    pub fn from_weight(weight: Tensor<B, 2>, bias: Option<Tensor<B, 1>>) -> Self {
+    pub fn from_weight(weight: Tensor<2>, bias: Option<Tensor<1>>) -> Self {
         let [k, n] = weight.dims();
         let device = weight.device();
 
@@ -59,17 +58,11 @@ impl<B: Backend> Nvfp4Linear<B> {
 
         let qw_i8: Vec<i8> = qw_bytes.iter().map(|&b| b as i8).collect();
         let bs_i8: Vec<i8> = bs_bytes.iter().map(|&b| b as i8).collect();
-        let qw = Tensor::<B, 2, Int>::from_data_dtype(
-            TensorData::new(qw_i8, [n, k / 2]),
-            &device,
-            DType::I8,
-        );
-        let bs = Tensor::<B, 2, Int>::from_data_dtype(
-            TensorData::new(bs_i8, [n, k / 16]),
-            &device,
-            DType::I8,
-        );
-        let gscale = Tensor::<B, 1>::from_data(TensorData::new(vec![gscale], [1]), &device);
+        let qw =
+            Tensor::<2, Int>::from_data(TensorData::new(qw_i8, [n, k / 2]), (&device, DType::I8));
+        let bs =
+            Tensor::<2, Int>::from_data(TensorData::new(bs_i8, [n, k / 16]), (&device, DType::I8));
+        let gscale = Tensor::<1>::from_data(TensorData::new(vec![gscale], [1]), &device);
 
         Self {
             qw,
@@ -93,7 +86,7 @@ impl<B: Backend> Nvfp4Linear<B> {
         gscale: f32,
         k: usize,
         n: usize,
-        device: &B::Device,
+        device: &Device,
     ) -> Self {
         assert_eq!(
             k % 16,
@@ -121,17 +114,11 @@ impl<B: Backend> Nvfp4Linear<B> {
 
         let qw_i8: Vec<i8> = qw.iter().map(|&b| b as i8).collect();
         let bs_i8: Vec<i8> = block_scales.iter().map(|&b| b as i8).collect();
-        let qw = Tensor::<B, 2, Int>::from_data_dtype(
-            TensorData::new(qw_i8, [n, k / 2]),
-            device,
-            DType::I8,
-        );
-        let bs = Tensor::<B, 2, Int>::from_data_dtype(
-            TensorData::new(bs_i8, [n, k / 16]),
-            device,
-            DType::I8,
-        );
-        let gscale = Tensor::<B, 1>::from_data(TensorData::new(vec![gscale], [1]), device);
+        let qw =
+            Tensor::<2, Int>::from_data(TensorData::new(qw_i8, [n, k / 2]), (device, DType::I8));
+        let bs =
+            Tensor::<2, Int>::from_data(TensorData::new(bs_i8, [n, k / 16]), (device, DType::I8));
+        let gscale = Tensor::<1>::from_data(TensorData::new(vec![gscale], [1]), device);
 
         Self {
             qw,
@@ -145,7 +132,7 @@ impl<B: Backend> Nvfp4Linear<B> {
     }
 
     /// Quantize-on-load from an existing [`burn::nn::Linear`], preserving its bias if present.
-    pub fn from_linear(lin: &Linear<B>) -> Self {
+    pub fn from_linear(lin: &Linear) -> Self {
         let weight = lin.weight.val();
         let bias = lin.bias.as_ref().map(|b| b.val());
         Self::from_weight(weight, bias)
@@ -180,11 +167,9 @@ impl<B: Backend> Nvfp4Linear<B> {
 #[cfg(test)]
 mod host_tests {
     use super::*;
-    use burn::backend::NdArray;
+    use burn::prelude::Device;
 
     use crate::nvfp4::{dequant_nvfp4, quantize_nvfp4};
-
-    type B = NdArray;
 
     fn synth(seed: u64, len: usize, scale: f32) -> Vec<f32> {
         (0..len)
@@ -198,7 +183,7 @@ mod host_tests {
             .collect()
     }
 
-    fn int_bytes<const D: usize>(tensor: Tensor<B, D, Int>) -> Vec<u8> {
+    fn int_bytes<const D: usize>(tensor: Tensor<D, Int>) -> Vec<u8> {
         tensor
             .into_data()
             .to_vec::<i8>()
@@ -224,17 +209,17 @@ mod host_tests {
 
     #[test]
     fn from_packed_parts_matches_from_weight_host_reference() {
-        let device = <B as Backend>::Device::default();
+        let device = Device::default();
         let (m, k, n) = (3usize, 64usize, 32usize);
         let weight = synth(0x4E56_4650_344C, k * n, 0.03);
         let x = synth(0xAC71_0001, m * k, 0.2);
         let weight_tensor =
-            Tensor::<B, 2>::from_data(TensorData::new(weight.clone(), [k, n]), &device);
+            Tensor::<2>::from_data(TensorData::new(weight.clone(), [k, n]), &device);
 
-        let from_weight = Nvfp4Linear::<B>::from_weight(weight_tensor, None);
+        let from_weight = Nvfp4Linear::from_weight(weight_tensor, None);
         let (qw, bs, gscale) = quantize_nvfp4(&weight, k, n);
         let from_parts =
-            Nvfp4Linear::<B>::from_packed_parts(qw.clone(), bs.clone(), gscale, k, n, &device);
+            Nvfp4Linear::from_packed_parts(qw.clone(), bs.clone(), gscale, k, n, &device);
 
         let from_weight_qw = int_bytes(from_weight.qw.clone());
         let from_weight_bs = int_bytes(from_weight.bs.clone());
@@ -273,25 +258,14 @@ mod host_tests {
 // CUDA forward — backend-generic over the NVFP4 GEMV trait, so the same wrapper works for both the
 // Fusion `Cuda` eager path and the raw capture `CubeBackend<CudaRuntime,f32,i32,u8>` path.
 // =================================================================================================
-#[cfg(feature = "cuda")]
-mod cuda_forward {
+#[cfg(feature = "cubecl-gpu")]
+mod cubecl_forward {
     use super::Nvfp4Linear;
     use burn::tensor::Tensor;
 
-    impl<B: crate::nvfp4::Nvfp4GemvBackend> Nvfp4Linear<B> {
+    impl Nvfp4Linear {
         /// Forward at `[M,K] -> [M,N]` through the fused NVFP4 decode-GEMV kernel.
-        ///
-        /// The fused NVFP4 kernel is a *decode* GEMV: its comptime register arrays fix the batch
-        /// bound at `self.m_max` (`1..=8`), so a single launch can only cover `M <= m_max` rows.
-        /// Decode (`M == 1`) always takes the single-launch fast path with zero overhead.
-        ///
-        /// When a *prefill or diagnostic* caller presents `M > m_max` (e.g. the shared expert's
-        /// weight-only `Nvfp4Linear`, loaded at the default `m_max = 1`, running at prefill `T = 5`
-        /// through `ql3`), we chunk the input rows into `ceil(M / m_max)` slices of at most `m_max`
-        /// rows each, launch the GEMV per chunk, and `cat` the outputs on the row dim. This restores
-        /// correctness for those callers while guaranteeing the kernel's `m <= m_max` contract holds
-        /// on every launch; it only affects these perf-insensitive paths (decode is untouched).
-        pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        pub fn forward(&self, x: Tensor<2>) -> Tensor<2> {
             assert_eq!(
                 x.dims()[1],
                 self.k,
@@ -301,8 +275,7 @@ mod cuda_forward {
             );
             let m = x.dims()[0];
             let y = if m <= self.m_max {
-                // Fast path: one launch covers all rows (decode M=1 hits this — zero overhead).
-                B::nvfp4_gemv(
+                crate::nvfp4::nvfp4_gemv(
                     x,
                     self.qw.clone(),
                     self.bs.clone(),
@@ -312,13 +285,12 @@ mod cuda_forward {
                     self.m_max,
                 )
             } else {
-                // Row-chunked path: split [M,K] into ceil(M/m_max) slices of <= m_max rows.
                 let mut chunks = Vec::with_capacity(m.div_ceil(self.m_max));
                 let mut i = 0;
                 while i < m {
                     let rows = self.m_max.min(m - i);
                     let xi = x.clone().slice([i..i + rows, 0..self.k]);
-                    chunks.push(B::nvfp4_gemv(
+                    chunks.push(crate::nvfp4::nvfp4_gemv(
                         xi,
                         self.qw.clone(),
                         self.bs.clone(),
@@ -337,9 +309,8 @@ mod cuda_forward {
             }
         }
 
-        /// 3-D convenience: `[B,S,K] -> [B,S,N]` by flattening to `[B*S,K]`, running
-        /// [`forward`](Self::forward), and reshaping back.
-        pub fn forward3(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        /// 3-D convenience: `[B,S,K] -> [B,S,N]`.
+        pub fn forward3(&self, x: Tensor<3>) -> Tensor<3> {
             let [b, s, k] = x.dims();
             let y = self.forward(x.reshape([b * s, k]));
             let n = y.dims()[1];
@@ -350,19 +321,20 @@ mod cuda_forward {
 
 /// Quantized Linear dispatch enum for inference-time Linear call sites.
 #[derive(Clone, Debug)]
-pub enum QuantLinear<B: Backend> {
-    Nvfp4(Nvfp4Linear<B>),
+pub enum QuantLinear {
+    Nvfp4(Nvfp4Linear),
     #[cfg(feature = "cuda")]
-    Fp8(crate::w8a16_linear::W8A16Linear<B>),
-    Bf16(burn::nn::Linear<B>),
+    Fp8(crate::w8a16_linear::W8A16Linear),
+    Bf16(burn::nn::Linear),
 }
 
-#[cfg(feature = "cuda")]
-impl<B: crate::w8a16::W8A16GemvBackend + crate::nvfp4::Nvfp4GemvBackend> QuantLinear<B> {
-    /// Dispatch `[B,S,K] -> [B,S,N]` on any backend with the dense quant GEMV traits.
-    pub fn forward3(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+#[cfg(feature = "cubecl-gpu")]
+impl QuantLinear {
+    /// Dispatch `[B,S,K] -> [B,S,N]`.
+    pub fn forward3(&self, x: Tensor<3>) -> Tensor<3> {
         match self {
             Self::Nvfp4(n) => n.forward3(x),
+            #[cfg(feature = "cuda")]
             Self::Fp8(f) => f.forward3(x),
             Self::Bf16(lin) => crate::linear2d::linear3(lin, x, crate::linear2d::Precision::Bf16),
         }
@@ -375,8 +347,8 @@ impl<B: crate::w8a16::W8A16GemvBackend + crate::nvfp4::Nvfp4GemvBackend> QuantLi
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
-    use burn::backend::cuda::{Cuda, CudaDevice};
     use burn::nn::LinearConfig;
+    use burn::prelude::Device;
     use burn::tensor::{Distribution, Tensor};
 
     /// Cosine similarity over flattened outputs (f64 accum).
@@ -409,7 +381,7 @@ mod tests {
     }
 
     /// bf16 reference matmul: cast both operands to bf16, matmul, widen back to f32.
-    fn bf16_ref(x: Tensor<Cuda, 2>, w: Tensor<Cuda, 2>) -> Vec<f32> {
+    fn bf16_ref(x: Tensor<2>, w: Tensor<2>) -> Vec<f32> {
         x.cast(DType::BF16)
             .matmul(w.cast(DType::BF16))
             .cast(DType::F32)
@@ -420,7 +392,7 @@ mod tests {
 
     #[test]
     fn nvfp4_linear_matches_bf16_linear_m1_and_mgt1() {
-        let dev = CudaDevice::default();
+        let dev = Device::cuda(0);
         let shapes = [
             ("qkv/gate", 2048usize, 768usize),
             ("down", 768usize, 2048usize),
@@ -433,12 +405,12 @@ mod tests {
         let mut worst_rel = 0.0f32;
 
         for (label, k, n) in shapes {
-            let weight = Tensor::<Cuda, 2>::random([k, n], Distribution::Normal(0.0, 0.05), &dev);
+            let weight = Tensor::<2>::random([k, n], Distribution::Normal(0.0, 0.05), &dev);
             let nvfp4 = Nvfp4Linear::from_weight(weight.clone(), None);
 
             for m in ms {
                 let q4 = nvfp4.clone().with_m_max(m);
-                let x = Tensor::<Cuda, 2>::random([m, k], Distribution::Normal(0.0, 1.0), &dev);
+                let x = Tensor::<2>::random([m, k], Distribution::Normal(0.0, 1.0), &dev);
 
                 let got = q4.forward(x.clone()).into_data().to_vec::<f32>().unwrap();
                 let ref_bf16 = bf16_ref(x, weight.clone());
@@ -477,7 +449,7 @@ mod tests {
 
     #[test]
     fn from_linear_with_bias_tracks_linear() {
-        let dev = CudaDevice::default();
+        let dev = Device::cuda(0);
         let (k, n, m) = (1024usize, 512usize, 4usize);
 
         let lin = LinearConfig::new(k, n).with_bias(true).init::<Cuda>(&dev);
@@ -485,7 +457,7 @@ mod tests {
         assert!(q4.has_bias(), "from_linear must carry the bias");
         assert_eq!((q4.k(), q4.n()), (k, n));
 
-        let x = Tensor::<Cuda, 2>::random([m, k], Distribution::Normal(0.0, 1.0), &dev);
+        let x = Tensor::<2>::random([m, k], Distribution::Normal(0.0, 1.0), &dev);
 
         let got = q4.forward(x.clone()).into_data().to_vec::<f32>().unwrap();
         let reference = lin.forward(x).into_data().to_vec::<f32>().unwrap();
@@ -501,20 +473,19 @@ mod tests {
 
     #[test]
     fn from_packed_parts_forward_matches_from_weight_bit_exact() {
-        let dev = CudaDevice::default();
+        let dev = Device::cuda(0);
         let (k, n, m) = (512usize, 128usize, 4usize);
         let weight_data: Vec<f32> = (0..k * n)
             .map(|idx| ((idx % 257) as f32 - 128.0) * 0.0007)
             .collect();
-        let weight =
-            Tensor::<Cuda, 2>::from_data(TensorData::new(weight_data.clone(), [k, n]), &dev);
+        let weight = Tensor::<2>::from_data(TensorData::new(weight_data.clone(), [k, n]), &dev);
         let (qw, bs, gscale) = crate::nvfp4::quantize_nvfp4(&weight_data, k, n);
         let from_weight = Nvfp4Linear::from_weight(weight, None).with_m_max(m);
         let from_parts = Nvfp4Linear::from_packed_parts(qw, bs, gscale, k, n, &dev).with_m_max(m);
         let x_data: Vec<f32> = (0..m * k)
             .map(|idx| ((idx % 131) as f32 - 65.0) * 0.004)
             .collect();
-        let x = Tensor::<Cuda, 2>::from_data(TensorData::new(x_data, [m, k]), &dev);
+        let x = Tensor::<2>::from_data(TensorData::new(x_data, [m, k]), &dev);
 
         let got_weight = from_weight
             .forward(x.clone())
@@ -537,12 +508,12 @@ mod tests {
     /// and a multi-chunk-plus-remainder case (M=17 through m_max=8 -> 8+8+1).
     #[test]
     fn forward_row_chunking_matches_unchunked_fast_path() {
-        let dev = CudaDevice::default();
+        let dev = Device::cuda(0);
         let (k, n) = (512usize, 128usize);
         let weight_data: Vec<f32> = (0..k * n)
             .map(|idx| ((idx % 257) as f32 - 128.0) * 0.0007)
             .collect();
-        let weight = Tensor::<Cuda, 2>::from_data(TensorData::new(weight_data, [k, n]), &dev);
+        let weight = Tensor::<2>::from_data(TensorData::new(weight_data, [k, n]), &dev);
 
         // (M, m_max): M=5 through m_max=1 (5 single-row launches); M=17 through m_max=8 (8+8+1).
         for (m, m_max) in [(5usize, 1usize), (17usize, 8usize)] {
@@ -550,7 +521,7 @@ mod tests {
             let x_data: Vec<f32> = (0..m * k)
                 .map(|idx| ((idx % 131) as f32 - 65.0) * 0.004)
                 .collect();
-            let x = Tensor::<Cuda, 2>::from_data(TensorData::new(x_data, [m, k]), &dev);
+            let x = Tensor::<2>::from_data(TensorData::new(x_data, [m, k]), &dev);
 
             // Chunked: single call with M > m_max hits the internal row-chunking path.
             let got = q4.forward(x.clone()).into_data().to_vec::<f32>().unwrap();
@@ -578,12 +549,12 @@ mod tests {
 
     #[test]
     fn quant_linear_dispatch() {
-        let dev = CudaDevice::default();
+        let dev = Device::cuda(0);
         let (b, s, k, n) = (2usize, 4usize, 1024usize, 768usize);
 
-        let weight = Tensor::<Cuda, 2>::random([k, n], Distribution::Normal(0.0, 0.05), &dev);
+        let weight = Tensor::<2>::random([k, n], Distribution::Normal(0.0, 0.05), &dev);
         let q4 = Nvfp4Linear::from_weight(weight, None).with_m_max(b * s);
-        let x = Tensor::<Cuda, 3>::random([b, s, k], Distribution::Normal(0.0, 1.0), &dev);
+        let x = Tensor::<3>::random([b, s, k], Distribution::Normal(0.0, 1.0), &dev);
 
         let direct = q4
             .clone()

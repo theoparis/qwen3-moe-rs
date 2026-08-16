@@ -10,7 +10,7 @@ use std::{path::PathBuf, time::Instant};
 
 use burn::{
     backend::cuda::CudaDevice,
-    prelude::Backend,
+    prelude::Device,
     tensor::{DType, Int, Tensor},
 };
 use cubecl::{Runtime, cuda::CudaRuntime};
@@ -46,11 +46,11 @@ fn print_mem(label: &str) {
     println!("{label}: VmRSS={rss}, VmHWM={hwm}");
 }
 
-fn positions(start: usize, len: usize, device: &CudaDevice) -> Tensor<B, 2, Int> {
+fn positions(start: usize, len: usize, device: &CudaDevice) -> Tensor<2, Int> {
     if len == 1 {
-        Tensor::<B, 2, Int>::from_data([[start as i64]], device)
+        Tensor::<2, Int>::from_data([[start as i64]], device)
     } else {
-        Tensor::<B, 1, Int>::arange(start as i64..(start + len) as i64, device).unsqueeze()
+        Tensor::<1, Int>::arange(start as i64..(start + len) as i64, device).unsqueeze()
     }
 }
 
@@ -175,7 +175,7 @@ struct DecodeRun {
 }
 
 fn eager_decode(
-    model: &Qwen3_5MoeForCausalLM<B>,
+    model: &Qwen3_5MoeForCausalLM,
     prompt_ids: &[i64],
     prec: Precision,
     device: &CudaDevice,
@@ -185,7 +185,7 @@ fn eager_decode(
 
     let prompt_len = prompt_ids.len();
     let total = prompt_len + MAX_NEW_TOKENS;
-    let input = Tensor::<B, 1, Int>::from_data(prompt_ids, device).unsqueeze();
+    let input = Tensor::<1, Int>::from_data(prompt_ids, device).unsqueeze();
     let mut cache = model.model.new_cache_with_capacity(total);
     let start = Instant::now();
     let mut logits = model.forward_prec(input, positions(0, prompt_len, device), &mut cache, prec);
@@ -199,7 +199,7 @@ fn eager_decode(
         ids.push(id);
 
         if step + 1 < MAX_NEW_TOKENS {
-            let tok = Tensor::<B, 2, Int>::from_data([[id]], device);
+            let tok = Tensor::<2, Int>::from_data([[id]], device);
             let pos = positions(prompt_len + step, 1, device);
             logits = model.forward_prec(tok, pos, &mut cache, prec);
         }
@@ -213,7 +213,7 @@ fn eager_decode(
 }
 
 fn static_decode(
-    model: &Qwen3_5MoeForCausalLM<B>,
+    model: &Qwen3_5MoeForCausalLM,
     prompt_ids: &[i64],
     prec: Precision,
     device: &CudaDevice,
@@ -222,7 +222,7 @@ fn static_decode(
     qwen3_burn::qwen3_5::set_qwen35_fused_moe_enabled(true);
 
     let prompt_len = prompt_ids.len();
-    let input = Tensor::<B, 1, Int>::from_data(prompt_ids, device).unsqueeze();
+    let input = Tensor::<1, Int>::from_data(prompt_ids, device).unsqueeze();
     let prompt_pos = positions(0, prompt_len, device);
 
     let mut cache = model.model.new_cache_with_capacity(T_MAX);
@@ -235,12 +235,12 @@ fn static_decode(
     }
 
     let freqs = rope_freqs::<B>(ROTARY_DIM, ROPE_THETA, device);
-    let arange_tmax = Tensor::<B, 1, Int>::arange(0..T_MAX as i64, device);
+    let arange_tmax = Tensor::<1, Int>::arange(0..T_MAX as i64, device);
 
     let start = Instant::now();
     let logits = static_prefill_logits(model, input, prompt_pos, &mut cache, prec);
     let mut current_row = logits_last_row3(&logits, "static prefill")?;
-    let mut pos = Tensor::<B, 1, Int>::full([1], prompt_len as i64, device);
+    let mut pos = Tensor::<1, Int>::full([1], prompt_len as i64, device);
 
     let mut ids = Vec::with_capacity(MAX_NEW_TOKENS);
     let mut rows = Vec::with_capacity(MAX_NEW_TOKENS);
@@ -250,7 +250,7 @@ fn static_decode(
         ids.push(id);
 
         if step + 1 < MAX_NEW_TOKENS {
-            let tok = Tensor::<B, 2, Int>::from_data([[id]], device);
+            let tok = Tensor::<2, Int>::from_data([[id]], device);
             let logits = model.forward_decode_static_pre(
                 tok,
                 pos.clone(),
@@ -330,7 +330,7 @@ fn run() -> Result<(), String> {
     }
 
     let dir = PathBuf::from(std::env::var("QWEN35_DIR").unwrap_or_else(|_| MODEL_DIR.to_string()));
-    let device = CudaDevice::default();
+    let device = Device::cuda(0);
     let quant = std::env::var("QUANT").unwrap_or_else(|_| "bf16".to_string());
     let quant_mode = if quant.eq_ignore_ascii_case("fp8") {
         "fp8"
@@ -363,7 +363,7 @@ fn run() -> Result<(), String> {
     );
 
     let tokenizer = Qwen3Tokenizer::from_file(dir.join("tokenizer.json"))?;
-    let mut model = cfg.init_causal_lm::<B>(&device);
+    let mut model = cfg.init_causal_lm(&device);
 
     println!("loading sharded BF16 weights from {dir:?} ...");
     let load_start = Instant::now();

@@ -37,8 +37,8 @@
 
 use std::path::PathBuf;
 
-use burn::backend::cuda::{Cuda, CudaDevice};
-use burn::tensor::{DType, Int, Tensor};
+use burn::prelude::Device;
+use burn::tensor::{DType, Device, Int, Tensor};
 use qwen3_burn::{Qwen3MoeConfig, Qwen3Tokenizer};
 
 type B = Cuda;
@@ -94,8 +94,10 @@ fn arg<'a>(a: &'a [String], f: &str) -> Option<&'a String> {
 
 /// Build a `Qwen3MoeConfig` from a HuggingFace `config.json` (same as examples/moe_generate.rs).
 fn config_from_hf(dir: &PathBuf) -> Result<Qwen3MoeConfig, String> {
-    let txt = std::fs::read_to_string(dir.join("config.json")).map_err(|e| format!("read config.json: {e}"))?;
-    let v: serde_json::Value = serde_json::from_str(&txt).map_err(|e| format!("parse config.json: {e}"))?;
+    let txt = std::fs::read_to_string(dir.join("config.json"))
+        .map_err(|e| format!("read config.json: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&txt).map_err(|e| format!("parse config.json: {e}"))?;
     let u = |k: &str, d: u64| -> usize { v.get(k).and_then(|x| x.as_u64()).unwrap_or(d) as usize };
     let f = |k: &str, d: f64| -> f64 { v.get(k).and_then(|x| x.as_f64()).unwrap_or(d) };
     let mut cfg = Qwen3MoeConfig::new()
@@ -137,8 +139,12 @@ fn path_bytes(cfg: &Qwen3MoeConfig, dtype_bytes: usize, path: Path) -> (f64, f64
 }
 
 /// Read the single argmax id to host — forces a full device sync (queue must drain to produce data).
-fn read_id(t: Tensor<B, 1, Int>) -> i64 {
-    t.cast(DType::I64).into_data().as_slice::<i64>().map(|s| s.first().copied().unwrap_or(0)).unwrap_or(0)
+fn read_id(t: Tensor<1, Int>) -> i64 {
+    t.cast(DType::I64)
+        .into_data()
+        .as_slice::<i64>()
+        .map(|s| s.first().copied().unwrap_or(0))
+        .unwrap_or(0)
 }
 
 struct Stats {
@@ -149,7 +155,7 @@ struct Stats {
 
 /// One steady-state decode bench for `path`: prefill (excluded) then `decode_tokens` timed steps.
 fn bench_path(
-    model: &qwen3_burn::Qwen3MoeForCausalLM<B>,
+    model: &qwen3_burn::Qwen3MoeForCausalLM,
     prompt_ids: &[i64],
     device: &CudaDevice,
     decode_tokens: usize,
@@ -158,16 +164,19 @@ fn bench_path(
 ) -> Stats {
     path.apply_env();
     let init_len = prompt_ids.len();
-    let input: Tensor<B, 2, Int> = Tensor::<B, 1, Int>::from_data(prompt_ids, device).unsqueeze();
+    let input: Tensor<2, Int> = Tensor::<1, Int>::from_data(prompt_ids, device).unsqueeze();
     let mut cache = model.model.new_cache();
 
     // --- Prefill (EXCLUDED from steady-state): full-prompt forward → first next token. ---
     let t_pf = std::time::Instant::now();
-    let pos = Tensor::<B, 1, Int>::arange(0..init_len as i64, device).unsqueeze_dim::<2>(0);
+    let pos = Tensor::<1, Int>::arange(0..init_len as i64, device).unsqueeze_dim::<2>(0);
     let logits = model.forward_with_cache(input, None, pos, &mut cache);
     let vocab = logits.dims()[2];
-    let mut next: Tensor<B, 1, Int> =
-        logits.slice([0..1, (init_len - 1)..init_len, 0..vocab]).reshape([1, vocab]).argmax(1).flatten(0, 1);
+    let mut next: Tensor<1, Int> = logits
+        .slice([0..1, (init_len - 1)..init_len, 0..vocab])
+        .reshape([1, vocab])
+        .argmax(1)
+        .flatten(0, 1);
     let first_id = read_id(next.clone()); // sync — completes prefill
     let prefill_ms = t_pf.elapsed().as_secs_f64() * 1000.0;
 
@@ -178,16 +187,24 @@ fn bench_path(
     for _ in 0..decode_tokens {
         cur += 1;
         let t = std::time::Instant::now();
-        let pos = Tensor::<B, 1, Int>::from_data([cur as i64 - 1], device).unsqueeze_dim::<2>(0);
+        let pos = Tensor::<1, Int>::from_data([cur as i64 - 1], device).unsqueeze_dim::<2>(0);
         let logits = model.forward_with_cache(next.clone().unsqueeze_dim(1), None, pos, &mut cache);
-        next = logits.slice([0..1, 0..1, 0..vocab]).reshape([1, vocab]).argmax(1).flatten(0, 1);
+        next = logits
+            .slice([0..1, 0..1, 0..vocab])
+            .reshape([1, vocab])
+            .argmax(1)
+            .flatten(0, 1);
         let id = read_id(next.clone()); // forces device sync → timer captures true per-token latency
         steps_ms.push(t.elapsed().as_secs_f64() * 1000.0);
         gen_ids.push(id);
         // NOTE: we do NOT break on EOS — a fixed step count keeps the steady-state sample stable.
         let _ = eos;
     }
-    Stats { prefill_ms, steps_ms, gen_ids }
+    Stats {
+        prefill_ms,
+        steps_ms,
+        gen_ids,
+    }
 }
 
 fn mean(xs: &[f64]) -> f64 {
@@ -203,7 +220,11 @@ fn median(xs: &[f64]) -> f64 {
     let mut v = xs.to_vec();
     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = v.len();
-    if n % 2 == 1 { v[n / 2] } else { (v[n / 2 - 1] + v[n / 2]) / 2.0 }
+    if n % 2 == 1 {
+        v[n / 2]
+    } else {
+        (v[n / 2 - 1] + v[n / 2]) / 2.0
+    }
 }
 
 fn main() {
@@ -215,38 +236,67 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
-    let dir = PathBuf::from(arg(&args, "--dir").cloned().unwrap_or_else(|| "models/qwen3-30b-a3b".into()));
-    let prompt = arg(&args, "--prompt").cloned().unwrap_or_else(|| "The capital of France is".into());
-    let decode_tokens: usize = arg(&args, "--decode-tokens").and_then(|s| s.parse().ok()).unwrap_or(8);
-    let warmup: usize = arg(&args, "--warmup").and_then(|s| s.parse().ok()).unwrap_or(1);
-    let dtype_bytes: usize = arg(&args, "--dtype-bytes").and_then(|s| s.parse().ok()).unwrap_or(2); // bf16
+    let dir = PathBuf::from(
+        arg(&args, "--dir")
+            .cloned()
+            .unwrap_or_else(|| "models/qwen3-30b-a3b".into()),
+    );
+    let prompt = arg(&args, "--prompt")
+        .cloned()
+        .unwrap_or_else(|| "The capital of France is".into());
+    let decode_tokens: usize = arg(&args, "--decode-tokens")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    let warmup: usize = arg(&args, "--warmup")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+    let dtype_bytes: usize = arg(&args, "--dtype-bytes")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2); // bf16
     let all_paths = args.iter().any(|x| x == "--all-paths");
     if decode_tokens <= warmup {
-        return Err(format!("--decode-tokens ({decode_tokens}) must exceed --warmup ({warmup})"));
+        return Err(format!(
+            "--decode-tokens ({decode_tokens}) must exceed --warmup ({warmup})"
+        ));
     }
 
-    let device = CudaDevice::default();
+    let device = Device::cuda(0);
     println!("device: {device:?}");
     let cfg = config_from_hf(&dir)?;
     println!(
         "config: {} layers, hidden {}, {} experts top-{}, moe_inter {}, head_dim {}, vocab {}",
-        cfg.num_hidden_layers, cfg.hidden_size, cfg.num_experts, cfg.num_experts_per_tok,
-        cfg.moe_intermediate_size, cfg.get_head_dim(), cfg.vocab_size
+        cfg.num_hidden_layers,
+        cfg.hidden_size,
+        cfg.num_experts,
+        cfg.num_experts_per_tok,
+        cfg.moe_intermediate_size,
+        cfg.get_head_dim(),
+        cfg.vocab_size
     );
-    println!("byte model: bf16 weights ({dtype_bytes} B/weight); peak = {PEAK_GBPS} GB/s; KV-read excluded (short ctx)");
+    println!(
+        "byte model: bf16 weights ({dtype_bytes} B/weight); peak = {PEAK_GBPS} GB/s; KV-read excluded (short ctx)"
+    );
 
     let tokenizer = Qwen3Tokenizer::from_file(dir.join("tokenizer.json"))?;
-    let mut model = cfg.init_causal_lm::<B>(&device);
+    let mut model = cfg.init_causal_lm(&device);
     println!("loading sharded weights from {dir:?} ...");
     let t0 = std::time::Instant::now();
-    model.load_weights_sharded(&dir).map_err(|e| format!("load_weights_sharded failed: {e:?}"))?;
-    println!("loaded {} layers in {:.1}s (load EXCLUDED from timing)", model.num_layers(), t0.elapsed().as_secs_f64());
+    model
+        .load_weights_sharded(&dir)
+        .map_err(|e| format!("load_weights_sharded failed: {e:?}"))?;
+    println!(
+        "loaded {} layers in {:.1}s (load EXCLUDED from timing)",
+        model.num_layers(),
+        t0.elapsed().as_secs_f64()
+    );
 
     let (ids_u32, _) = tokenizer.encode_no_pad(&prompt)?;
     let prompt_ids: Vec<i64> = ids_u32.iter().map(|&x| x as i64).collect();
     let eos = [151643i64, 151645];
     println!("\nprompt ({} tok): {prompt:?}", prompt_ids.len());
-    println!("decode-tokens: {decode_tokens} (steady-state excludes prefill + first {warmup} step(s))\n");
+    println!(
+        "decode-tokens: {decode_tokens} (steady-state excludes prefill + first {warmup} step(s))\n"
+    );
 
     // Which paths to run: --all-paths loops all three (one load); else the env-selected single path.
     let paths: Vec<Path> = if all_paths {
@@ -286,19 +336,37 @@ fn run() -> Result<(), String> {
         // Per-path detail (per-step times expose the warmup spike + steady-state stability).
         println!(
             "{:<46} {:>9.1} {:>10.3} {:>9.2} {:>11.1} {:>8.0}%  {}",
-            path.label(), ms, tok_s, gb_tok, eff_gbps, pct, verdict
+            path.label(),
+            ms,
+            tok_s,
+            gb_tok,
+            eff_gbps,
+            pct,
+            verdict
         );
         println!(
             "    prefill {:.0} ms | steps(ms): {} | mean {:.1} median {:.1} min {:.1}",
             stats.prefill_ms,
-            stats.steps_ms.iter().map(|m| format!("{m:.0}")).collect::<Vec<_>>().join(","),
-            mean(steady), ms, steady.iter().cloned().fold(f64::INFINITY, f64::min)
+            stats
+                .steps_ms
+                .iter()
+                .map(|m| format!("{m:.0}"))
+                .collect::<Vec<_>>()
+                .join(","),
+            mean(steady),
+            ms,
+            steady.iter().cloned().fold(f64::INFINITY, f64::min)
         );
         println!(
             "    bytes/tok: experts {:.2} + attn {:.2} + head {:.2} GB = {:.2} GB",
-            be / 1e9, ba / 1e9, bh / 1e9, gb_tok
+            be / 1e9,
+            ba / 1e9,
+            bh / 1e9,
+            gb_tok
         );
-        if let Ok(txt) = tokenizer.decode(&stats.gen_ids.iter().map(|&x| x as u32).collect::<Vec<_>>()) {
+        if let Ok(txt) =
+            tokenizer.decode(&stats.gen_ids.iter().map(|&x| x as u32).collect::<Vec<_>>())
+        {
             println!("    sample: {txt:?}");
         }
         summary.push((path, ms, tok_s, eff_gbps, pct, launch_bound));
@@ -306,20 +374,36 @@ fn run() -> Result<(), String> {
     println!("{:-<108}", "");
 
     // --- Verdict on the plan's central claim (the ORACLE / full-dense path = the measured 0.73). ---
-    println!("\n===== VERDICT vs PERF_80TOKS_PLAN §1 (\"0.73 tok/s is LAUNCH-bound, ~16% of peak\") =====");
+    println!(
+        "\n===== VERDICT vs PERF_80TOKS_PLAN §1 (\"0.73 tok/s is LAUNCH-bound, ~16% of peak\") ====="
+    );
     for (path, ms, tok_s, eff, pct, lb) in &summary {
         let line = if *lb {
             format!("LAUNCH-BOUND ({pct:.0}% of peak)")
         } else {
             format!("BANDWIDTH-BOUND ({pct:.0}% of peak)")
         };
-        println!("  {:<46} {:>7.3} tok/s  {:>6.1} ms/tok  {:>6.1} GB/s eff  →  {line}", path.label(), tok_s, ms, eff);
+        println!(
+            "  {:<46} {:>7.3} tok/s  {:>6.1} ms/tok  {:>6.1} GB/s eff  →  {line}",
+            path.label(),
+            tok_s,
+            ms,
+            eff
+        );
     }
     if let Some((_, _, _, _, pct, lb)) = summary.iter().find(|(p, ..)| *p == Path::Oracle) {
         println!(
             "\n  ORACLE (dense) verdict: {}  →  the plan's '~16% of peak, launch-bound' is {}.",
-            if *lb { format!("LAUNCH-BOUND ({pct:.0}% of peak)") } else { format!("BANDWIDTH-BOUND ({pct:.0}% of peak)") },
-            if *lb { "CONFIRMED (well below the memory roofline ⇒ overhead-bound)" } else { "REFUTED (near the memory roofline)" }
+            if *lb {
+                format!("LAUNCH-BOUND ({pct:.0}% of peak)")
+            } else {
+                format!("BANDWIDTH-BOUND ({pct:.0}% of peak)")
+            },
+            if *lb {
+                "CONFIRMED (well below the memory roofline ⇒ overhead-bound)"
+            } else {
+                "REFUTED (near the memory roofline)"
+            }
         );
     }
     Ok(())

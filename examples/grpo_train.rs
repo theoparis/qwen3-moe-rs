@@ -21,15 +21,12 @@
 //! For large models / large `group_size * max_new_tokens`, micro-batch the policy forward/backward
 //! (the single full-batch autodiff pass here will OOM at scale — a deferred perf task).
 
-use burn::backend::{Autodiff, NdArray};
 use burn::grad_clipping::GradientClippingConfig;
 use burn::module::AutodiffModule;
 use burn::optim::AdamWConfig;
-use qwen3_burn::grpo::{grpo_step_ragged, GrpoConfig, GrpoTrainConfig, RolloutConfig, Rollouts};
+use burn::prelude::Device;
 use qwen3_burn::Qwen3Config;
-
-type IB = NdArray;
-type B = Autodiff<IB>;
+use qwen3_burn::grpo::{GrpoConfig, GrpoTrainConfig, RolloutConfig, Rollouts, grpo_step_ragged};
 
 const VOCAB: usize = 32;
 const HALF: i64 = (VOCAB as i64) / 2; // dense reward: pay completion tokens with id >= HALF
@@ -37,8 +34,11 @@ const PAD: i64 = 0;
 const EOS: i64 = 7;
 
 fn main() {
-    let steps: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(30);
-    let dev = Default::default();
+    let steps: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(30);
+    let dev = Device::flex().autodiff();
 
     // ---- model: tiny random Qwen3 (swap for qwen3_0_6b() + load_weights for a real run) ----
     let cfg = Qwen3Config::new()
@@ -49,12 +49,17 @@ fn main() {
         .with_num_attention_heads(4)
         .with_num_key_value_heads(2)
         .with_head_dim(Some(16));
-    let mut policy = cfg.init_causal_lm::<B>(&dev);
+    let mut policy = cfg.init_causal_lm(&dev);
 
     // ---- frozen reference: snapshot the (SFT) weights ONCE, on the inner (no-grad) backend.
     // It is never stepped; the KL term anchors the policy to it for the whole run. ----
     let ref_model = policy.valid();
-    let ref_fingerprint: f32 = ref_model.model.embed_tokens_weight().abs().sum().into_scalar();
+    let ref_fingerprint: f32 = ref_model
+        .model
+        .embed_tokens_weight()
+        .abs()
+        .sum()
+        .into_scalar();
 
     // ---- optimizer: AdamW + GLOBAL-NORM gradient clipping (RL is high-variance — clip or explode) ----
     let mut optim = AdamWConfig::new()
@@ -63,22 +68,36 @@ fn main() {
 
     let g = 4usize; // group size (GRPO needs G >= 2)
     let train_cfg = GrpoTrainConfig {
-        grpo: GrpoConfig { group_size: g, ..GrpoConfig::default() },
+        grpo: GrpoConfig {
+            group_size: g,
+            ..GrpoConfig::default()
+        },
         // VERY high temperature: a tiny random-init model has peaked logits, so anything lower
         // collapses each group to identical completions (zero-std, no learning signal). A real
         // pretrained model uses a normal temperature (~0.7-1.0).
-        rollout: RolloutConfig { group_size: g, max_new_tokens: 8, temperature: 5.0, top_p: 1.0, top_k: 0 },
+        rollout: RolloutConfig {
+            group_size: g,
+            max_new_tokens: 8,
+            temperature: 5.0,
+            top_p: 1.0,
+            top_k: 0,
+        },
         eos: vec![EOS],
         lr: 3e-3,
     };
 
     // toy learnable reward: fraction of (masked) completion tokens equal to TARGET
-    let reward_fn = |roll: &Rollouts<IB>| -> Vec<f32> {
+    let reward_fn = |roll: &Rollouts| -> Vec<f32> {
         let n = roll.seq_ids.dims()[0];
         let (lp, glen) = (roll.prompt_len, roll.gen_len);
         let width = lp + glen;
         let ids = roll.seq_ids.clone().into_data().to_vec::<i64>().unwrap();
-        let mask = roll.completion_mask.clone().into_data().to_vec::<f32>().unwrap();
+        let mask = roll
+            .completion_mask
+            .clone()
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
         (0..n)
             .map(|s| {
                 let (mut hits, mut tot) = (0.0f32, 0.0f32);
@@ -96,8 +115,12 @@ fn main() {
     };
 
     // ragged toy prompts (variable length -> exercises grpo_step_ragged's left-pad path)
-    let prompts: Vec<Vec<i64>> =
-        vec![vec![1, 2, 3, 4], vec![6, 1], vec![2, 3, 6], vec![4, 1, 2, 6, 3]];
+    let prompts: Vec<Vec<i64>> = vec![
+        vec![1, 2, 3, 4],
+        vec![6, 1],
+        vec![2, 3, 6],
+        vec![4, 1, 2, 6, 3],
+    ];
 
     println!(
         "GRPO smoke | {steps} steps | prompts {} x G {} = {} completions/step | reward: upper-half (id >= {HALF})",
@@ -109,12 +132,23 @@ fn main() {
     let mut first_reward = f32::NAN;
     let mut last_reward = f32::NAN;
     for step in 0..steps {
-        let (p, o, report) =
-            grpo_step_ragged(policy, &ref_model, optim, prompts.clone(), PAD, &dev, &reward_fn, &train_cfg);
+        let (p, o, report) = grpo_step_ragged(
+            policy,
+            &ref_model,
+            optim,
+            prompts.clone(),
+            PAD,
+            &dev,
+            &reward_fn,
+            &train_cfg,
+        );
         policy = p;
         optim = o;
 
-        assert!(report.metrics.total_loss.is_finite(), "step {step}: non-finite loss");
+        assert!(
+            report.metrics.total_loss.is_finite(),
+            "step {step}: non-finite loss"
+        );
         if step == 0 {
             first_reward = report.mean_reward;
         }
@@ -134,11 +168,22 @@ fn main() {
     }
 
     // the frozen reference must NOT have moved
-    let ref_after: f32 = ref_model.model.embed_tokens_weight().abs().sum().into_scalar();
-    assert_eq!(ref_fingerprint, ref_after, "frozen reference changed during training");
+    let ref_after: f32 = ref_model
+        .model
+        .embed_tokens_weight()
+        .abs()
+        .sum()
+        .into_scalar();
+    assert_eq!(
+        ref_fingerprint, ref_after,
+        "frozen reference changed during training"
+    );
 
     println!("\n===== GRPO SMOKE =====");
-    println!("mean reward: {first_reward:.3} (step 0) -> {last_reward:.3} (step {})", steps - 1);
+    println!(
+        "mean reward: {first_reward:.3} (step 0) -> {last_reward:.3} (step {})",
+        steps - 1
+    );
     println!("frozen reference unchanged: ✓");
     println!(
         "{}",

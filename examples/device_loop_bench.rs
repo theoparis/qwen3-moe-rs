@@ -21,22 +21,24 @@
 //!
 //!   RUSTFLAGS="-C target-feature=+fp16" cargo run --release --features cuda --example device_loop_bench
 
-use burn::backend::cuda::{Cuda, CudaDevice};
-use burn::tensor::backend::Backend;
-use burn::tensor::{Int, Tensor};
-use qwen3_burn::device_sample_step;
-use qwen3_burn::grpo::{group_sample_cached_device, group_sample_cached_device_loop, RolloutConfig};
+use burn::prelude::Device;
+
+use burn::tensor::{Device, Int, Tensor};
 use qwen3_burn::Qwen3Config;
+use qwen3_burn::device_sample_step;
+use qwen3_burn::grpo::{
+    RolloutConfig, group_sample_cached_device, group_sample_cached_device_loop,
+};
 use std::time::Instant;
 
 type B = Cuda;
 
 /// Force the device queue to drain so `Instant` brackets measure real GPU work (not just enqueue).
 fn sync(d: &CudaDevice) {
-    let _ = Tensor::<B, 1>::zeros([1], d).sum().into_scalar();
+    let _ = Tensor::<1>::zeros([1], d).sum().into_scalar();
 }
 
-fn build_model(device: &CudaDevice, vocab: usize, layers: usize) -> qwen3_burn::Qwen3ForCausalLM<B> {
+fn build_model(device: &CudaDevice, vocab: usize, layers: usize) -> qwen3_burn::Qwen3ForCausalLM {
     let cfg = Qwen3Config::new()
         .with_vocab_size(vocab)
         .with_hidden_size(1024)
@@ -45,26 +47,37 @@ fn build_model(device: &CudaDevice, vocab: usize, layers: usize) -> qwen3_burn::
         .with_num_attention_heads(16)
         .with_num_key_value_heads(8)
         .with_head_dim(Some(128));
-    cfg.init_causal_lm::<B>(device)
+    cfg.init_causal_lm(device)
 }
 
 /// Prime a KV cache with a `ctx0` prefill, then return the steady-state last-token logits `[N, V]` (on
 /// device) — the per-step tensor the rollout sampler consumes.
-fn primed_last(model: &qwen3_burn::Qwen3ForCausalLM<B>, device: &CudaDevice, n: usize, vocab: usize, ctx0: usize) -> Tensor<B, 2> {
-    let prompt = Tensor::<B, 1, Int>::from_data(
-        (0..(n * ctx0) as i64).map(|i| (i * 131 + 17) % vocab as i64).collect::<Vec<_>>().as_slice(),
+fn primed_last(
+    model: &qwen3_burn::Qwen3ForCausalLM,
+    device: &CudaDevice,
+    n: usize,
+    vocab: usize,
+    ctx0: usize,
+) -> Tensor<2> {
+    let prompt = Tensor::<1, Int>::from_data(
+        (0..(n * ctx0) as i64)
+            .map(|i| (i * 131 + 17) % vocab as i64)
+            .collect::<Vec<_>>()
+            .as_slice(),
         device,
     )
     .reshape([n, ctx0]);
     let mut cache = model.new_cache_with_capacity(ctx0 + 4);
-    let pos0 = Tensor::<B, 1, Int>::arange(0..ctx0 as i64, device).unsqueeze_dim::<2>(0).repeat(&[n, 1]);
+    let pos0 = Tensor::<1, Int>::arange(0..ctx0 as i64, device)
+        .unsqueeze_dim::<2>(0)
+        .repeat(&[n, 1]);
     let logits = model.forward_with_cache(prompt, None, pos0, &mut cache); // [n, ctx0, v]
     let [_, _, v] = logits.dims();
     logits.slice([0..n, (ctx0 - 1)..ctx0, 0..v]).reshape([n, v])
 }
 
 fn main() {
-    let device = CudaDevice::default();
+    let device = Device::cuda(0);
     println!("device: {device:?} | backend: Cuda (sm_121 / GB10)\n");
 
     let vocab = 151936usize; // the real Qwen3 vocab
@@ -73,7 +86,7 @@ fn main() {
     let reps = 64usize;
     let eos_set: Vec<i64> = vec![vocab as i64 - 1]; // unlikely id -> both drivers run the FULL length
 
-    <B as Backend>::seed(&device, 7);
+    device.seed(7);
     let model = build_model(&device, vocab, layers);
 
     // ===================================================================================
@@ -94,17 +107,21 @@ fn main() {
         let mut sink = 0i64;
         for _ in 0..reps {
             let (toks, logp_t) = device_sample_step(last.clone(), 0.0); // on device
-            let cand: Vec<i64> =
-                toks.cast(burn::tensor::DType::I64).into_data().to_vec::<i64>().unwrap(); // [N] SYNC
+            let cand: Vec<i64> = toks
+                .cast(burn::tensor::DType::I64)
+                .into_data()
+                .to_vec::<i64>()
+                .unwrap(); // [N] SYNC
             let lv: Vec<f32> = logp_t.into_data().to_vec::<f32>().unwrap(); // [N] SYNC
-            let next: Vec<i64> =
-                (0..n).map(|s| if finished[s] { eos0 } else { cand[s] }).collect(); // host EOS loop
+            let next: Vec<i64> = (0..n)
+                .map(|s| if finished[s] { eos0 } else { cand[s] })
+                .collect(); // host EOS loop
             for s in 0..n {
                 if !finished[s] && next[s] == eos0 {
                     finished[s] = true;
                 }
             }
-            let _next_t = Tensor::<B, 1, Int>::from_data(next.as_slice(), &device).reshape([n, 1]); // [N] upload
+            let _next_t = Tensor::<1, Int>::from_data(next.as_slice(), &device).reshape([n, 1]); // [N] upload
             sink ^= next[0] ^ (lv[0].to_bits() as i64);
         }
         core::hint::black_box(sink);
@@ -116,11 +133,11 @@ fn main() {
     //     NO into_data. We drain ONCE at the end (the single sync), not per step. ---
     let device_path_cost = || -> f64 {
         let total = 128usize;
-        let mut tok_buf = Tensor::<B, 2, Int>::zeros([n, total], &device);
-        let mut logp_buf = Tensor::<B, 2>::zeros([n, reps], &device);
-        let mut mask_buf = Tensor::<B, 2>::zeros([n, reps], &device);
-        let mut finished = Tensor::<B, 2, Int>::zeros([n, 1], &device).equal_elem(1i64);
-        let pad = Tensor::<B, 2, Int>::full([n, 1], eos0, &device);
+        let mut tok_buf = Tensor::<2, Int>::zeros([n, total], &device);
+        let mut logp_buf = Tensor::<2>::zeros([n, reps], &device);
+        let mut mask_buf = Tensor::<2>::zeros([n, reps], &device);
+        let mut finished = Tensor::<2, Int>::zeros([n, 1], &device).equal_elem(1i64);
+        let pad = Tensor::<2, Int>::full([n, 1], eos0, &device);
         sync(&device);
         let t0 = Instant::now();
         for t in 0..reps {
@@ -136,7 +153,11 @@ fn main() {
         }
         sync(&device); // the SINGLE end-of-loop sync
         // touch the buffers so nothing is dead-code-eliminated
-        core::hint::black_box((tok_buf.sum().into_scalar(), logp_buf.sum().into_scalar(), mask_buf.sum().into_scalar()));
+        core::hint::black_box((
+            tok_buf.sum().into_scalar(),
+            logp_buf.sum().into_scalar(),
+            mask_buf.sum().into_scalar(),
+        ));
         t0.elapsed().as_secs_f64() * 1e3 / reps as f64
     };
 
@@ -145,9 +166,16 @@ fn main() {
     let _ = device_path_cost();
     let ms_host_sync = host_sync_cost();
     let ms_dev_path = device_path_cost();
-    println!("  per-step host round-trip ([N] into_data + host EOS + [N] upload + [N] logp sync) : {ms_host_sync:8.4} ms");
-    println!("  per-step pure-device EOS path (mask_where/equal_elem/bool_or + slice_assign)      : {ms_dev_path:8.4} ms");
-    println!("  net per-step delta (host_round_trip - device_path): {:+.4} ms", ms_host_sync - ms_dev_path);
+    println!(
+        "  per-step host round-trip ([N] into_data + host EOS + [N] upload + [N] logp sync) : {ms_host_sync:8.4} ms"
+    );
+    println!(
+        "  per-step pure-device EOS path (mask_where/equal_elem/bool_or + slice_assign)      : {ms_dev_path:8.4} ms"
+    );
+    println!(
+        "  net per-step delta (host_round_trip - device_path): {:+.4} ms",
+        ms_host_sync - ms_dev_path
+    );
     println!(
         "  NOTE: device_sample_step (full-vocab logsumexp/argmax/gather over [N,{vocab}]) dominates BOTH,\n        \
          so the residual [N] sync is a small fraction of the per-step cost at production vocab — the\n        \
@@ -161,12 +189,20 @@ fn main() {
     println!("=== (2) END-TO-END DECODE WALL-CLOCK  (vocab={vocab}, N={n}) ===");
     let (p, g, lp, max_new) = (16usize, 4usize, 16usize, 64usize);
     assert_eq!(p * g, n);
-    let prompt_ids: Vec<i64> = (0..(p * lp) as i64).map(|i| (i * 131 + 17) % vocab as i64).collect();
-    let prompt = Tensor::<B, 1, Int>::from_data(prompt_ids.as_slice(), &device).reshape([p, lp]);
+    let prompt_ids: Vec<i64> = (0..(p * lp) as i64)
+        .map(|i| (i * 131 + 17) % vocab as i64)
+        .collect();
+    let prompt = Tensor::<1, Int>::from_data(prompt_ids.as_slice(), &device).reshape([p, lp]);
 
     let e2e_reps = 5usize;
     let bench_e2e = |temp: f32, parity: bool| {
-        let rc = RolloutConfig { group_size: g, max_new_tokens: max_new, temperature: temp, top_p: 1.0, top_k: 0 };
+        let rc = RolloutConfig {
+            group_size: g,
+            max_new_tokens: max_new,
+            temperature: temp,
+            top_p: 1.0,
+            top_k: 0,
+        };
         // warmup (JIT-compile kernels) both paths
         let _ = group_sample_cached_device(&model, prompt.clone(), &rc, &eos_set);
         let _ = group_sample_cached_device_loop(&model, prompt.clone(), &rc, &eos_set);
@@ -208,7 +244,11 @@ fn main() {
         ms_sync /= e2e_reps as f64;
         ms_loop /= e2e_reps as f64;
 
-        let tag = if temp <= 0.0 { "GREEDY     " } else { "TEMPERATURE" };
+        let tag = if temp <= 0.0 {
+            "GREEDY     "
+        } else {
+            "TEMPERATURE"
+        };
         print!(
             "  {tag} (temp={temp}): device-sampling {ms_sync:8.1} ms | device-LOOP {ms_loop:8.1} ms | speedup {:.3}x",
             ms_sync / ms_loop

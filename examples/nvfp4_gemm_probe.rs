@@ -62,13 +62,12 @@ fn kernel_single_canonical_nvfp4(
     scales_b: &Tensor<e4m3>,
     out: &mut Tensor<f32>,
 ) {
-    let def =
-        cmma::MmaDefinition::<e2m1x2, e2m1x2, f32>::new_scaled::<e4m3>(
-            MMA_M,
-            MMA_N,
-            MMA_K,
-            SCALES_FACTOR,
-        );
+    let def = cmma::MmaDefinition::<e2m1x2, e2m1x2, f32>::new_scaled::<e4m3>(
+        MMA_M,
+        MMA_N,
+        MMA_K,
+        SCALES_FACTOR,
+    );
     let lane_id = UNIT_POS_PLANE;
 
     let elem_count_a = def.elems_per_lane(MatrixIdent::A);
@@ -141,8 +140,7 @@ fn kernel_single_canonical_nvfp4(
         #[unroll]
         for j in 0..line_size_c {
             let n_elem = i * line_size_c + j;
-            let (row, col) =
-                def.position_of_nth(lane_id, n_elem as u32, MatrixIdent::Accumulator);
+            let (row, col) = def.position_of_nth(lane_id, n_elem as u32, MatrixIdent::Accumulator);
             out[row as usize * MMA_N + col as usize] = reg[j] * SECOND_LEVEL_SCALE;
         }
     }
@@ -156,13 +154,12 @@ fn kernel_tiled_nvfp4(
     scales_b: &Tensor<e4m3>,
     out: &mut Tensor<f32>,
 ) {
-    let def =
-        cmma::MmaDefinition::<e2m1x2, e2m1x2, f32>::new_scaled::<e4m3>(
-            MMA_M,
-            MMA_N,
-            MMA_K,
-            SCALES_FACTOR,
-        );
+    let def = cmma::MmaDefinition::<e2m1x2, e2m1x2, f32>::new_scaled::<e4m3>(
+        MMA_M,
+        MMA_N,
+        MMA_K,
+        SCALES_FACTOR,
+    );
 
     let mut stage_a = SharedMemory::<e2m1x2>::new_lined(A_STAGE_LINES, AB_LINE_SIZE);
     let mut stage_b = SharedMemory::<e2m1x2>::new_lined(B_STAGE_LINES, AB_LINE_SIZE);
@@ -208,41 +205,36 @@ fn kernel_tiled_nvfp4(
         if unit < A_STAGE_LINES {
             let row = unit / A_LINES_PER_ROW;
             let col_line = unit % A_LINES_PER_ROW;
-            let global = (cta_m + row) * (K / (FP4_PACK * AB_LINE_SIZE))
-                + kt * A_LINES_PER_ROW
-                + col_line;
+            let global =
+                (cta_m + row) * (K / (FP4_PACK * AB_LINE_SIZE)) + kt * A_LINES_PER_ROW + col_line;
             stage_a[unit] = a[global];
         }
         let unit_a2 = unit + WARPS_PER_CTA * 32;
         if unit_a2 < A_STAGE_LINES {
             let row = unit_a2 / A_LINES_PER_ROW;
             let col_line = unit_a2 % A_LINES_PER_ROW;
-            let global = (cta_m + row) * (K / (FP4_PACK * AB_LINE_SIZE))
-                + kt * A_LINES_PER_ROW
-                + col_line;
+            let global =
+                (cta_m + row) * (K / (FP4_PACK * AB_LINE_SIZE)) + kt * A_LINES_PER_ROW + col_line;
             stage_a[unit_a2] = a[global];
         }
 
         if unit < B_STAGE_LINES {
             let col = unit / B_LINES_PER_COL;
             let row_line = unit % B_LINES_PER_COL;
-            let global = (cta_n + col) * (K / (FP4_PACK * AB_LINE_SIZE))
-                + kt * B_LINES_PER_COL
-                + row_line;
+            let global =
+                (cta_n + col) * (K / (FP4_PACK * AB_LINE_SIZE)) + kt * B_LINES_PER_COL + row_line;
             stage_b[unit] = b[global];
         }
 
         if unit < A_SCALE_ELEMS {
             let row = unit / SCALES_FACTOR;
             let scale = unit % SCALES_FACTOR;
-            stage_scales_a[unit] =
-                scales_a[((cta_m + row) * K_TILES + kt) * SCALES_FACTOR + scale];
+            stage_scales_a[unit] = scales_a[((cta_m + row) * K_TILES + kt) * SCALES_FACTOR + scale];
         }
         if unit < B_SCALE_ELEMS {
             let col = unit / SCALES_FACTOR;
             let scale = unit % SCALES_FACTOR;
-            stage_scales_b[unit] =
-                scales_b[((cta_n + col) * K_TILES + kt) * SCALES_FACTOR + scale];
+            stage_scales_b[unit] = scales_b[((cta_n + col) * K_TILES + kt) * SCALES_FACTOR + scale];
         }
 
         sync_cube();
@@ -307,8 +299,7 @@ fn kernel_tiled_nvfp4(
         for j in 0..line_size_c {
             let value = reg[j] * SECOND_LEVEL_SCALE;
             let n_elem = i * line_size_c + j;
-            let (row, col) =
-                def.position_of_nth(lane_id, n_elem as u32, MatrixIdent::Accumulator);
+            let (row, col) = def.position_of_nth(lane_id, n_elem as u32, MatrixIdent::Accumulator);
             let idx = (tile_m + row as usize) * N + tile_n + col as usize;
             out[idx] = value;
         }
@@ -330,8 +321,7 @@ fn chosen_config() -> ScaledMmaConfig {
 
 fn quantized_e2m1(seed: usize) -> f32 {
     let raw = [
-        -6.7, -4.4, -3.1, -2.3, -1.7, -1.2, -0.7, -0.2, 0.2, 0.7, 1.2, 1.7, 2.3, 3.1, 4.4,
-        6.7,
+        -6.7, -4.4, -3.1, -2.3, -1.7, -1.2, -0.7, -0.2, 0.2, 0.7, 1.2, 1.7, 2.3, 3.1, 4.4, 6.7,
     ];
     e2m1::from_f32(raw[seed % raw.len()]).to_f32()
 }
@@ -346,7 +336,14 @@ fn scale_b(col: usize, kt: usize, block: usize) -> e4m3 {
     e4m3::from_f32(vals[(col * 13 + kt * 7 + block * 5 + 1) % vals.len()])
 }
 
-fn make_inputs() -> (Vec<f32>, Vec<e2m1x2>, Vec<e4m3>, Vec<f32>, Vec<e2m1x2>, Vec<e4m3>) {
+fn make_inputs() -> (
+    Vec<f32>,
+    Vec<e2m1x2>,
+    Vec<e4m3>,
+    Vec<f32>,
+    Vec<e2m1x2>,
+    Vec<e4m3>,
+) {
     let a_f32: Vec<f32> = (0..M)
         .flat_map(|row| (0..K).map(move |k| quantized_e2m1(row * 31 + k * 7 + (row * k) % 19)))
         .collect();
@@ -360,19 +357,27 @@ fn make_inputs() -> (Vec<f32>, Vec<e2m1x2>, Vec<e4m3>, Vec<f32>, Vec<e2m1x2>, Ve
 
     let scales_a: Vec<e4m3> = (0..M)
         .flat_map(|row| {
-            (0..K_TILES).flat_map(move |kt| (0..SCALES_FACTOR).map(move |block| scale_a(row, kt, block)))
+            (0..K_TILES)
+                .flat_map(move |kt| (0..SCALES_FACTOR).map(move |block| scale_a(row, kt, block)))
         })
         .collect();
     let scales_b: Vec<e4m3> = (0..N)
         .flat_map(|col| {
-            (0..K_TILES).flat_map(move |kt| (0..SCALES_FACTOR).map(move |block| scale_b(col, kt, block)))
+            (0..K_TILES)
+                .flat_map(move |kt| (0..SCALES_FACTOR).map(move |block| scale_b(col, kt, block)))
         })
         .collect();
 
     (a_f32, a, scales_a, b_f32, b, scales_b)
 }
 
-fn host_reference(a: &[f32], scales_a: &[e4m3], b: &[f32], scales_b: &[e4m3], abs_scales: bool) -> Vec<f32> {
+fn host_reference(
+    a: &[f32],
+    scales_a: &[e4m3],
+    b: &[f32],
+    scales_b: &[e4m3],
+    abs_scales: bool,
+) -> Vec<f32> {
     let mut out = vec![0.0f32; M * N];
     let k_block = MMA_K / SCALES_FACTOR;
     for row in 0..M {
@@ -397,7 +402,10 @@ fn host_reference(a: &[f32], scales_a: &[e4m3], b: &[f32], scales_b: &[e4m3], ab
     out
 }
 
-fn run_single_canonical_probe(client: &Client, positive_scales_only: bool) -> Result<(f32, f32), String> {
+fn run_single_canonical_probe(
+    client: &Client,
+    positive_scales_only: bool,
+) -> Result<(f32, f32), String> {
     let a_f32: Vec<f32> = (0..MMA_M)
         .flat_map(|row| (0..MMA_K).map(move |k| quantized_e2m1(row * 31 + k * 7 + (row * k) % 19)))
         .collect();
@@ -410,7 +418,11 @@ fn run_single_canonical_probe(client: &Client, positive_scales_only: bool) -> Re
         .flat_map(|row| {
             (0..SCALES_FACTOR).map(move |block| {
                 let value = scale_a(row, 0, block).to_f32();
-                e4m3::from_f32(if positive_scales_only { value.abs() } else { value })
+                e4m3::from_f32(if positive_scales_only {
+                    value.abs()
+                } else {
+                    value
+                })
             })
         })
         .collect();
@@ -418,7 +430,11 @@ fn run_single_canonical_probe(client: &Client, positive_scales_only: bool) -> Re
         .flat_map(|col| {
             (0..SCALES_FACTOR).map(move |block| {
                 let value = scale_b(col, 0, block).to_f32();
-                e4m3::from_f32(if positive_scales_only { value.abs() } else { value })
+                e4m3::from_f32(if positive_scales_only {
+                    value.abs()
+                } else {
+                    value
+                })
             })
         })
         .collect();
@@ -515,7 +531,11 @@ fn launch_kernel(
         kernel_tiled_nvfp4::launch::<R>(
             client,
             CubeCount::Static((N / CTA_N) as u32, (M / CTA_M) as u32, 1),
-            CubeDim { x: 32, y: WARPS_PER_CTA as u32, z: 1 },
+            CubeDim {
+                x: 32,
+                y: WARPS_PER_CTA as u32,
+                z: 1,
+            },
             TensorArg::from_raw_parts::<e2m1x2>(
                 a_handle,
                 &[K / FP4_PACK, 1],
@@ -560,13 +580,27 @@ fn run_probe(client: &Client) -> Result<(Vec<f32>, Vec<f32>, f32, f32, f64, f64)
     let out_handle = client.create_from_slice(f32::as_bytes(&zeros));
 
     for _ in 0..WARMUP_ITERS {
-        launch_kernel(client, &a_handle, &b_handle, &scales_a_handle, &scales_b_handle, &out_handle)?;
+        launch_kernel(
+            client,
+            &a_handle,
+            &b_handle,
+            &scales_a_handle,
+            &scales_b_handle,
+            &out_handle,
+        )?;
     }
     sync_client(client)?;
 
     let start = Instant::now();
     for _ in 0..BENCH_ITERS {
-        launch_kernel(client, &a_handle, &b_handle, &scales_a_handle, &scales_b_handle, &out_handle)?;
+        launch_kernel(
+            client,
+            &a_handle,
+            &b_handle,
+            &scales_a_handle,
+            &scales_b_handle,
+            &out_handle,
+        )?;
     }
     sync_client(client)?;
     let ms = start.elapsed().as_secs_f64() * 1.0e3 / BENCH_ITERS as f64;
@@ -585,7 +619,14 @@ fn run_probe(client: &Client) -> Result<(Vec<f32>, Vec<f32>, f32, f32, f64, f64)
         .map(|(got, want)| (got - want).abs())
         .fold(0.0f32, f32::max);
 
-    Ok((actual, expected, max_abs_diff, max_abs_diff_abs_scales, ms, tflops))
+    Ok((
+        actual,
+        expected,
+        max_abs_diff,
+        max_abs_diff_abs_scales,
+        ms,
+        tflops,
+    ))
 }
 
 fn max_abs_diff_range(actual: &[f32], expected: &[f32], rows: std::ops::Range<usize>) -> f32 {
@@ -609,50 +650,81 @@ fn panic_payload_to_string(payload: Box<dyn Any + Send>) -> String {
 }
 
 fn main() {
-    let device = CudaDevice::default();
+    let device = Device::cuda(0);
     let client = R::client(&device);
     let props = client.properties();
     let config = chosen_config();
     let reports_support = props.features.scaled_mma.contains(&config);
     let max_smem = props.hardware.max_shared_memory_size;
-    let smem_bound_ctas = if SHARED_BYTES == 0 { 0 } else { max_smem / SHARED_BYTES };
+    let smem_bound_ctas = if SHARED_BYTES == 0 {
+        0
+    } else {
+        max_smem / SHARED_BYTES
+    };
     let smem_bound_warps = (smem_bound_ctas * WARPS_PER_CTA).min(NVIDIA_MAX_WARPS_PER_SM);
 
-    println!("P0.3b NVFP4 tiled GEMM probe: M={M} N={N} K={K}, CTA={CTA_M}x{CTA_N}, warps/CTA={WARPS_PER_CTA}");
+    println!(
+        "P0.3b NVFP4 tiled GEMM probe: M={M} N={N} K={K}, CTA={CTA_M}x{CTA_N}, warps/CTA={WARPS_PER_CTA}"
+    );
     println!("DEVICE_REPORTS_SCALED_MMA_E2M1_E4M3: {reports_support}");
     println!(
         "SHARED_MEMORY: used={SHARED_BYTES} B, 99KiB_limit={SHARED_LIMIT_99KIB} B, device_limit={max_smem} B, fits_99KiB={}, smem_bound_ctas/SM={smem_bound_ctas}, smem_bound_occupancy<={} warps/SM, double_buffered={DOUBLE_BUFFERED}",
         SHARED_BYTES <= SHARED_LIMIT_99KIB,
         smem_bound_warps
     );
-    println!("OCCUPANCY_NOTE: CubeCL exposes SM count ({:?}) but not post-JIT achieved occupancy here; printed occupancy is the shared-memory upper bound capped at {NVIDIA_MAX_WARPS_PER_SM} warps/SM.", props.hardware.num_streaming_multiprocessors);
-    println!("PIPELINE_NOTE: A, B, and per-block scales are staged through shared memory; this probe uses synchronous barriers, not an async double-buffered K-loop.");
-    println!("NUMERICS: second_level_scale={SECOND_LEVEL_SCALE}, signed_e4m3_scales=true, rounded_e2m1_inputs=true");
+    println!(
+        "OCCUPANCY_NOTE: CubeCL exposes SM count ({:?}) but not post-JIT achieved occupancy here; printed occupancy is the shared-memory upper bound capped at {NVIDIA_MAX_WARPS_PER_SM} warps/SM.",
+        props.hardware.num_streaming_multiprocessors
+    );
+    println!(
+        "PIPELINE_NOTE: A, B, and per-block scales are staged through shared memory; this probe uses synchronous barriers, not an async double-buffered K-loop."
+    );
+    println!(
+        "NUMERICS: second_level_scale={SECOND_LEVEL_SCALE}, signed_e4m3_scales=true, rounded_e2m1_inputs=true"
+    );
 
-    match panic::catch_unwind(panic::AssertUnwindSafe(|| run_single_canonical_probe(&client, false))) {
+    match panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        run_single_canonical_probe(&client, false)
+    })) {
         Ok(Ok((top, bottom))) => {
             println!(
                 "CANONICAL_SINGLE_MMA_SINGLE_TILE_SIGNED_SCALES: rows0_7_max_abs_diff={top:.6}, rows8_15_max_abs_diff={bottom:.6} {}",
-                if top <= PASS_EPS && bottom <= PASS_EPS { "PASS" } else { "FAIL" }
+                if top <= PASS_EPS && bottom <= PASS_EPS {
+                    "PASS"
+                } else {
+                    "FAIL"
+                }
             );
         }
-        Ok(Err(err)) => println!("CANONICAL_SINGLE_MMA_SINGLE_TILE_SIGNED_SCALES: FAILED_TO_RUN - {err}"),
+        Ok(Err(err)) => {
+            println!("CANONICAL_SINGLE_MMA_SINGLE_TILE_SIGNED_SCALES: FAILED_TO_RUN - {err}")
+        }
         Err(payload) => println!(
             "CANONICAL_SINGLE_MMA_SINGLE_TILE_SIGNED_SCALES: PANIC - {}",
             panic_payload_to_string(payload)
         ),
     }
-    match panic::catch_unwind(panic::AssertUnwindSafe(|| run_single_canonical_probe(&client, true))) {
+    match panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        run_single_canonical_probe(&client, true)
+    })) {
         Ok(Ok((top, bottom))) => {
             println!(
                 "CANONICAL_SINGLE_MMA_SINGLE_TILE_POSITIVE_SCALES: rows0_7_max_abs_diff={top:.6}, rows8_15_max_abs_diff={bottom:.6} {}",
-                if top <= PASS_EPS && bottom <= PASS_EPS { "PASS" } else { "FAIL" }
+                if top <= PASS_EPS && bottom <= PASS_EPS {
+                    "PASS"
+                } else {
+                    "FAIL"
+                }
             );
             if top <= PASS_EPS && bottom > PASS_EPS {
-                println!("BUG_FINDING: positive-scale canonical single-MMA full tile passes rows 0-7 but fails rows 8-15 on e4m3/scales_factor=4.");
+                println!(
+                    "BUG_FINDING: positive-scale canonical single-MMA full tile passes rows 0-7 but fails rows 8-15 on e4m3/scales_factor=4."
+                );
             }
         }
-        Ok(Err(err)) => println!("CANONICAL_SINGLE_MMA_SINGLE_TILE_POSITIVE_SCALES: FAILED_TO_RUN - {err}"),
+        Ok(Err(err)) => {
+            println!("CANONICAL_SINGLE_MMA_SINGLE_TILE_POSITIVE_SCALES: FAILED_TO_RUN - {err}")
+        }
         Err(payload) => println!(
             "CANONICAL_SINGLE_MMA_SINGLE_TILE_POSITIVE_SCALES: PANIC - {}",
             panic_payload_to_string(payload)
@@ -671,18 +743,26 @@ fn main() {
                 if canonical_pass { "PASS" } else { "FAIL" }
             );
             if top <= PASS_EPS && bottom > PASS_EPS {
-                println!("BUG_FINDING: rows 8-15 fail on the natural one execute_scaled e4m3/scales_factor=4 path; no workaround was used.");
+                println!(
+                    "BUG_FINDING: rows 8-15 fail on the natural one execute_scaled e4m3/scales_factor=4 path; no workaround was used."
+                );
             }
             println!(
                 "NVFP4_GEMM: max_abs_diff={max_abs_diff:.6} {}, time={ms:.4} ms, throughput={tflops:.3} TFLOP/s",
                 if pass { "PASS" } else { "FAIL" }
             );
-            println!("SIGNED_SCALE_DIAGNOSTIC: max_abs_diff_if_scale_signs_ignored={max_abs_diff_abs_scales:.6}");
-            println!("BF16_BASELINE: not measured in this one-file probe; NVFP4/bf16 ratio unavailable.");
+            println!(
+                "SIGNED_SCALE_DIAGNOSTIC: max_abs_diff_if_scale_signs_ignored={max_abs_diff_abs_scales:.6}"
+            );
+            println!(
+                "BF16_BASELINE: not measured in this one-file probe; NVFP4/bf16 ratio unavailable."
+            );
         }
         Ok(Err(err)) => {
             println!("LAUNCH: FAILED - {err}");
-            println!("BLOCKER: tiled canonical NVFP4 kernel did not complete, so correctness/perf are unavailable.");
+            println!(
+                "BLOCKER: tiled canonical NVFP4 kernel did not complete, so correctness/perf are unavailable."
+            );
         }
         Err(payload) => {
             println!("LAUNCH: FAILED - {}", panic_payload_to_string(payload));

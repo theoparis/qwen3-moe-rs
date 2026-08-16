@@ -18,11 +18,11 @@
 
 use std::time::Instant;
 
-use burn::backend::cuda::{Cuda, CudaDevice};
 use burn::grad_clipping::GradientClippingConfig;
 use burn::module::AutodiffModule;
 use burn::optim::AdamWConfig;
-use qwen3_burn::grpo::{grpo_step_ragged, GrpoConfig, GrpoTrainConfig, RolloutConfig, Rollouts};
+use burn::prelude::Device;
+use qwen3_burn::grpo::{GrpoConfig, GrpoTrainConfig, RolloutConfig, Rollouts, grpo_step_ragged};
 use qwen3_burn::{Qwen3Config, Qwen3Tokenizer};
 
 type IB = Cuda;
@@ -43,29 +43,44 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let steps: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(25);
-    let device = CudaDevice::default();
+    let steps: usize = std::env::args()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(25);
+    let device = Device::cuda(0);
     println!("device: {device:?} | backend: Autodiff<Cuda>");
 
     // ---- tokenizer + model ----
     let tokenizer = Qwen3Tokenizer::from_file(TOKENIZER).map_err(|e| format!("tokenizer: {e}"))?;
     let cfg = Qwen3Config::qwen3_0_6b();
-    let mut policy = cfg.init_causal_lm::<B>(&device);
+    let mut policy = cfg.init_causal_lm(&device);
     println!("loading f32 weights ...");
-    policy.load_weights(WEIGHTS).map_err(|e| format!("load_weights: {e:?}"))?;
+    policy
+        .load_weights(WEIGHTS)
+        .map_err(|e| format!("load_weights: {e:?}"))?;
 
     // ---- real ragged prompts -> token ids ----
-    let prompt_texts = ["The derivative of x squared is", "To animate a circle in Manim, we"];
+    let prompt_texts = [
+        "The derivative of x squared is",
+        "To animate a circle in Manim, we",
+    ];
     let mut prompts: Vec<Vec<i64>> = Vec::new();
     for t in &prompt_texts {
-        let (ids, _) = tokenizer.encode_no_pad(t).map_err(|e| format!("encode: {e}"))?;
+        let (ids, _) = tokenizer
+            .encode_no_pad(t)
+            .map_err(|e| format!("encode: {e}"))?;
         prompts.push(ids.iter().map(|&u| u as i64).collect());
     }
     let pad_token: i64 = EOS; // left-pad with EOS (masked out anyway)
 
     // ---- frozen reference: snapshot ONCE on the inner (no-grad) backend ----
     let ref_model = policy.valid();
-    let ref_fp: f32 = ref_model.model.embed_tokens_weight().abs().sum().into_scalar();
+    let ref_fp: f32 = ref_model
+        .model
+        .embed_tokens_weight()
+        .abs()
+        .sum()
+        .into_scalar();
 
     // ---- optimizer: AdamW + global-norm grad clipping ----
     let mut optim = AdamWConfig::new()
@@ -73,19 +88,33 @@ fn run() -> Result<(), String> {
         .init();
 
     let train_cfg = GrpoTrainConfig {
-        grpo: GrpoConfig { group_size: G, ..GrpoConfig::default() },
-        rollout: RolloutConfig { group_size: G, max_new_tokens: MAX_NEW, temperature: 1.0, top_p: 1.0, top_k: 0 },
+        grpo: GrpoConfig {
+            group_size: G,
+            ..GrpoConfig::default()
+        },
+        rollout: RolloutConfig {
+            group_size: G,
+            max_new_tokens: MAX_NEW,
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 0,
+        },
         eos: vec![EOS],
         lr: 1e-4,
     };
 
     // dense learnable reward: fraction of (masked) completion tokens in the upper vocab half
-    let reward_fn = move |roll: &Rollouts<IB>| -> Vec<f32> {
+    let reward_fn = move |roll: &Rollouts| -> Vec<f32> {
         let n = roll.seq_ids.dims()[0];
         let (lp, glen) = (roll.prompt_len, roll.gen_len);
         let width = lp + glen;
         let ids = roll.seq_ids.clone().into_data().to_vec::<i32>().unwrap(); // CUDA Int = I32
-        let mask = roll.completion_mask.clone().into_data().to_vec::<f32>().unwrap();
+        let mask = roll
+            .completion_mask
+            .clone()
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
         (0..n)
             .map(|s| {
                 let (mut hits, mut tot) = (0.0f32, 0.0f32);
@@ -115,11 +144,22 @@ fn run() -> Result<(), String> {
     let mut last_reward = f32::NAN;
     for step in 0..steps {
         let t0 = Instant::now();
-        let (p, o, report) =
-            grpo_step_ragged(policy, &ref_model, optim, prompts.clone(), pad_token, &device, &reward_fn, &train_cfg);
+        let (p, o, report) = grpo_step_ragged(
+            policy,
+            &ref_model,
+            optim,
+            prompts.clone(),
+            pad_token,
+            &device,
+            &reward_fn,
+            &train_cfg,
+        );
         policy = p;
         optim = o;
-        assert!(report.metrics.total_loss.is_finite(), "step {step}: non-finite loss");
+        assert!(
+            report.metrics.total_loss.is_finite(),
+            "step {step}: non-finite loss"
+        );
         if step == 0 {
             first_reward = report.mean_reward;
         }
@@ -136,12 +176,26 @@ fn run() -> Result<(), String> {
         );
     }
 
-    let ref_after: f32 = ref_model.model.embed_tokens_weight().abs().sum().into_scalar();
-    assert_eq!(ref_fp, ref_after, "frozen reference changed during training");
+    let ref_after: f32 = ref_model
+        .model
+        .embed_tokens_weight()
+        .abs()
+        .sum()
+        .into_scalar();
+    assert_eq!(
+        ref_fp, ref_after,
+        "frozen reference changed during training"
+    );
 
     println!("\n===== GRPO CUDA SMOKE =====");
-    println!("mean reward: {first_reward:.3} (step 0) -> {last_reward:.3} (step {})", steps - 1);
-    println!("frozen reference unchanged: ✓ | wall {:.1}s", start.elapsed().as_secs_f64());
+    println!(
+        "mean reward: {first_reward:.3} (step 0) -> {last_reward:.3} (step {})",
+        steps - 1
+    );
+    println!(
+        "frozen reference unchanged: ✓ | wall {:.1}s",
+        start.elapsed().as_secs_f64()
+    );
     println!("===========================");
     Ok(())
 }

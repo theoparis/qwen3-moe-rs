@@ -51,19 +51,18 @@
 
 use std::path::PathBuf;
 
-use burn::backend::cuda::{Cuda, CudaDevice};
-use burn::tensor::{DType, Int, Tensor};
+use burn::prelude::Device;
+use burn::tensor::{DType, Device, Int, Tensor};
 
 use crate::sampling::sample_index;
 use crate::{
-    Precision, Qwen3MoeConfig, Qwen3MoeForCausalLM, Qwen3Tokenizer, Qwen3_5MoeConfig,
-    Qwen3_5MoeForCausalLM,
+    Precision, Qwen3_5MoeConfig, Qwen3_5MoeForCausalLM, Qwen3MoeConfig, Qwen3MoeForCausalLM,
+    Qwen3Tokenizer,
 };
 
 /// The one backend the engine runs on (Fusion-over-CUDA), matching the proven
 /// examples (`vllm_infer` for 30B, `qwen35_generate` for 35B). The CUDA-graph
 /// `CaptureBackend` path is explicitly OUT of scope for v1 (eager-static only).
-type B = Cuda;
 
 // ============================================================================
 // Public engine-owned config / request / event types (self-contained: this
@@ -388,10 +387,10 @@ fn engine_main(
 /// 35B variant.
 enum LoadedModel {
     /// Qwen3-30B-A3B via the fused static-decode path (vllm_infer's non-captured arm).
-    Moe30b(Box<Qwen3MoeForCausalLM<B>>),
+    Moe30b(Box<Qwen3MoeForCausalLM>),
     /// Qwen3.6-35B-A3B via `forward_last_logits` (qwen35_generate's arm).
     Moe35b {
-        model: Box<Qwen3_5MoeForCausalLM<B>>,
+        model: Box<Qwen3_5MoeForCausalLM>,
         /// Activation precision for the 35B forward (bf16, matching qwen35_generate's default).
         prec: Precision,
     },
@@ -415,7 +414,7 @@ impl Engine {
     /// `Qwen3_5MoeForCausalLM::{load_weights_sharded,load_nvidia_nvfp4}` plus
     /// `quant_gate::{quantize_dense_fp8,quantize_experts_fp8}` for the fp8 arm).
     fn load(config: &EngineConfig) -> Result<Self, EngineError> {
-        let device = CudaDevice::default();
+        let device = Device::cuda(0);
         let dir = &config.model_dir;
 
         let tokenizer = Qwen3Tokenizer::from_file(dir.join("tokenizer.json"))
@@ -431,7 +430,7 @@ impl Engine {
                     )));
                 }
                 let cfg = load_moe30b_config(dir)?;
-                let mut model = cfg.init_causal_lm::<B>(&device);
+                let mut model = cfg.init_causal_lm(&device);
                 model
                     .load_weights_sharded(dir.clone())
                     .map_err(|e| EngineError::Load(format!("30B sharded load: {e:?}")))?;
@@ -444,7 +443,7 @@ impl Engine {
             WhichModel::Qwen35Moe => {
                 let cfg = Qwen3_5MoeConfig::from_hf_config_file(dir.join("config.json"))
                     .map_err(EngineError::Config)?;
-                let mut model = cfg.init_causal_lm::<B>(&device);
+                let mut model = cfg.init_causal_lm(&device);
                 match config.quant {
                     Quant::Bf16 => {
                         model
@@ -506,22 +505,22 @@ impl Engine {
             LoadedModel::Moe30b(m) => {
                 let sd = m.build_static_decode(2).with_fused(true);
                 let mut cache = m.model.new_cache_with_capacity(2);
-                let input = Tensor::<B, 1, Int>::from_data([0i64].as_slice(), device).unsqueeze();
-                let pos0 = Tensor::<B, 1, Int>::arange(0..1, device).unsqueeze_dim::<2>(0);
+                let input = Tensor::<1, Int>::from_data([0i64].as_slice(), device).unsqueeze();
+                let pos0 = Tensor::<1, Int>::arange(0..1, device).unsqueeze_dim::<2>(0);
                 let _ = m.forward_with_cache(input, None, pos0, &mut cache);
-                let emit = Tensor::<B, 1, Int>::from_data([0i64].as_slice(), device).reshape([1, 1]);
-                let pos = Tensor::<B, 1, Int>::full([1], 1i64, device);
+                let emit = Tensor::<1, Int>::from_data([0i64].as_slice(), device).reshape([1, 1]);
+                let pos = Tensor::<1, Int>::full([1], 1i64, device);
                 let lg = m.forward_with_cache_static_pre(emit, pos, &mut cache, &sd);
                 // Force a host sync so the warm kernels actually run before we report ready.
                 let _ = lg.reshape([1, vocab]).into_data();
             }
             LoadedModel::Moe35b { model, prec } => {
                 let mut cache = model.model.new_cache_with_capacity(2);
-                let input = Tensor::<B, 2, Int>::from_data([[0i64]], device);
-                let pos0 = Tensor::<B, 2, Int>::from_data([[0i64]], device);
+                let input = Tensor::<2, Int>::from_data([[0i64]], device);
+                let pos0 = Tensor::<2, Int>::from_data([[0i64]], device);
                 let _ = model.forward_last_logits(input, pos0, &mut cache, *prec);
-                let tok = Tensor::<B, 2, Int>::from_data([[0i64]], device);
-                let pos = Tensor::<B, 2, Int>::from_data([[1i64]], device);
+                let tok = Tensor::<2, Int>::from_data([[0i64]], device);
+                let pos = Tensor::<2, Int>::from_data([[1i64]], device);
                 let lg = model.forward_last_logits(tok, pos, &mut cache, *prec);
                 let _ = lg.into_data();
             }
@@ -579,7 +578,9 @@ impl Engine {
         let max_eff = match max_tokens {
             Some(n) => {
                 // checked_add guards a pathological huge max_tokens from overflowing.
-                let overflows = prompt_len.checked_add(n).map_or(true, |sum| sum > self.t_max);
+                let overflows = prompt_len
+                    .checked_add(n)
+                    .map_or(true, |sum| sum > self.t_max);
                 if overflows {
                     sink.user_error(format!(
                         "prompt length {prompt_len} + max_tokens {n} exceeds context limit {} (t_max)",
@@ -614,10 +615,9 @@ impl Engine {
                 let mut cache = m.model.new_cache_with_capacity(total);
 
                 // ---- eager prefill (variable-shape prompt) → last-token logits [1, v] ----
-                let input =
-                    Tensor::<B, 1, Int>::from_data(prompt_ids.as_slice(), device).unsqueeze();
+                let input = Tensor::<1, Int>::from_data(prompt_ids.as_slice(), device).unsqueeze();
                 let pos0 =
-                    Tensor::<B, 1, Int>::arange(0..prompt_len as i64, device).unsqueeze_dim::<2>(0);
+                    Tensor::<1, Int>::arange(0..prompt_len as i64, device).unsqueeze_dim::<2>(0);
                 let logits = m.forward_with_cache(input, None, pos0, &mut cache);
                 let mut last = logits
                     .slice([0..1, (prompt_len - 1)..prompt_len, 0..vocab])
@@ -625,13 +625,19 @@ impl Engine {
 
                 let mut pos_val = prompt_len as i64;
                 loop {
-                    match self.step_token(&last, &params, &mut rng, &mut completion, max_eff, &mut sink)
-                    {
+                    match self.step_token(
+                        &last,
+                        &params,
+                        &mut rng,
+                        &mut completion,
+                        max_eff,
+                        &mut sink,
+                    ) {
                         StepOutcome::Feed(id) => {
                             // FUSED static decode of `id` at device `pos` → next logits [1,1,v].
-                            let emit = Tensor::<B, 1, Int>::from_data([id].as_slice(), device)
+                            let emit = Tensor::<1, Int>::from_data([id].as_slice(), device)
                                 .reshape([1, 1]);
-                            let pos = Tensor::<B, 1, Int>::full([1], pos_val, device);
+                            let pos = Tensor::<1, Int>::full([1], pos_val, device);
                             let lg = m.forward_with_cache_static_pre(emit, pos, &mut cache, &sd);
                             last = lg.reshape([1, vocab]);
                             pos_val += 1;
@@ -647,19 +653,23 @@ impl Engine {
                 let mut cache = model.model.new_cache_with_capacity(total);
 
                 // ---- eager prefill → last-token logits [1, v] ----
-                let input =
-                    Tensor::<B, 1, Int>::from_data(prompt_ids.as_slice(), device).unsqueeze();
-                let pos0 =
-                    Tensor::<B, 1, Int>::arange(0..prompt_len as i64, device).unsqueeze();
+                let input = Tensor::<1, Int>::from_data(prompt_ids.as_slice(), device).unsqueeze();
+                let pos0 = Tensor::<1, Int>::arange(0..prompt_len as i64, device).unsqueeze();
                 let mut last = model.forward_last_logits(input, pos0, &mut cache, prec);
 
                 let mut pos_val = prompt_len as i64;
                 loop {
-                    match self.step_token(&last, &params, &mut rng, &mut completion, max_eff, &mut sink)
-                    {
+                    match self.step_token(
+                        &last,
+                        &params,
+                        &mut rng,
+                        &mut completion,
+                        max_eff,
+                        &mut sink,
+                    ) {
                         StepOutcome::Feed(id) => {
-                            let tok = Tensor::<B, 2, Int>::from_data([[id]], device);
-                            let pos = Tensor::<B, 2, Int>::from_data([[pos_val]], device);
+                            let tok = Tensor::<2, Int>::from_data([[id]], device);
+                            let pos = Tensor::<2, Int>::from_data([[pos_val]], device);
                             last = model.forward_last_logits(tok, pos, &mut cache, prec);
                             pos_val += 1;
                         }
@@ -686,7 +696,7 @@ impl Engine {
     /// the greedy and sampled paths run IDENTICAL prompt/stop handling.
     fn step_token(
         &self,
-        last: &Tensor<B, 2>,
+        last: &Tensor<2>,
         params: &SamplingParams,
         rng: &mut Rng,
         completion: &mut usize,
@@ -720,7 +730,7 @@ impl Engine {
 
     /// Greedy (device argmax) when `temperature <= 0`, else host top-k/top-p categorical
     /// sampling via [`crate::sampling::sample_index`] (identical to vllm_infer's sampler).
-    fn sample(&self, last: &Tensor<B, 2>, p: &SamplingParams, rng: &mut Rng) -> i64 {
+    fn sample(&self, last: &Tensor<2>, p: &SamplingParams, rng: &mut Rng) -> i64 {
         if p.temperature <= 0.0 {
             last.clone()
                 .argmax(1)
@@ -806,9 +816,7 @@ impl ReplySink {
         match self {
             // Legal off-runtime: this is a plain OS thread; blocking here just applies
             // backpressure to a slow client (bounded channel) — it cannot stall tokio.
-            ReplySink::Stream(tx) => tx
-                .blocking_send(EngineEvent::Token(id))
-                .map_err(|_| ()),
+            ReplySink::Stream(tx) => tx.blocking_send(EngineEvent::Token(id)).map_err(|_| ()),
             ReplySink::Oneshot { tx, acc } => {
                 if tx.as_ref().map_or(true, |t| t.is_closed()) {
                     return Err(());
@@ -918,14 +926,17 @@ fn load_eos_list(dir: &PathBuf, tokenizer: &Qwen3Tokenizer) -> Result<Vec<i64>, 
         .and_then(|n| match n {
             serde_json::Value::String(s) => Some(s.clone()),
             // Some configs store {"content": "<|im_end|>"}.
-            serde_json::Value::Object(o) => {
-                o.get("content").and_then(|c| c.as_str()).map(str::to_string)
-            }
+            serde_json::Value::Object(o) => o
+                .get("content")
+                .and_then(|c| c.as_str())
+                .map(str::to_string),
             _ => None,
         })
         .ok_or_else(|| EngineError::Eos("tokenizer_config.json has no eos_token".to_string()))?;
     let id = tokenizer.token_to_id(&eos_str).ok_or_else(|| {
-        EngineError::Eos(format!("eos_token {eos_str:?} not found in tokenizer vocab"))
+        EngineError::Eos(format!(
+            "eos_token {eos_str:?} not found in tokenizer vocab"
+        ))
     })?;
     Ok(vec![id as i64])
 }

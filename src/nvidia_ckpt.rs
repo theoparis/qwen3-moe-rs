@@ -14,7 +14,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use memmap2::MmapOptions;
-use safetensors::{tensor::Metadata, Dtype, SafeTensors};
+use safetensors::{Dtype, SafeTensors, tensor::Metadata};
 
 use crate::nvfp4::{dequant_nvfp4, repack_kmajor_to_outmajor};
 #[cfg(feature = "cuda")]
@@ -107,6 +107,184 @@ impl<'a> ShardReader<'a> {
             shape: info.shape.clone(),
             data,
         })
+    }
+
+    /// Slice a single expert's weight sub-tensor directly out of the mmapped shard, without
+    /// materializing the full fused `[num_experts, ...]` tensor. Requires `key`'s tensor to be
+    /// row-major contiguous with experts as dimension 0 (true for `experts.gate_up_proj` /
+    /// `experts.down_proj` in this checkpoint format: `[num_experts, hidden, 2*inter]` /
+    /// `[num_experts, inter, hidden]`). This is the streaming-load primitive from
+    /// `docs/MEMORY_STREAMING_PLAN.md` Phase 1: no offline repack needed, the on-disk safetensors
+    /// shard already has the layout we want, so an on-demand mmap byte-range read is enough.
+    pub fn read_expert_slice(&mut self, key: &str, expert_idx: usize) -> Result<RawTensor, String> {
+        let shard = self
+            .index
+            .get(key)
+            .ok_or_else(|| format!("{key} missing from weight_map"))?
+            .clone();
+        if !self.shards.contains_key(&shard) {
+            let data = self.load_shard(&shard)?;
+            self.shards.insert(shard.clone(), data);
+        }
+        let shard_data = self.shards.get(&shard).unwrap();
+        let info = shard_data.metadata.info(key).ok_or_else(|| {
+            format!(
+                "read tensor {key} from {}: tensor not found",
+                shard_data.path.display()
+            )
+        })?;
+        let num_experts = *info
+            .shape
+            .first()
+            .ok_or_else(|| format!("{key}: expected a rank>=1 [num_experts, ...] tensor"))?;
+        if expert_idx >= num_experts {
+            return Err(format!(
+                "{key}: expert_idx {expert_idx} out of range (num_experts={num_experts})"
+            ));
+        }
+        let tensor_start = shard_data
+            .data_start
+            .checked_add(info.data_offsets.0)
+            .ok_or_else(|| {
+                format!(
+                    "{key}: data offset overflow in {}",
+                    shard_data.path.display()
+                )
+            })?;
+        let tensor_end = shard_data
+            .data_start
+            .checked_add(info.data_offsets.1)
+            .ok_or_else(|| {
+                format!(
+                    "{key}: data offset overflow in {}",
+                    shard_data.path.display()
+                )
+            })?;
+        let tensor_len = tensor_end - tensor_start;
+        if tensor_len % num_experts != 0 {
+            return Err(format!(
+                "{key}: tensor byte length {tensor_len} not evenly divisible by num_experts {num_experts}"
+            ));
+        }
+        let stride = tensor_len / num_experts;
+        let start = tensor_start + expert_idx * stride;
+        let end = start + stride;
+        let data = shard_data
+            .mmap
+            .get(start..end)
+            .ok_or_else(|| {
+                format!(
+                    "{key}: expert {expert_idx} byte range out of bounds in {}",
+                    shard_data.path.display()
+                )
+            })?
+            .to_vec();
+        let mut shape = info.shape.clone();
+        shape[0] = 1;
+        Ok(RawTensor {
+            dtype: info.dtype,
+            shape,
+            data,
+        })
+    }
+
+    /// Batched form of [`Self::read_expert_slice`]: does the shard-load + header-lookup exactly
+    /// once for `key`, then slices every requested `expert_idx` out of the same mmapped region in
+    /// one pass (ascending order, so any OS readahead/page-cache locality benefit is not undone by
+    /// jumping around per the router's arbitrary expert order). Added because per-token streamed
+    /// decode calls `read_expert_slice` ~640 times (`docs/MEMORY_STREAMING_PLAN.md`'s measured
+    /// bottleneck: ~4.4ms fixed overhead/call dominates the actual bytes moved) -- batching removes
+    /// the redundant shard-hashmap + safetensors-header lookup per expert, leaving just the mmap
+    /// slice + copy per expert.
+    pub fn read_expert_slices(
+        &mut self,
+        key: &str,
+        expert_indices: &[usize],
+    ) -> Result<Vec<(usize, RawTensor)>, String> {
+        if expert_indices.is_empty() {
+            return Ok(Vec::new());
+        }
+        let shard = self
+            .index
+            .get(key)
+            .ok_or_else(|| format!("{key} missing from weight_map"))?
+            .clone();
+        if !self.shards.contains_key(&shard) {
+            let data = self.load_shard(&shard)?;
+            self.shards.insert(shard.clone(), data);
+        }
+        let shard_data = self.shards.get(&shard).unwrap();
+        let info = shard_data.metadata.info(key).ok_or_else(|| {
+            format!(
+                "read tensor {key} from {}: tensor not found",
+                shard_data.path.display()
+            )
+        })?;
+        let num_experts = *info
+            .shape
+            .first()
+            .ok_or_else(|| format!("{key}: expected a rank>=1 [num_experts, ...] tensor"))?;
+        let tensor_start = shard_data
+            .data_start
+            .checked_add(info.data_offsets.0)
+            .ok_or_else(|| {
+                format!(
+                    "{key}: data offset overflow in {}",
+                    shard_data.path.display()
+                )
+            })?;
+        let tensor_end = shard_data
+            .data_start
+            .checked_add(info.data_offsets.1)
+            .ok_or_else(|| {
+                format!(
+                    "{key}: data offset overflow in {}",
+                    shard_data.path.display()
+                )
+            })?;
+        let tensor_len = tensor_end - tensor_start;
+        if tensor_len % num_experts != 0 {
+            return Err(format!(
+                "{key}: tensor byte length {tensor_len} not evenly divisible by num_experts {num_experts}"
+            ));
+        }
+        let stride = tensor_len / num_experts;
+
+        let mut sorted: Vec<usize> = expert_indices.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+
+        let mut out = Vec::with_capacity(sorted.len());
+        for expert_idx in sorted {
+            if expert_idx >= num_experts {
+                return Err(format!(
+                    "{key}: expert_idx {expert_idx} out of range (num_experts={num_experts})"
+                ));
+            }
+            let start = tensor_start + expert_idx * stride;
+            let end = start + stride;
+            let data = shard_data
+                .mmap
+                .get(start..end)
+                .ok_or_else(|| {
+                    format!(
+                        "{key}: expert {expert_idx} byte range out of bounds in {}",
+                        shard_data.path.display()
+                    )
+                })?
+                .to_vec();
+            let mut shape = info.shape.clone();
+            shape[0] = 1;
+            out.push((
+                expert_idx,
+                RawTensor {
+                    dtype: info.dtype,
+                    shape,
+                    data,
+                },
+            ));
+        }
+        Ok(out)
     }
 
     fn load_shard(&self, shard: &str) -> Result<ShardData, String> {
@@ -453,12 +631,12 @@ pub fn fuse_expert_nvfp4_parts(
 }
 
 #[cfg(feature = "cuda")]
-pub fn quantize_dequantized_expert_to_fp8<B: burn::prelude::Backend>(
+pub fn quantize_dequantized_expert_to_fp8(
     parts: &[ExpertNvfp4Parts],
     h: usize,
     i: usize,
-    device: &B::Device,
-) -> ExpertFp8<B> {
+    device: &Device,
+) -> ExpertFp8 {
     let e = parts.len();
     let mut q_gu = Vec::with_capacity(e * h * i * 2);
     let mut s_gu = Vec::with_capacity(e * i * 2);
@@ -490,21 +668,21 @@ pub fn quantize_dequantized_expert_to_fp8<B: burn::prelude::Backend>(
         s_dn.extend(s);
     }
     ExpertFp8 {
-        q_gu: burn::tensor::Tensor::<B, 3, burn::tensor::Int>::from_data_dtype(
-            burn::tensor::TensorData::new(q_gu, [e, h, i * 2]),
+        q_gu: burn::tensor::Tensor::<3, Int>::from_data(
+            burn::tensor::TensorData::new(q_gu, ([e, h, i * 2])),
             device,
             burn::tensor::DType::I8,
         ),
-        s_gu: burn::tensor::Tensor::<B, 2>::from_data(
+        s_gu: burn::tensor::Tensor::<2>::from_data(
             burn::tensor::TensorData::new(s_gu, [e, i * 2]),
             device,
         ),
-        q_dn: burn::tensor::Tensor::<B, 3, burn::tensor::Int>::from_data_dtype(
-            burn::tensor::TensorData::new(q_dn, [e, i, h]),
+        q_dn: burn::tensor::Tensor::<3, Int>::from_data(
+            burn::tensor::TensorData::new(q_dn, ([e, i, h])),
             device,
             burn::tensor::DType::I8,
         ),
-        s_dn: burn::tensor::Tensor::<B, 2>::from_data(
+        s_dn: burn::tensor::Tensor::<2>::from_data(
             burn::tensor::TensorData::new(s_dn, [e, h]),
             device,
         ),

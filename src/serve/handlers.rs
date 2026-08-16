@@ -242,7 +242,11 @@ pub fn validate_tools(tools: &OrderedJson) -> Result<(), ApiFailure> {
         }
         match ordered_field(f, "name") {
             Some(OrderedJson::String(n)) if !n.is_empty() => {}
-            _ => return bad(&format!("tools[{i}].function.name must be a non-empty string")),
+            _ => {
+                return bad(&format!(
+                    "tools[{i}].function.name must be a non-empty string"
+                ));
+            }
         }
     }
     Ok(())
@@ -568,7 +572,11 @@ impl ChunkCtx {
         if self.include_usage { Some(None) } else { None }
     }
 
-    fn base_chunk(&self, choices: Vec<ChunkChoice>, usage: Option<Option<Usage>>) -> ChatCompletionChunk {
+    fn base_chunk(
+        &self,
+        choices: Vec<ChunkChoice>,
+        usage: Option<Option<Usage>>,
+    ) -> ChatCompletionChunk {
         ChatCompletionChunk {
             id: self.id.clone(),
             object: "chat.completion.chunk".to_string(),
@@ -714,13 +722,13 @@ pub fn gen_id(prefix: &str, counter: u64, nanos: u128) -> String {
 // ===========================================================================
 
 #[cfg(feature = "cuda")]
-pub use engine_wiring::{build_router, ServeState};
+pub use engine_wiring::{ServeState, build_router};
 
 #[cfg(feature = "cuda")]
 mod engine_wiring {
     use std::convert::Infallible;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
 
     use axum::body::Bytes;
@@ -848,10 +856,7 @@ mod engine_wiring {
     }
 
     // ---- POST /v1/chat/completions ----
-    async fn chat_completions(
-        State(state): State<Arc<ServeState>>,
-        body: Bytes,
-    ) -> Response {
+    async fn chat_completions(State(state): State<Arc<ServeState>>, body: Bytes) -> Response {
         // Parse ONCE into the typed request (validation / params).
         let req: ChatCompletionRequest = match serde_json::from_slice(&body) {
             Ok(r) => r,
@@ -1012,11 +1017,7 @@ mod engine_wiring {
     /// the bounded frame channel — this is where a slow client back-pressures the
     /// engine) and record it for the non-stream collapse. Returns `false` when
     /// the client is gone (send failed) — the caller stops draining.
-    async fn deliver(
-        segs: Vec<Segment>,
-        out: &mut Vec<Segment>,
-        sink: &Option<SegSink>,
-    ) -> bool {
+    async fn deliver(segs: Vec<Segment>, out: &mut Vec<Segment>, sink: &Option<SegSink>) -> bool {
         for s in segs {
             if let Some(k) = sink {
                 if k.tx.send(Ok((k.map)(&s))).await.is_err() {
@@ -1200,7 +1201,12 @@ mod engine_wiring {
 
                 if res.cancelled {
                     log_request(
-                        "chat", &id, true, res.prompt_tokens, res.completion_tokens, started,
+                        "chat",
+                        &id,
+                        true,
+                        res.prompt_tokens,
+                        res.completion_tokens,
+                        started,
                         "cancelled",
                     );
                     return;
@@ -1213,23 +1219,35 @@ mod engine_wiring {
                         .await;
                     let _ = ftx.send(Ok(sse_done())).await;
                     log_request(
-                        "chat", &id, true, res.prompt_tokens, res.completion_tokens, started,
+                        "chat",
+                        &id,
+                        true,
+                        res.prompt_tokens,
+                        res.completion_tokens,
+                        started,
                         "error",
                     );
                     return;
                 }
 
-                let _ = ftx.send(Ok(sse_event(&ctx.finish_chunk(res.finish_reason)))).await;
+                let _ = ftx
+                    .send(Ok(sse_event(&ctx.finish_chunk(res.finish_reason))))
+                    .await;
                 if include_usage {
-                    let _ = ftx
-                        .send(Ok(sse_event(
+                    let _ =
+                        ftx.send(Ok(sse_event(
                             &ctx.usage_chunk(usage(res.prompt_tokens, res.completion_tokens)),
                         )))
                         .await;
                 }
                 let _ = ftx.send(Ok(sse_done())).await;
                 log_request(
-                    "chat", &id, true, res.prompt_tokens, res.completion_tokens, started,
+                    "chat",
+                    &id,
+                    true,
+                    res.prompt_tokens,
+                    res.completion_tokens,
+                    started,
                     res.finish_reason,
                 );
             });
@@ -1241,7 +1259,12 @@ mod engine_wiring {
             }
             let (content, reasoning) = collapse_segments(&res.segments);
             log_request(
-                "chat", &id, false, res.prompt_tokens, res.completion_tokens, started,
+                "chat",
+                &id,
+                false,
+                res.prompt_tokens,
+                res.completion_tokens,
+                started,
                 res.finish_reason,
             );
             Json(ChatCompletionResponse {
@@ -1300,17 +1323,19 @@ mod engine_wiring {
             let mk_chunk = {
                 let id = id.clone();
                 let model = model.clone();
-                move |text: String, finish_reason: Option<String>, u: Option<Usage>| CompletionResponse {
-                    id: id.clone(),
-                    object: "text_completion".to_string(),
-                    created,
-                    model: model.clone(),
-                    choices: vec![CompletionChoice {
-                        text,
-                        index: 0,
-                        finish_reason,
-                    }],
-                    usage: u,
+                move |text: String, finish_reason: Option<String>, u: Option<Usage>| {
+                    CompletionResponse {
+                        id: id.clone(),
+                        object: "text_completion".to_string(),
+                        created,
+                        model: model.clone(),
+                        choices: vec![CompletionChoice {
+                            text,
+                            index: 0,
+                            finish_reason,
+                        }],
+                        usage: u,
+                    }
                 }
             };
             tokio::spawn(async move {
@@ -1329,8 +1354,13 @@ mod engine_wiring {
 
                 if res.cancelled {
                     log_request(
-                        "completion", &id, true, res.prompt_tokens, res.completion_tokens,
-                        started, "cancelled",
+                        "completion",
+                        &id,
+                        true,
+                        res.prompt_tokens,
+                        res.completion_tokens,
+                        started,
+                        "cancelled",
                     );
                     return;
                 }
@@ -1340,8 +1370,13 @@ mod engine_wiring {
                         .await;
                     let _ = ftx.send(Ok(sse_done())).await;
                     log_request(
-                        "completion", &id, true, res.prompt_tokens, res.completion_tokens,
-                        started, "error",
+                        "completion",
+                        &id,
+                        true,
+                        res.prompt_tokens,
+                        res.completion_tokens,
+                        started,
+                        "error",
                     );
                     return;
                 }
@@ -1354,7 +1389,12 @@ mod engine_wiring {
                 let _ = ftx.send(Ok(sse_event(&fin))).await;
                 let _ = ftx.send(Ok(sse_done())).await;
                 log_request(
-                    "completion", &id, true, res.prompt_tokens, res.completion_tokens, started,
+                    "completion",
+                    &id,
+                    true,
+                    res.prompt_tokens,
+                    res.completion_tokens,
+                    started,
                     res.finish_reason,
                 );
             });
@@ -1366,7 +1406,12 @@ mod engine_wiring {
             }
             let text = text_of(&res.segments);
             log_request(
-                "completion", &id, false, res.prompt_tokens, res.completion_tokens, started,
+                "completion",
+                &id,
+                false,
+                res.prompt_tokens,
+                res.completion_tokens,
+                started,
                 res.finish_reason,
             );
             Json(CompletionResponse {
@@ -1442,8 +1487,7 @@ mod tests {
     #[test]
     fn think_initial_in_think_routes_reasoning_then_content() {
         // Template opened `<think>\n` ⇒ start InThink. Reasoning, close, content.
-        let (content, reasoning) =
-            run_splitter(true, &["let me think", "</think>", "the answer"]);
+        let (content, reasoning) = run_splitter(true, &["let me think", "</think>", "the answer"]);
         assert_eq!(reasoning, "let me think");
         assert_eq!(content, "the answer");
     }
@@ -1451,8 +1495,7 @@ mod tests {
     #[test]
     fn think_close_tag_split_across_chunks_held_back() {
         // `</think>` arrives in pieces; no fragment may leak into either field.
-        let (content, reasoning) =
-            run_splitter(true, &["reason", "</", "thi", "nk>", "answer"]);
+        let (content, reasoning) = run_splitter(true, &["reason", "</", "thi", "nk>", "answer"]);
         assert_eq!(reasoning, "reason");
         assert_eq!(content, "answer");
     }
@@ -1503,8 +1546,7 @@ mod tests {
 
     #[test]
     fn think_open_tag_split_at_start() {
-        let (content, reasoning) =
-            run_splitter(false, &["<thi", "nk>reason</think>ans"]);
+        let (content, reasoning) = run_splitter(false, &["<thi", "nk>reason</think>ans"]);
         assert_eq!(reasoning, "reason");
         assert_eq!(content, "ans");
     }
@@ -1808,8 +1850,7 @@ mod tests {
     #[test]
     fn load_sampling_defaults_reads_generation_config() {
         // The in-repo 30B instruct dir ships temp 0.7 / top_p 0.8 / top_k 20.
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("models/qwen3-30b-a3b-instruct-2507");
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("models/qwen3-30b-a3b-instruct-2507");
         if dir.join("generation_config.json").exists() {
             let d = load_sampling_defaults(&dir);
             assert!((d.temperature - 0.7).abs() < 1e-6, "temp {}", d.temperature);

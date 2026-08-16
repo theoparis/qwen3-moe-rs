@@ -317,7 +317,8 @@ impl<R: CubeRuntime> Operation<Fr<R>> for CubeCustomOpExec<R> {
 
         // 4. Cross-validate each output against its declaration (rule 2), then register it back into
         //    the stream routed by kind (rule 4).
-        for (idx, (actual, (ir, kind))) in outputs.into_iter().zip(self.outputs.iter()).enumerate() {
+        for (idx, (actual, (ir, kind))) in outputs.into_iter().zip(self.outputs.iter()).enumerate()
+        {
             validate_output(self.name, idx, &actual, ir);
             match kind {
                 HandleKind::Float => {

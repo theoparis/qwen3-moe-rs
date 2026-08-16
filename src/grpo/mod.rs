@@ -15,14 +15,14 @@ mod rollout;
 mod trainer;
 
 pub use logprob::token_logprobs;
-pub use loss::{grpo_loss, group_norm_advantage, GrpoMetrics};
+pub use loss::{GrpoMetrics, group_norm_advantage, grpo_loss};
 pub use reward::{ManimReward, RewardFn};
 pub use rollout::{
-    group_sample, group_sample_cached, group_sample_cached_device, group_sample_cached_device_loop,
-    group_sample_cached_device_static, group_sample_cached_shrink, group_sample_padded, RolloutConfig,
-    Rollouts,
+    RolloutConfig, Rollouts, group_sample, group_sample_cached, group_sample_cached_device,
+    group_sample_cached_device_loop, group_sample_cached_device_static, group_sample_cached_shrink,
+    group_sample_padded,
 };
-pub use trainer::{grpo_step, grpo_step_ragged, GrpoTrainConfig, StepReport};
+pub use trainer::{GrpoTrainConfig, StepReport, grpo_step, grpo_step_ragged};
 
 /// How the per-token policy loss is reduced to a scalar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]

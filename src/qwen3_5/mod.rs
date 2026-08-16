@@ -10,71 +10,54 @@ use std::collections::BTreeMap;
 
 use burn::{
     module::{
-        AutodiffModule, ConstantRecord, Content, Devices, Ignored, Module, ModuleDisplay,
-        ModuleDisplayDefault, ModuleMapper, ModuleVisitor, Param, ParamId,
+        AutodiffModule, Content, Devices, Module, ModuleDisplay, ModuleDisplayDefault,
+        ModuleMapper, ModuleVisitor, Param, ParamId,
     },
     nn::{Embedding, Linear, RmsNorm},
-    prelude::Backend,
+    prelude::Device,
     tensor::{
-        DType, Distribution, IndexingUpdateOp, Int, Shape, Tensor, TensorData,
-        activation::sigmoid,
-        activation::silu,
-        activation::softmax,
-        backend::AutodiffBackend,
-        module::attention_fallback as attention,
-        ops::{AttentionModuleOptions, Device},
+        DType, Distribution, IndexingUpdateOp, Int, Shape, Tensor, TensorData, activation::sigmoid,
+        activation::silu, activation::softmax, module::attention_fallback as attention,
+        ops::AttentionModuleOptions,
     },
 };
 
 use crate::{
     cache::{GdnStateCache, KVCache, Qwen3_5HybridCache, Qwen3_5HybridLayerCache},
+    expert_stream::ExpertSlotPool,
     linear2d::{Precision, linear3},
     nvfp4_linear::QuantLinear,
     rope::{apply_rope_partial, compute_rope_embeddings, compute_rope_embeddings_pre},
 };
 
 #[cfg(feature = "cuda")]
-pub trait Qwen3_5DenseQuantBackend:
-    Backend
-    + crate::w8a16::W8A16GemvBackend
-    + crate::nvfp4::Nvfp4GemvBackend
-    + crate::flash_decode::FlashDecodeBackend
-    + crate::moe_grouped::Fused35MoeBackend
-{
-}
+pub trait Qwen3_5DenseQuantBackend {}
 
 #[cfg(feature = "cuda")]
-impl<T> Qwen3_5DenseQuantBackend for T where
-    T: Backend
-        + crate::w8a16::W8A16GemvBackend
-        + crate::nvfp4::Nvfp4GemvBackend
-        + crate::flash_decode::FlashDecodeBackend
-        + crate::moe_grouped::Fused35MoeBackend
-{
-}
+impl Qwen3_5DenseQuantBackend for () {}
 
 #[cfg(not(feature = "cuda"))]
-pub trait Qwen3_5DenseQuantBackend: Backend {}
+pub trait Qwen3_5DenseQuantBackend {}
 
 #[cfg(not(feature = "cuda"))]
-impl<T: Backend> Qwen3_5DenseQuantBackend for T {}
+impl Qwen3_5DenseQuantBackend for () {}
 
 #[cfg(feature = "cuda")]
 const FLASH_MIN_CTX: usize = 1024;
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cubecl-gpu")]
 const QWEN35_FUSED_MOE_MAX_T: usize = 16;
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cubecl-gpu")]
 static QWEN35_FUSED_MOE_ENABLED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(true);
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cubecl-gpu")]
 pub fn set_qwen35_fused_moe_enabled(enabled: bool) {
     QWEN35_FUSED_MOE_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(feature = "cubecl-gpu")]
 fn qwen35_fused_moe_enabled() -> bool {
     QWEN35_FUSED_MOE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -89,14 +72,14 @@ fn flash_decode_n_splits(sk: usize) -> usize {
 }
 
 #[derive(Clone, Debug)]
-pub struct QuantSidecar<B: Backend>(pub Option<QuantLinear<B>>);
+pub struct QuantSidecar(pub Option<QuantLinear>);
 
 #[derive(Clone, Debug)]
-pub struct ExpertFp8<B: Backend> {
-    pub q_gu: Tensor<B, 3, Int>,
-    pub s_gu: Tensor<B, 2>,
-    pub q_dn: Tensor<B, 3, Int>,
-    pub s_dn: Tensor<B, 2>,
+pub struct ExpertFp8 {
+    pub q_gu: Tensor<3, Int>,
+    pub s_gu: Tensor<2>,
+    pub q_dn: Tensor<3, Int>,
+    pub s_dn: Tensor<2>,
     pub e: usize,
     pub h: usize,
     pub i: usize,
@@ -124,37 +107,37 @@ pub struct ExpertNvfp4Parts {
 /// from per-expert checkpoint bytes, then may replace the bf16 params with tiny placeholders. Forward
 /// wiring is intentionally left for B5.3.
 #[derive(Clone, Debug)]
-pub struct ExpertNvfp4<B: Backend> {
+pub struct ExpertNvfp4 {
     /// Output-major fused gate/up E2M1 bytes `[E, H, I]` for logical `K=H, N=2I`.
-    pub qw_gu: Tensor<B, 3, Int>,
+    pub qw_gu: Tensor<3, Int>,
     /// Fused gate/up E4M3 block-scale bytes `[E, 2I, H/16]`.
-    pub bs_gu: Tensor<B, 3, Int>,
+    pub bs_gu: Tensor<3, Int>,
     /// Per-expert, per-half ModelOpt `weight_scale_2` values `[E,2]`: gate then up.
-    pub gscale_gu: Tensor<B, 2>,
+    pub gscale_gu: Tensor<2>,
     /// Output-major down E2M1 bytes `[E, I, H/2]` for logical `K=I, N=H`.
-    pub qw_dn: Tensor<B, 3, Int>,
+    pub qw_dn: Tensor<3, Int>,
     /// Down E4M3 block-scale bytes `[E, H, I/16]`.
-    pub bs_dn: Tensor<B, 3, Int>,
+    pub bs_dn: Tensor<3, Int>,
     /// Per-expert down ModelOpt `weight_scale_2` values `[E]`.
-    pub gscale_dn: Tensor<B, 1>,
+    pub gscale_dn: Tensor<1>,
     pub e: usize,
     pub h: usize,
     pub i: usize,
 }
 
 #[derive(Clone, Debug)]
-pub struct ExpertNvfp4Sidecar<B: Backend>(pub Option<ExpertNvfp4<B>>);
+pub struct ExpertNvfp4Sidecar(pub Option<ExpertNvfp4>);
 
 #[derive(Clone, Debug)]
-pub struct ExpertQuantSidecar<B: Backend>(pub Option<ExpertFp8<B>>);
+pub struct ExpertQuantSidecar(pub Option<ExpertFp8>);
 
-impl<B: Backend> ExpertNvfp4<B> {
+impl ExpertNvfp4 {
     /// Stack already-repacked per-expert NVFP4 host parts onto `device`.
     pub fn from_expert_parts(
         parts: Vec<ExpertNvfp4Parts>,
         h: usize,
         i: usize,
-        device: &Device<B>,
+        device: &Device,
     ) -> Self {
         let e = parts.len();
         assert!(e > 0, "ExpertNvfp4::from_expert_parts: no experts");
@@ -225,28 +208,24 @@ impl<B: Backend> ExpertNvfp4<B> {
         }
 
         Self {
-            qw_gu: Tensor::<B, 3, Int>::from_data_dtype(
+            qw_gu: Tensor::<3, Int>::from_data(
                 TensorData::new(qw_gu, [e, h, i]),
-                device,
-                DType::I8,
+                (device, DType::I8),
             ),
-            bs_gu: Tensor::<B, 3, Int>::from_data_dtype(
+            bs_gu: Tensor::<3, Int>::from_data(
                 TensorData::new(bs_gu, [e, i * 2, h / 16]),
-                device,
-                DType::I8,
+                (device, DType::I8),
             ),
-            gscale_gu: Tensor::<B, 2>::from_data(TensorData::new(gscale_gu, [e, 2]), device),
-            qw_dn: Tensor::<B, 3, Int>::from_data_dtype(
+            gscale_gu: Tensor::<2>::from_data(TensorData::new(gscale_gu, [e, 2]), device),
+            qw_dn: Tensor::<3, Int>::from_data(
                 TensorData::new(qw_dn, [e, i, h / 2]),
-                device,
-                DType::I8,
+                (device, DType::I8),
             ),
-            bs_dn: Tensor::<B, 3, Int>::from_data_dtype(
+            bs_dn: Tensor::<3, Int>::from_data(
                 TensorData::new(bs_dn, [e, h, i / 16]),
-                device,
-                DType::I8,
+                (device, DType::I8),
             ),
-            gscale_dn: Tensor::<B, 1>::from_data(TensorData::new(gscale_dn, [e]), device),
+            gscale_dn: Tensor::<1>::from_data(TensorData::new(gscale_dn, [e]), device),
             e,
             h,
             i,
@@ -254,179 +233,133 @@ impl<B: Backend> ExpertNvfp4<B> {
     }
 }
 
-impl<B: Backend> Module<B> for QuantSidecar<B> {
-    type Record = ConstantRecord;
+impl Module for QuantSidecar {
+    fn visit<V: ModuleVisitor>(&self, _visitor: &mut V) {}
 
-    fn visit<V: ModuleVisitor<B>>(&self, _visitor: &mut V) {}
-
-    fn map<M: ModuleMapper<B>>(self, _mapper: &mut M) -> Self {
+    fn map<M: ModuleMapper>(self, _mapper: &mut M) -> Self {
         self
     }
 
-    fn load_record(self, _record: Self::Record) -> Self {
+    fn to_device(self, _: &Device) -> Self {
         self
     }
 
-    fn into_record(self) -> Self::Record {
-        ConstantRecord::new()
-    }
-
-    fn to_device(self, _: &Device<B>) -> Self {
+    fn fork(self, _: &Device) -> Self {
         self
     }
 
-    fn fork(self, _: &Device<B>) -> Self {
-        self
-    }
-
-    fn collect_devices(&self, devices: Devices<B>) -> Devices<B> {
+    fn collect_devices(&self, devices: Devices) -> Devices {
         devices
     }
 }
 
-impl<B: AutodiffBackend> AutodiffModule<B> for QuantSidecar<B> {
-    type InnerModule = QuantSidecar<B::InnerBackend>;
-
-    fn valid(&self) -> Self::InnerModule {
+impl AutodiffModule for QuantSidecar {
+    fn valid(&self) -> Self {
         QuantSidecar(None)
     }
 
-    fn from_inner(_module: Self::InnerModule) -> Self {
+    fn from_inner(_module: Self) -> Self {
         QuantSidecar(None)
     }
 }
 
-impl<B: Backend> ModuleDisplayDefault for QuantSidecar<B> {
+impl ModuleDisplayDefault for QuantSidecar {
     fn content(&self, content: Content) -> Option<Content> {
         let state = if self.0.is_some() { "Some" } else { "None" };
         content.add_formatted(&state).optional()
     }
 }
 
-impl<B: Backend> ModuleDisplay for QuantSidecar<B> {}
+impl ModuleDisplay for QuantSidecar {}
 
-impl<B: Backend> Module<B> for ExpertQuantSidecar<B> {
-    type Record = ConstantRecord;
+impl Module for ExpertQuantSidecar {
+    fn visit<V: ModuleVisitor>(&self, _visitor: &mut V) {}
 
-    fn visit<V: ModuleVisitor<B>>(&self, _visitor: &mut V) {}
-
-    fn map<M: ModuleMapper<B>>(self, _mapper: &mut M) -> Self {
+    fn map<M: ModuleMapper>(self, _mapper: &mut M) -> Self {
         self
     }
 
-    fn load_record(self, _record: Self::Record) -> Self {
+    fn to_device(self, _: &Device) -> Self {
         self
     }
 
-    fn into_record(self) -> Self::Record {
-        ConstantRecord::new()
-    }
-
-    fn to_device(self, _: &Device<B>) -> Self {
+    fn fork(self, _: &Device) -> Self {
         self
     }
 
-    fn fork(self, _: &Device<B>) -> Self {
-        self
-    }
-
-    fn collect_devices(&self, devices: Devices<B>) -> Devices<B> {
+    fn collect_devices(&self, devices: Devices) -> Devices {
         devices
     }
 }
 
-impl<B: AutodiffBackend> AutodiffModule<B> for ExpertQuantSidecar<B> {
-    type InnerModule = ExpertQuantSidecar<B::InnerBackend>;
-
-    fn valid(&self) -> Self::InnerModule {
+impl AutodiffModule for ExpertQuantSidecar {
+    fn valid(&self) -> Self {
         ExpertQuantSidecar(None)
     }
 
-    fn from_inner(_module: Self::InnerModule) -> Self {
+    fn from_inner(_module: Self) -> Self {
         ExpertQuantSidecar(None)
     }
 }
 
-impl<B: Backend> ModuleDisplayDefault for ExpertQuantSidecar<B> {
+impl ModuleDisplayDefault for ExpertQuantSidecar {
     fn content(&self, content: Content) -> Option<Content> {
         let state = if self.0.is_some() { "Some" } else { "None" };
         content.add_formatted(&state).optional()
     }
 }
 
-impl<B: Backend> ModuleDisplay for ExpertQuantSidecar<B> {}
+impl ModuleDisplay for ExpertQuantSidecar {}
 
-impl<B: Backend> Module<B> for ExpertNvfp4Sidecar<B> {
-    type Record = ConstantRecord;
+impl Module for ExpertNvfp4Sidecar {
+    fn visit<V: ModuleVisitor>(&self, _visitor: &mut V) {}
 
-    fn visit<V: ModuleVisitor<B>>(&self, _visitor: &mut V) {}
-
-    fn map<M: ModuleMapper<B>>(self, _mapper: &mut M) -> Self {
+    fn map<M: ModuleMapper>(self, _mapper: &mut M) -> Self {
         self
     }
 
-    fn load_record(self, _record: Self::Record) -> Self {
+    fn to_device(self, _: &Device) -> Self {
         self
     }
 
-    fn into_record(self) -> Self::Record {
-        ConstantRecord::new()
-    }
-
-    fn to_device(self, _: &Device<B>) -> Self {
+    fn fork(self, _: &Device) -> Self {
         self
     }
 
-    fn fork(self, _: &Device<B>) -> Self {
-        self
-    }
-
-    fn collect_devices(&self, devices: Devices<B>) -> Devices<B> {
+    fn collect_devices(&self, devices: Devices) -> Devices {
         devices
     }
 }
 
-impl<B: AutodiffBackend> AutodiffModule<B> for ExpertNvfp4Sidecar<B> {
-    type InnerModule = ExpertNvfp4Sidecar<B::InnerBackend>;
-
-    fn valid(&self) -> Self::InnerModule {
+impl AutodiffModule for ExpertNvfp4Sidecar {
+    fn valid(&self) -> Self {
         ExpertNvfp4Sidecar(None)
     }
 
-    fn from_inner(_module: Self::InnerModule) -> Self {
+    fn from_inner(_module: Self) -> Self {
         ExpertNvfp4Sidecar(None)
     }
 }
 
-impl<B: Backend> ModuleDisplayDefault for ExpertNvfp4Sidecar<B> {
+impl ModuleDisplayDefault for ExpertNvfp4Sidecar {
     fn content(&self, content: Content) -> Option<Content> {
         let state = if self.0.is_some() { "Some" } else { "None" };
         content.add_formatted(&state).optional()
     }
 }
 
-impl<B: Backend> ModuleDisplay for ExpertNvfp4Sidecar<B> {}
+impl ModuleDisplay for ExpertNvfp4Sidecar {}
 
-#[cfg(feature = "cuda")]
-fn ql3<B: Qwen3_5DenseQuantBackend>(
-    q: &QuantSidecar<B>,
-    lin: &Linear<B>,
-    x: Tensor<B, 3>,
-    prec: Precision,
-) -> Tensor<B, 3> {
+#[cfg(feature = "cubecl-gpu")]
+fn ql3(q: &QuantSidecar, lin: &Linear, x: Tensor<3>, prec: Precision) -> Tensor<3> {
     match &q.0 {
         Some(ql) => ql.forward3(x.cast(DType::F32)),
         None => linear3(lin, x, prec),
     }
 }
 
-#[cfg(not(feature = "cuda"))]
-fn ql3<B: Backend>(
-    q: &QuantSidecar<B>,
-    lin: &Linear<B>,
-    x: Tensor<B, 3>,
-    prec: Precision,
-) -> Tensor<B, 3> {
+#[cfg(not(feature = "cubecl-gpu"))]
+fn ql3(q: &QuantSidecar, lin: &Linear, x: Tensor<3>, prec: Precision) -> Tensor<3> {
     let _ = q;
     linear3(lin, x, prec)
 }
@@ -582,9 +515,9 @@ impl Qwen3_5MoeConfig {
         Ok(())
     }
 
-    pub fn init_causal_lm<B: Backend>(&self, device: &B::Device) -> Qwen3_5MoeForCausalLM<B> {
+    pub fn init_causal_lm(&self, device: &Device) -> Qwen3_5MoeForCausalLM {
         let model = Qwen3_5Model {
-            config: Ignored(self.clone()),
+            config: (self.clone()),
             embed_tokens: lazy_embedding(self.vocab_size, self.hidden_size, device),
             layers: self
                 .layer_types
@@ -618,7 +551,7 @@ impl Qwen3_5MoeConfig {
         }
     }
 
-    fn init_gdn_layer<B: Backend>(&self, device: &B::Device) -> Qwen3_5GdnLayer<B> {
+    fn init_gdn_layer(&self, device: &Device) -> Qwen3_5GdnLayer {
         let qkv = self.linear_qkv_dim();
         let v = self.linear_v_dim();
         Qwen3_5GdnLayer {
@@ -646,7 +579,7 @@ impl Qwen3_5MoeConfig {
         }
     }
 
-    fn init_full_layer<B: Backend>(&self, device: &B::Device) -> Qwen3_5FullAttnLayer<B> {
+    fn init_full_layer(&self, device: &Device) -> Qwen3_5FullAttnLayer {
         Qwen3_5FullAttnLayer {
             input_layernorm: lazy_rms_norm(self.hidden_size, self.rms_norm_eps, device),
             self_attn: Qwen3_5FullAttention {
@@ -666,7 +599,7 @@ impl Qwen3_5MoeConfig {
         }
     }
 
-    fn init_mlp<B: Backend>(&self, device: &B::Device) -> Qwen3_5SharedMoeBlock<B> {
+    fn init_mlp(&self, device: &Device) -> Qwen3_5SharedMoeBlock {
         Qwen3_5SharedMoeBlock {
             gate: lazy_linear(self.hidden_size, self.num_experts, device),
             experts: Qwen3_5FusedExperts {
@@ -710,8 +643,8 @@ impl Qwen3_5MoeConfig {
                 down_proj_fp8: QuantSidecar(None),
             },
             shared_expert_gate: lazy_linear(self.hidden_size, 1, device),
-            num_experts_per_tok: Ignored(self.num_experts_per_tok),
-            norm_topk_prob: Ignored(self.norm_topk_prob),
+            num_experts_per_tok: (self.num_experts_per_tok),
+            norm_topk_prob: (self.norm_topk_prob),
         }
     }
 
@@ -900,148 +833,149 @@ impl Qwen3_5MoeConfig {
 }
 
 #[derive(Module, Debug)]
-pub struct Qwen3_5MoeForCausalLM<B: Backend> {
-    pub model: Qwen3_5Model<B>,
-    pub lm_head: Linear<B>,
-    pub lm_head_quant: QuantSidecar<B>,
-    pub mtp: Qwen3_5MtpBlock<B>,
+pub struct Qwen3_5MoeForCausalLM {
+    pub model: Qwen3_5Model,
+    pub lm_head: Linear,
+    pub lm_head_quant: QuantSidecar,
+    pub mtp: Qwen3_5MtpBlock,
 }
 
 #[derive(Module, Debug)]
-pub struct Qwen3_5Model<B: Backend> {
-    pub config: Ignored<Qwen3_5MoeConfig>,
-    pub embed_tokens: Embedding<B>,
-    pub layers: Vec<Qwen3_5DecoderLayer<B>>,
-    pub norm: RmsNorm<B>,
+pub struct Qwen3_5Model {
+    #[module(skip)]
+    pub config: Qwen3_5MoeConfig,
+    pub embed_tokens: Embedding,
+    pub layers: Vec<Qwen3_5DecoderLayer>,
+    pub norm: RmsNorm,
 }
 
 #[derive(Module, Debug)]
 #[allow(clippy::large_enum_variant)]
-pub enum Qwen3_5DecoderLayer<B: Backend> {
-    Linear(Qwen3_5GdnLayer<B>),
-    Full(Qwen3_5FullAttnLayer<B>),
+pub enum Qwen3_5DecoderLayer {
+    Linear(Qwen3_5GdnLayer),
+    Full(Qwen3_5FullAttnLayer),
 }
 
 #[derive(Module, Debug)]
-pub struct Qwen3_5GdnLayer<B: Backend> {
-    pub input_layernorm: RmsNorm<B>,
-    pub linear_attn: Qwen3_5GdnAttention<B>,
-    pub post_attention_layernorm: RmsNorm<B>,
-    pub mlp: Qwen3_5SharedMoeBlock<B>,
+pub struct Qwen3_5GdnLayer {
+    pub input_layernorm: RmsNorm,
+    pub linear_attn: Qwen3_5GdnAttention,
+    pub post_attention_layernorm: RmsNorm,
+    pub mlp: Qwen3_5SharedMoeBlock,
 }
 
 #[derive(Module, Debug)]
 #[allow(non_snake_case)]
-pub struct Qwen3_5GdnAttention<B: Backend> {
-    pub in_proj_qkv: Linear<B>,
-    pub in_proj_qkv_fp8: QuantSidecar<B>,
-    pub in_proj_a: Linear<B>,
-    pub in_proj_a_fp8: QuantSidecar<B>,
-    pub in_proj_b: Linear<B>,
-    pub in_proj_b_fp8: QuantSidecar<B>,
-    pub in_proj_z: Linear<B>,
-    pub in_proj_z_fp8: QuantSidecar<B>,
-    pub A_log: Param<Tensor<B, 1>>,
-    pub dt_bias: Param<Tensor<B, 1>>,
-    pub conv1d: Qwen3_5Conv1d<B>,
-    pub norm: RmsNorm<B>,
-    pub out_proj: Linear<B>,
-    pub out_proj_fp8: QuantSidecar<B>,
+pub struct Qwen3_5GdnAttention {
+    pub in_proj_qkv: Linear,
+    pub in_proj_qkv_fp8: QuantSidecar,
+    pub in_proj_a: Linear,
+    pub in_proj_a_fp8: QuantSidecar,
+    pub in_proj_b: Linear,
+    pub in_proj_b_fp8: QuantSidecar,
+    pub in_proj_z: Linear,
+    pub in_proj_z_fp8: QuantSidecar,
+    pub A_log: Param<Tensor<1>>,
+    pub dt_bias: Param<Tensor<1>>,
+    pub conv1d: Qwen3_5Conv1d,
+    pub norm: RmsNorm,
+    pub out_proj: Linear,
+    pub out_proj_fp8: QuantSidecar,
 }
 
 #[derive(Module, Debug)]
-pub struct Qwen3_5Conv1d<B: Backend> {
-    pub weight: Param<Tensor<B, 3>>,
+pub struct Qwen3_5Conv1d {
+    pub weight: Param<Tensor<3>>,
 }
 
 #[derive(Module, Debug)]
-pub struct Qwen3_5FullAttnLayer<B: Backend> {
-    pub input_layernorm: RmsNorm<B>,
-    pub self_attn: Qwen3_5FullAttention<B>,
-    pub post_attention_layernorm: RmsNorm<B>,
-    pub mlp: Qwen3_5SharedMoeBlock<B>,
+pub struct Qwen3_5FullAttnLayer {
+    pub input_layernorm: RmsNorm,
+    pub self_attn: Qwen3_5FullAttention,
+    pub post_attention_layernorm: RmsNorm,
+    pub mlp: Qwen3_5SharedMoeBlock,
 }
 
 #[derive(Module, Debug)]
-pub struct Qwen3_5FullAttention<B: Backend> {
-    pub q_proj: Linear<B>,
-    pub q_proj_fp8: QuantSidecar<B>,
-    pub k_proj: Linear<B>,
-    pub k_proj_fp8: QuantSidecar<B>,
-    pub v_proj: Linear<B>,
-    pub v_proj_fp8: QuantSidecar<B>,
-    pub o_proj: Linear<B>,
-    pub o_proj_fp8: QuantSidecar<B>,
-    pub q_norm: RmsNorm<B>,
-    pub k_norm: RmsNorm<B>,
+pub struct Qwen3_5FullAttention {
+    pub q_proj: Linear,
+    pub q_proj_fp8: QuantSidecar,
+    pub k_proj: Linear,
+    pub k_proj_fp8: QuantSidecar,
+    pub v_proj: Linear,
+    pub v_proj_fp8: QuantSidecar,
+    pub o_proj: Linear,
+    pub o_proj_fp8: QuantSidecar,
+    pub q_norm: RmsNorm,
+    pub k_norm: RmsNorm,
 }
 
 #[derive(Module, Debug)]
-pub struct Qwen3_5SharedMoeBlock<B: Backend> {
-    pub gate: Linear<B>,
-    pub experts: Qwen3_5FusedExperts<B>,
-    pub shared_expert: Qwen3_5SharedExpert<B>,
-    pub shared_expert_gate: Linear<B>,
-    pub num_experts_per_tok: Ignored<usize>,
-    pub norm_topk_prob: Ignored<bool>,
+pub struct Qwen3_5SharedMoeBlock {
+    pub gate: Linear,
+    pub experts: Qwen3_5FusedExperts,
+    pub shared_expert: Qwen3_5SharedExpert,
+    pub shared_expert_gate: Linear,
+    pub num_experts_per_tok: usize,
+    pub norm_topk_prob: bool,
 }
 
 #[derive(Module, Debug)]
-pub struct Qwen3_5FusedExperts<B: Backend> {
-    pub gate_up_proj: Param<Tensor<B, 3>>,
-    pub down_proj: Param<Tensor<B, 3>>,
-    pub fp8: ExpertQuantSidecar<B>,
-    pub nvfp4: ExpertNvfp4Sidecar<B>,
+pub struct Qwen3_5FusedExperts {
+    pub gate_up_proj: Param<Tensor<3>>,
+    pub down_proj: Param<Tensor<3>>,
+    pub fp8: ExpertQuantSidecar,
+    pub nvfp4: ExpertNvfp4Sidecar,
 }
 
 #[derive(Module, Debug)]
-pub struct Qwen3_5SharedExpert<B: Backend> {
-    pub gate_proj: Linear<B>,
-    pub gate_proj_fp8: QuantSidecar<B>,
-    pub up_proj: Linear<B>,
-    pub up_proj_fp8: QuantSidecar<B>,
-    pub down_proj: Linear<B>,
-    pub down_proj_fp8: QuantSidecar<B>,
+pub struct Qwen3_5SharedExpert {
+    pub gate_proj: Linear,
+    pub gate_proj_fp8: QuantSidecar,
+    pub up_proj: Linear,
+    pub up_proj_fp8: QuantSidecar,
+    pub down_proj: Linear,
+    pub down_proj_fp8: QuantSidecar,
 }
 
 #[derive(Module, Debug)]
-pub struct Qwen3_5MtpBlock<B: Backend> {
-    pub pre_fc_norm_embedding: RmsNorm<B>,
-    pub pre_fc_norm_hidden: RmsNorm<B>,
-    pub fc: Linear<B>,
-    pub fc_fp8: QuantSidecar<B>,
-    pub layers: Vec<Qwen3_5FullAttnLayer<B>>,
-    pub norm: RmsNorm<B>,
+pub struct Qwen3_5MtpBlock {
+    pub pre_fc_norm_embedding: RmsNorm,
+    pub pre_fc_norm_hidden: RmsNorm,
+    pub fc: Linear,
+    pub fc_fp8: QuantSidecar,
+    pub layers: Vec<Qwen3_5FullAttnLayer>,
+    pub norm: RmsNorm,
 }
 
-impl<B: Qwen3_5DenseQuantBackend> Qwen3_5MoeForCausalLM<B> {
+impl Qwen3_5MoeForCausalLM {
     pub fn forward(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        position_ids: Tensor<B, 2, Int>,
-        cache: &mut Qwen3_5HybridCache<B>,
-    ) -> Tensor<B, 3> {
+        input_ids: Tensor<2, Int>,
+        position_ids: Tensor<2, Int>,
+        cache: &mut Qwen3_5HybridCache,
+    ) -> Tensor<3> {
         self.forward_prec(input_ids, position_ids, cache, Precision::F32)
     }
 
     pub fn forward_prec(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        position_ids: Tensor<B, 2, Int>,
-        cache: &mut Qwen3_5HybridCache<B>,
+        input_ids: Tensor<2, Int>,
+        position_ids: Tensor<2, Int>,
+        cache: &mut Qwen3_5HybridCache,
         prec: Precision,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         self.forward_hidden_prec(input_ids, position_ids, cache, prec)
             .1
     }
 
     pub fn forward_hidden_prec(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        position_ids: Tensor<B, 2, Int>,
-        cache: &mut Qwen3_5HybridCache<B>,
+        input_ids: Tensor<2, Int>,
+        position_ids: Tensor<2, Int>,
+        cache: &mut Qwen3_5HybridCache,
         prec: Precision,
-    ) -> (Tensor<B, 3>, Tensor<B, 3>) {
+    ) -> (Tensor<3>, Tensor<3>) {
         let hidden_states = self
             .model
             .forward_prec(input_ids, position_ids, cache, prec);
@@ -1069,17 +1003,42 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5MoeForCausalLM<B> {
     /// m_max. The bf16/fp8 paths are unchanged (still the same per-position linear).
     pub fn forward_last_logits(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        position_ids: Tensor<B, 2, Int>,
-        cache: &mut Qwen3_5HybridCache<B>,
+        input_ids: Tensor<2, Int>,
+        position_ids: Tensor<2, Int>,
+        cache: &mut Qwen3_5HybridCache,
         prec: Precision,
-    ) -> Tensor<B, 2> {
+    ) -> Tensor<2> {
         let hidden_states = self
             .model
             .forward_prec(input_ids, position_ids, cache, prec);
         let [batch, seq_len, hidden] = hidden_states.dims();
         let last = hidden_states.slice([0..batch, (seq_len - 1)..seq_len, 0..hidden]);
         let logits = ql3(&self.lm_head_quant, &self.lm_head, last, prec);
+        let vocab = logits.dims()[2];
+        logits.reshape([batch, vocab])
+    }
+
+    /// `docs/MEMORY_STREAMING_PLAN.md` streamed sibling of [`Self::forward_last_logits`]: routed
+    /// experts are fetched on demand through `pool` (an [`ExpertSlotPool`] opened on the same
+    /// checkpoint dir) instead of requiring `self.model.layers[*].mlp.experts.*` to be fully resident.
+    /// Pair with `load_weights_sharded_resident_core` at load time.
+    pub fn forward_last_logits_streamed(
+        &self,
+        input_ids: Tensor<2, Int>,
+        position_ids: Tensor<2, Int>,
+        cache: &mut Qwen3_5HybridCache,
+        prec: Precision,
+        pool: &mut ExpertSlotPool,
+    ) -> Tensor<2> {
+        let hidden_states =
+            self.model
+                .forward_prec_streamed(input_ids, position_ids, cache, prec, pool);
+        let [batch, seq_len, hidden] = hidden_states.dims();
+        let last = hidden_states.slice([0..batch, (seq_len - 1)..seq_len, 0..hidden]);
+        let prof_device = last.device();
+        let logits = timed(&profile::LM_HEAD, &prof_device, || {
+            ql3(&self.lm_head_quant, &self.lm_head, last, prec)
+        });
         let vocab = logits.dims()[2];
         logits.reshape([batch, vocab])
     }
@@ -1091,13 +1050,13 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5MoeForCausalLM<B> {
     #[allow(clippy::too_many_arguments)]
     pub fn forward_decode_static_pre(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        pos: Tensor<B, 1, Int>,
-        cache: &mut Qwen3_5HybridCache<B>,
+        input_ids: Tensor<2, Int>,
+        pos: Tensor<1, Int>,
+        cache: &mut Qwen3_5HybridCache,
         prec: Precision,
-        freqs: &Tensor<B, 1>,
-        arange_tmax: &Tensor<B, 1, Int>,
-    ) -> Tensor<B, 2> {
+        freqs: &Tensor<1>,
+        arange_tmax: &Tensor<1, Int>,
+    ) -> Tensor<2> {
         let hidden_states =
             self.model
                 .forward_decode_static_pre(input_ids, pos, cache, prec, freqs, arange_tmax);
@@ -1119,7 +1078,7 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5MoeForCausalLM<B> {
     /// [`Qwen3_5Model::preflight_static`]. `tokens` is the per-step token count (1 at B=1 decode).
     pub fn preflight_static(
         &self,
-        cache: &Qwen3_5HybridCache<B>,
+        cache: &Qwen3_5HybridCache,
         tokens: usize,
     ) -> Result<(), String> {
         self.model.preflight_static(cache, tokens)
@@ -1127,30 +1086,30 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5MoeForCausalLM<B> {
 
     /// Allocate the capture-stable GDN state buffers for every linear-attention layer in `cache`. See
     /// [`Qwen3_5Model::init_static_caches`].
-    pub fn init_static_caches(&self, cache: &mut Qwen3_5HybridCache<B>, batch: usize) {
+    pub fn init_static_caches(&self, cache: &mut Qwen3_5HybridCache, batch: usize) {
         self.model.init_static_caches(cache, batch);
     }
 
-    pub fn mtp_new_cache(&self, t_max: usize) -> KVCache<B> {
+    pub fn mtp_new_cache(&self, t_max: usize) -> KVCache {
         KVCache::with_capacity(t_max)
     }
 }
 
-impl<B: Qwen3_5DenseQuantBackend> Qwen3_5MtpBlock<B> {
-    pub fn mtp_new_cache(t_max: usize) -> KVCache<B> {
+impl Qwen3_5MtpBlock {
+    pub fn mtp_new_cache(t_max: usize) -> KVCache {
         KVCache::with_capacity(t_max)
     }
 
     pub fn forward_draft(
         &self,
-        tok_next: Tensor<B, 2, Int>,
-        hidden: Tensor<B, 3>,
-        position_ids: Tensor<B, 2, Int>,
-        mtp_cache: &mut KVCache<B>,
-        embed: &Embedding<B>,
-        lm_head: &Linear<B>,
+        tok_next: Tensor<2, Int>,
+        hidden: Tensor<3>,
+        position_ids: Tensor<2, Int>,
+        mtp_cache: &mut KVCache,
+        embed: &Embedding,
+        lm_head: &Linear,
         prec: Precision,
-    ) -> (Tensor<B, 2>, Tensor<B, 3>) {
+    ) -> (Tensor<2>, Tensor<3>) {
         assert!(
             !self.layers.is_empty(),
             "Qwen3_5MtpBlock::forward_draft requires at least one MTP layer"
@@ -1182,18 +1141,18 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5MtpBlock<B> {
     }
 }
 
-impl<B: Qwen3_5DenseQuantBackend> Qwen3_5SharedMoeBlock<B> {
-    pub fn forward(&self, hidden_states: Tensor<B, 3>, prec: Precision) -> Tensor<B, 3> {
+impl Qwen3_5SharedMoeBlock {
+    pub fn forward(&self, hidden_states: Tensor<3>, prec: Precision) -> Tensor<3> {
         self.forward_impl(hidden_states, prec, true)
     }
 
-    #[cfg(feature = "cuda")]
+    #[cfg(feature = "cubecl-gpu")]
     fn combine_token_major_assignments(
-        y: Tensor<B, 2>,
+        y: Tensor<2>,
         tokens: usize,
         top_k: usize,
         hidden: usize,
-    ) -> Tensor<B, 2> {
+    ) -> Tensor<2> {
         y.reshape([tokens, top_k, hidden])
             .sum_dim(1)
             .reshape([tokens, hidden])
@@ -1201,21 +1160,21 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5SharedMoeBlock<B> {
 
     fn forward_impl(
         &self,
-        hidden_states: Tensor<B, 3>,
+        hidden_states: Tensor<3>,
         prec: Precision,
         fused_experts: bool,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         let [batch, seq_len, hidden] = hidden_states.dims();
         let tokens = batch * seq_len;
         let num_experts = self.gate.weight.val().dims()[1];
-        let top_k = (*self.num_experts_per_tok).min(num_experts);
+        let top_k = (self.num_experts_per_tok).min(num_experts);
         let device = hidden_states.device();
         let dtype = hidden_states.dtype();
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(feature = "cubecl-gpu"))]
         let _ = fused_experts;
 
         let (sel_idx, sel_w) = self.route_topk(hidden_states.clone(), top_k);
-        #[cfg(feature = "cuda")]
+        #[cfg(feature = "cubecl-gpu")]
         if fused_experts && qwen35_fused_moe_enabled() && tokens <= QWEN35_FUSED_MOE_MAX_T {
             // Dispatch precedence: NVFP4 experts (the official nvidia checkpoint) take priority over
             // the fp8 sidecar, which takes priority over the bf16 stacks. Mirrors the fp8 arm exactly
@@ -1289,7 +1248,7 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5SharedMoeBlock<B> {
                     .clone()
                     .reshape([tokens, hidden])
                     .cast(DType::F32);
-                let y = B::fused_moe_gu2_down_nvfp4(
+                let y = crate::nvfp4::fused_moe_gu2_down_nvfp4(
                     x2,
                     nvfp4.qw_gu.clone(),
                     nvfp4.bs_gu.clone(),
@@ -1312,6 +1271,7 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5SharedMoeBlock<B> {
                     .reshape([batch, seq_len, hidden])
                     .cast(dtype);
             }
+            #[cfg(feature = "cuda")]
             if let Some(fp8) = &self.experts.fp8.0 {
                 assert_eq!(
                     fp8.e, num_experts,
@@ -1355,7 +1315,7 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5SharedMoeBlock<B> {
                     .clone()
                     .reshape([tokens, hidden])
                     .cast(DType::F32);
-                let y = B::fused_moe_gu2_down_fp8(
+                let y = crate::moe_grouped::fused_moe_gu2_down_fp8(
                     x2,
                     fp8.q_gu.clone(),
                     fp8.s_gu.clone(),
@@ -1377,46 +1337,49 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5SharedMoeBlock<B> {
                     .cast(dtype);
             }
 
-            let gate_up_dims = self.experts.gate_up_proj.val().dims();
-            let down_dims = self.experts.down_proj.val().dims();
-            let placeholder = gate_up_dims == [1, 1, 1] || down_dims == [1, 1, 1];
-            if !placeholder && down_dims[0] == num_experts && down_dims[1] == hidden {
-                let inner = down_dims[2];
-                assert_eq!(
-                    gate_up_dims,
-                    [num_experts, inner * 2, hidden],
-                    "Qwen3.5 fused bf16 MoE requires non-placeholder gate_up [E,2I,H]"
-                );
-                assert_eq!(
-                    down_dims,
-                    [num_experts, hidden, inner],
-                    "Qwen3.5 fused bf16 MoE requires non-placeholder down [E,H,I]"
-                );
-                let n = tokens * top_k;
-                let assign_e = sel_idx.reshape([n]);
-                let sel_w_flat = sel_w.reshape([n]).cast(DType::F32);
-                let x2 = hidden_states
-                    .clone()
-                    .reshape([tokens, hidden])
-                    .cast(DType::F32);
-                let y = B::fused_moe_gu2_down_bf16(
-                    x2,
-                    self.experts.gate_up_proj.val(),
-                    self.experts.down_proj.val(),
-                    assign_e,
-                    sel_w_flat,
-                    hidden,
-                    inner,
-                    n,
-                )
-                .cast(dtype);
-                let routed = Self::combine_token_major_assignments(y, tokens, top_k, hidden);
-                let shared = self
-                    .shared_expert_forward(hidden_states, prec)
-                    .reshape([tokens, hidden]);
-                return (routed + shared)
-                    .reshape([batch, seq_len, hidden])
+            #[cfg(feature = "cuda")]
+            {
+                let gate_up_dims = self.experts.gate_up_proj.val().dims();
+                let down_dims = self.experts.down_proj.val().dims();
+                let placeholder = gate_up_dims == [1, 1, 1] || down_dims == [1, 1, 1];
+                if !placeholder && down_dims[0] == num_experts && down_dims[1] == hidden {
+                    let inner = down_dims[2];
+                    assert_eq!(
+                        gate_up_dims,
+                        [num_experts, inner * 2, hidden],
+                        "Qwen3.5 fused bf16 MoE requires non-placeholder gate_up [E,2I,H]"
+                    );
+                    assert_eq!(
+                        down_dims,
+                        [num_experts, hidden, inner],
+                        "Qwen3.5 fused bf16 MoE requires non-placeholder down [E,H,I]"
+                    );
+                    let n = tokens * top_k;
+                    let assign_e = sel_idx.reshape([n]);
+                    let sel_w_flat = sel_w.reshape([n]).cast(DType::F32);
+                    let x2 = hidden_states
+                        .clone()
+                        .reshape([tokens, hidden])
+                        .cast(DType::F32);
+                    let y = crate::moe_grouped::fused_moe_gu2_down_bf16(
+                        x2,
+                        self.experts.gate_up_proj.val(),
+                        self.experts.down_proj.val(),
+                        assign_e,
+                        sel_w_flat,
+                        hidden,
+                        inner,
+                        n,
+                    )
                     .cast(dtype);
+                    let routed = Self::combine_token_major_assignments(y, tokens, top_k, hidden);
+                    let shared = self
+                        .shared_expert_forward(hidden_states, prec)
+                        .reshape([tokens, hidden]);
+                    return (routed + shared)
+                        .reshape([batch, seq_len, hidden])
+                        .cast(dtype);
+                }
             }
         }
 
@@ -1444,15 +1407,15 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5SharedMoeBlock<B> {
         // whole combine stays F32; cast the RESULT back to the residual-stream dtype at the end so the
         // decoder `residual + moe_out` matches (bf16 on the real model). Do NOT cast routed/w to `dtype`
         // (bf16) here — that mismatches the F32 expert outputs (the `F32 * bf16` panic).
-        let mut routed = Tensor::<B, 2>::zeros([tokens, hidden], &device);
+        let mut routed = Tensor::<2>::zeros([tokens, hidden], &device);
         for expert in 0..num_experts {
             let (tok_ids, weights) = &by_expert[expert];
             if tok_ids.is_empty() {
                 continue;
             }
             let n = tok_ids.len();
-            let tok_idx = Tensor::<B, 1, Int>::from_data(tok_ids.as_slice(), &device);
-            let w = Tensor::<B, 1>::from_data(weights.as_slice(), &device).reshape([n, 1]);
+            let tok_idx = Tensor::<1, Int>::from_data(tok_ids.as_slice(), &device);
+            let w = Tensor::<1>::from_data(weights.as_slice(), &device).reshape([n, 1]);
             let x_e = x2
                 .clone()
                 .select(0, tok_idx.clone())
@@ -1469,11 +1432,112 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5SharedMoeBlock<B> {
             .cast(dtype)
     }
 
+    /// `docs/MEMORY_STREAMING_PLAN.md` streamed sibling of the bf16 host-loop branch of
+    /// [`Self::forward_impl`] (the default, non-`cuda`-fused path): identical routing/combine math,
+    /// but each selected expert's weights come from `pool` (on-demand `read_expert_slice` + LRU
+    /// cache) instead of a fully-resident `self.experts.gate_up_proj`/`down_proj`. Requires the model
+    /// to have been loaded via `load_weights_sharded_resident_core` (so `self.experts.*` stays at its
+    /// tiny placeholder and is never read here) plus a `pool` opened on the same checkpoint dir.
+    /// `layer_idx` must match this block's position in `Qwen3_5Model::layers` (the same index used to
+    /// build the checkpoint's `model.language_model.layers.{layer_idx}.mlp.experts.*` keys).
+    pub fn forward_streamed(
+        &self,
+        hidden_states: Tensor<3>,
+        prec: Precision,
+        pool: &mut ExpertSlotPool,
+        layer_idx: usize,
+    ) -> Tensor<3> {
+        let [batch, seq_len, hidden] = hidden_states.dims();
+        let tokens = batch * seq_len;
+        let num_experts = self.gate.weight.val().dims()[1];
+        let top_k = (self.num_experts_per_tok).min(num_experts);
+        let device = hidden_states.device();
+        let dtype = hidden_states.dtype();
+
+        let (sel_idx, sel_w) = timed(&profile::ROUTER, &device, || {
+            self.route_topk(hidden_states.clone(), top_k)
+        });
+        let idx_host: Vec<i64> = timed(&profile::ROUTER, &device, || {
+            sel_idx
+                .cast(DType::I64)
+                .into_data()
+                .to_vec()
+                .expect("read Qwen3.5 MoE route ids (streamed)")
+        });
+        // `sel_idx` must come to the host -- the CPU issues the disk reads, so it has to know which
+        // experts were routed. `sel_w` must NOT: it was previously downloaded only to be sliced per
+        // expert and re-uploaded, costing a second full device->host round trip per layer (~680 forced
+        // GPU syncs per 16-token run). Instead keep it resident and gather from it on-device with the
+        // flat `tok * top_k + slot` offsets, which we already know host-side from `idx_host`.
+        let sel_w_flat = sel_w.reshape([tokens * top_k]);
+        let mut by_expert: Vec<(Vec<i64>, Vec<i64>)> = vec![(Vec::new(), Vec::new()); num_experts];
+        for tok in 0..tokens {
+            for slot in 0..top_k {
+                let expert = idx_host[tok * top_k + slot] as usize;
+                by_expert[expert].0.push(tok as i64);
+                by_expert[expert].1.push((tok * top_k + slot) as i64);
+            }
+        }
+
+        // Batch all of this layer's distinct routed experts into two reader calls (one for
+        // gate_up, one for down) instead of one `read_expert_slice` call per expert per
+        // projection -- see `ExpertSlotPool::prefetch_layer` for why (removes redundant
+        // shard/header lookups, ~640 tiny fetches/token -> ~80).
+        let distinct_experts: Vec<usize> = (0..num_experts)
+            .filter(|&e| !by_expert[e].0.is_empty())
+            .collect();
+        timed(&profile::MOE_PREFETCH, &device, || {
+            pool.prefetch_layer(layer_idx, &distinct_experts, &device)
+                .expect("streamed prefetch_layer")
+        });
+
+        let x2 = hidden_states.clone().reshape([tokens, hidden]);
+        let mut routed = Tensor::<2>::zeros([tokens, hidden], &device);
+        for expert in 0..num_experts {
+            let (tok_ids, weight_offsets) = &by_expert[expert];
+            if tok_ids.is_empty() {
+                continue;
+            }
+            let n = tok_ids.len();
+            let tok_idx = Tensor::<1, Int>::from_data(tok_ids.as_slice(), &device);
+            let w = sel_w_flat
+                .clone()
+                .select(
+                    0,
+                    Tensor::<1, Int>::from_data(weight_offsets.as_slice(), &device),
+                )
+                .reshape([n, 1]);
+            let x_e = x2.clone().select(0, tok_idx.clone());
+            let y_e = timed(&profile::MOE_EXPERTS, &device, || {
+                pool.expert_forward(layer_idx, expert, x_e, prec, &device)
+                    .expect("streamed expert_forward")
+            });
+            routed = timed(&profile::MOE_SCATTER, &device, || {
+                routed.select_assign(0, tok_idx, y_e * w, IndexingUpdateOp::Add)
+            });
+        }
+
+        // When the per-expert sync is disabled (QWEN35_STREAM_SYNC=0), still bound the in-flight
+        // dispatch backlog -- but once per layer instead of once per routed expert, so this
+        // layer's tiny GEMVs pipeline instead of round-tripping to the host ~8 times.
+        if std::env::var("QWEN35_STREAM_SYNC").ok().as_deref() == Some("0") {
+            let _ = device.sync();
+        }
+
+        let shared = timed(&profile::MOE_SHARED, &device, || {
+            self.shared_expert_forward(hidden_states, prec)
+                .reshape([tokens, hidden])
+        });
+        (routed + shared)
+            .reshape([batch, seq_len, hidden])
+            .cast(dtype)
+    }
+
     pub fn route_topk(
         &self,
-        hidden_states: Tensor<B, 3>,
+        hidden_states: Tensor<3>,
         top_k: usize,
-    ) -> (Tensor<B, 2, Int>, Tensor<B, 2>) {
+    ) -> (Tensor<2, Int>, Tensor<2>) {
         let [batch, seq_len, _hidden] = hidden_states.dims();
         let tokens = batch * seq_len;
         let num_experts = self.gate.weight.val().dims()[1];
@@ -1486,10 +1550,10 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5SharedMoeBlock<B> {
 
     fn topk_select(
         &self,
-        probs: Tensor<B, 2>,
+        probs: Tensor<2>,
         tokens: usize,
         top_k: usize,
-    ) -> (Vec<Tensor<B, 2, Int>>, Vec<Tensor<B, 2>>) {
+    ) -> (Vec<Tensor<2, Int>>, Vec<Tensor<2>>) {
         let device = probs.device();
         let mut masked = probs;
         let mut sel_idx = Vec::with_capacity(top_k);
@@ -1497,12 +1561,12 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5SharedMoeBlock<B> {
         for _ in 0..top_k {
             let idx = masked.clone().argmax(1);
             let w = masked.clone().gather(1, idx.clone());
-            let neg = Tensor::<B, 2>::full([tokens, 1], -1.0e30, &device);
+            let neg = Tensor::<2>::full([tokens, 1], -1.0e30, &device);
             masked = masked.scatter(1, idx.clone(), neg, IndexingUpdateOp::Add);
             sel_idx.push(idx);
             sel_w.push(w);
         }
-        if *self.norm_topk_prob {
+        if self.norm_topk_prob {
             let mut wsum = sel_w[0].clone();
             for w in sel_w.iter().skip(1) {
                 wsum = wsum + w.clone();
@@ -1515,7 +1579,7 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5SharedMoeBlock<B> {
         (sel_idx, sel_w)
     }
 
-    fn expert_forward(&self, expert: usize, x: Tensor<B, 3>, prec: Precision) -> Tensor<B, 3> {
+    fn expert_forward(&self, expert: usize, x: Tensor<3>, prec: Precision) -> Tensor<3> {
         let [batch, seq_len, hidden] = x.dims();
         let tokens = batch * seq_len;
         // NVFP4 experts take precedence over the fp8 sidecar and the bf16 stacks. This is the
@@ -1540,7 +1604,7 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5SharedMoeBlock<B> {
             let inner = nvfp4.i;
             let device = x.device();
 
-            let read_bytes = |t: Tensor<B, 2, Int>| -> Vec<u8> {
+            let read_bytes = |t: Tensor<2, Int>| -> Vec<u8> {
                 t.into_data()
                     .to_vec::<i8>()
                     .expect("read nvfp4 expert bytes")
@@ -1613,12 +1677,12 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5SharedMoeBlock<B> {
 
             // dequant returns row-major [K,N]; transpose to the [out,in] layout `matmul_out_in` expects
             // (identical to how the bf16 branch slices `gate_up_proj`/`down_proj`).
-            let gu_t = Tensor::<B, 2>::from_data(TensorData::new(gu, [hidden, inner * 2]), &device)
+            let gu_t = Tensor::<2>::from_data(TensorData::new(gu, [hidden, inner * 2]), &device)
                 .transpose();
             let gate_w = gu_t.clone().slice([0..inner, 0..hidden]);
             let up_w = gu_t.slice([inner..inner * 2, 0..hidden]);
-            let down_w = Tensor::<B, 2>::from_data(TensorData::new(dn, [inner, hidden]), &device)
-                .transpose();
+            let down_w =
+                Tensor::<2>::from_data(TensorData::new(dn, [inner, hidden]), &device).transpose();
 
             let x2 = x.reshape([tokens, hidden]);
             let gate = silu(matmul_out_in(x2.clone(), gate_w, prec));
@@ -1660,7 +1724,7 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5SharedMoeBlock<B> {
             );
 
             let x2 = x.reshape([tokens, hidden]).cast(DType::F32);
-            let gu = B::w8a16_gemv(x2, q_gu_e, s_gu_e);
+            let gu = crate::w8a16::w8a16_gemv(x2, q_gu_e, s_gu_e);
             let gate = gu.clone().slice([0..tokens, 0..inner]);
             let up = gu.slice([0..tokens, inner..inner * 2]);
             let h = silu(gate) * up;
@@ -1686,7 +1750,7 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5SharedMoeBlock<B> {
                 "expert_forward fp8: s_dn_e layout mismatch"
             );
 
-            return B::w8a16_gemv(h, q_dn_e, s_dn_e).reshape([batch, seq_len, hidden]);
+            return crate::w8a16::w8a16_gemv(h, q_dn_e, s_dn_e).reshape([batch, seq_len, hidden]);
         }
 
         let gate_up_dims = self.experts.gate_up_proj.val().dims();
@@ -1715,7 +1779,7 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5SharedMoeBlock<B> {
         matmul_out_in(gate * up, down_w, prec).reshape([batch, seq_len, hidden])
     }
 
-    fn shared_expert_forward(&self, hidden_states: Tensor<B, 3>, prec: Precision) -> Tensor<B, 3> {
+    fn shared_expert_forward(&self, hidden_states: Tensor<3>, prec: Precision) -> Tensor<3> {
         // HF Qwen3_5MoeSparseMoeBlock: shared = sigmoid(shared_expert_gate(x)) · MLP(x), where
         // MLP(x) = down_proj(silu(gate_proj(x)) · up_proj(x)). The gate is a strongly-negative-logit
         // sigmoid (≈0.076) that keeps the shared expert nearly off — so the F32 matmul path in linear3
@@ -1757,11 +1821,11 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5SharedMoeBlock<B> {
     /// fallback D2H-syncs the router — capture poison). Run [`Self::preflight_static`] before capture to
     /// fail at build time instead. The math is identical to the fused branch of [`Self::forward_impl`].
     #[cfg(feature = "cuda")]
-    pub fn forward_static(&self, hidden_states: Tensor<B, 3>, prec: Precision) -> Tensor<B, 3> {
+    pub fn forward_static(&self, hidden_states: Tensor<3>, prec: Precision) -> Tensor<3> {
         let [batch, seq_len, hidden] = hidden_states.dims();
         let tokens = batch * seq_len;
         let num_experts = self.gate.weight.val().dims()[1];
-        let top_k = (*self.num_experts_per_tok).min(num_experts);
+        let top_k = (self.num_experts_per_tok).min(num_experts);
         let dtype = hidden_states.dtype();
         let n = tokens * top_k;
 
@@ -1851,7 +1915,7 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5SharedMoeBlock<B> {
                 .clone()
                 .reshape([tokens, hidden])
                 .cast(DType::F32);
-            let y = B::fused_moe_gu2_down_nvfp4(
+            let y = crate::moe_grouped::fused_moe_gu2_down_nvfp4(
                 x2,
                 nvfp4.qw_gu.clone(),
                 nvfp4.bs_gu.clone(),
@@ -1916,7 +1980,7 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5SharedMoeBlock<B> {
                 .clone()
                 .reshape([tokens, hidden])
                 .cast(DType::F32);
-            let y = B::fused_moe_gu2_down_fp8(
+            let y = crate::moe_grouped::fused_moe_gu2_down_fp8(
                 x2,
                 fp8.q_gu.clone(),
                 fp8.s_gu.clone(),
@@ -1966,7 +2030,7 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5SharedMoeBlock<B> {
             .clone()
             .reshape([tokens, hidden])
             .cast(DType::F32);
-        let y = B::fused_moe_gu2_down_bf16(
+        let y = crate::moe_grouped::fused_moe_gu2_down_bf16(
             x2,
             self.experts.gate_up_proj.val(),
             self.experts.down_proj.val(),
@@ -1991,7 +2055,7 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5SharedMoeBlock<B> {
     /// expert path, which is mathematically identical to the fused branch (the CUDA G2 gate covers the
     /// fused dispatch end-to-end).
     #[cfg(not(feature = "cuda"))]
-    pub fn forward_static(&self, hidden_states: Tensor<B, 3>, prec: Precision) -> Tensor<B, 3> {
+    pub fn forward_static(&self, hidden_states: Tensor<3>, prec: Precision) -> Tensor<3> {
         self.forward_impl(hidden_states, prec, false)
     }
 
@@ -2078,11 +2142,94 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5SharedMoeBlock<B> {
     }
 }
 
-fn matmul_out_in<B: Backend>(
-    x: Tensor<B, 2>,
-    weight_out_in: Tensor<B, 2>,
-    prec: Precision,
-) -> Tensor<B, 2> {
+/// Env-gated (`QWEN35_PROFILE=1`) wall-clock attribution for the streamed decode path.
+///
+/// Exists because the streamed-expert pool's own io/upload/compute counters accounted for only
+/// ~64s of a measured 132s decode -- the rest was outside the pool and unattributed. Each section
+/// syncs the device before stopping its timer, so the numbers are real GPU time rather than
+/// enqueue time; that makes a profiled run somewhat slower than an unprofiled one, but it is the
+/// only way to attribute async dispatch correctly.
+pub mod profile {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    pub static ENABLED: AtomicBool = AtomicBool::new(false);
+
+    macro_rules! counters {
+        ($($name:ident),* $(,)?) => {
+            $(pub static $name: AtomicU64 = AtomicU64::new(0);)*
+            /// `(label, nanoseconds)` for every counter, in declaration order.
+            pub fn snapshot() -> Vec<(&'static str, u64)> {
+                vec![$((stringify!($name), $name.load(Ordering::Relaxed))),*]
+            }
+        };
+    }
+
+    counters!(
+        EMBED,
+        GDN_ATTN,
+        FULL_ATTN,
+        ROUTER,
+        MOE_PREFETCH,
+        MOE_EXPERTS,
+        MOE_SHARED,
+        MOE_SCATTER,
+        FINAL_NORM,
+        LM_HEAD
+    );
+
+    pub fn init_from_env() {
+        ENABLED.store(
+            std::env::var("QWEN35_PROFILE").ok().as_deref() == Some("1"),
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn enabled() -> bool {
+        ENABLED.load(Ordering::Relaxed)
+    }
+
+    pub fn add(counter: &AtomicU64, ns: u64) {
+        counter.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    pub fn report() -> String {
+        let rows = snapshot();
+        let total: u64 = rows.iter().map(|(_, ns)| *ns).sum();
+        let mut out = String::from("model profile (device-synced):\n");
+        for (label, ns) in rows {
+            out.push_str(&format!(
+                "    {label:14} {:8.2}s  ({:5.1}%)\n",
+                ns as f64 / 1e9,
+                if total > 0 {
+                    ns as f64 * 100.0 / total as f64
+                } else {
+                    0.0
+                }
+            ));
+        }
+        out.push_str(&format!("    {:14} {:8.2}s\n", "TOTAL", total as f64 / 1e9));
+        out
+    }
+}
+
+/// Time `body`, syncing `device` first so async GPU work lands inside the measured window.
+#[inline]
+fn timed<T>(
+    counter: &std::sync::atomic::AtomicU64,
+    device: &Device,
+    body: impl FnOnce() -> T,
+) -> T {
+    if !profile::enabled() {
+        return body();
+    }
+    let t = std::time::Instant::now();
+    let out = body();
+    let _ = device.sync();
+    profile::add(counter, t.elapsed().as_nanos() as u64);
+    out
+}
+
+fn matmul_out_in(x: Tensor<2>, weight_out_in: Tensor<2>, prec: Precision) -> Tensor<2> {
     let weight_in_out = weight_out_in.transpose();
     let xdt = x.dtype();
     match prec {
@@ -2092,28 +2239,28 @@ fn matmul_out_in<B: Backend>(
             .cast(DType::BF16)
             .matmul(weight_in_out.cast(DType::BF16))
             .cast(DType::F32),
+        Precision::F16 => x
+            .cast(DType::F16)
+            .matmul(weight_in_out.cast(DType::F16))
+            .cast(DType::F32),
     }
 }
 
-impl<B: Qwen3_5DenseQuantBackend> Qwen3_5FullAttnLayer<B> {
+impl Qwen3_5FullAttnLayer {
     /// Full-attention sublayer forward for the Qwen3.6/Qwen3.5-MoE hybrid text tower.
     ///
     /// This lane intentionally stops after the attention residual; the shared-MoE forward remains
     /// stubbed for a later increment.
-    pub fn forward(
-        &self,
-        hidden_states: Tensor<B, 3>,
-        position_ids: Tensor<B, 2, Int>,
-    ) -> Tensor<B, 3> {
+    pub fn forward(&self, hidden_states: Tensor<3>, position_ids: Tensor<2, Int>) -> Tensor<3> {
         self.forward_prec(hidden_states, position_ids, Precision::F32)
     }
 
     pub fn forward_prec(
         &self,
-        hidden_states: Tensor<B, 3>,
-        position_ids: Tensor<B, 2, Int>,
+        hidden_states: Tensor<3>,
+        position_ids: Tensor<2, Int>,
         prec: Precision,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         let residual = hidden_states.clone();
         let hidden_states = self.input_layernorm.forward(hidden_states);
         residual + self.self_attn.forward(hidden_states, position_ids, prec)
@@ -2121,11 +2268,11 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5FullAttnLayer<B> {
 
     pub fn forward_decoder_with_cache(
         &self,
-        hidden_states: Tensor<B, 3>,
-        position_ids: Tensor<B, 2, Int>,
-        cache: &mut KVCache<B>,
+        hidden_states: Tensor<3>,
+        position_ids: Tensor<2, Int>,
+        cache: &mut KVCache,
         prec: Precision,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         let residual = hidden_states.clone();
         let hidden_states = self.input_layernorm.forward(hidden_states);
         let hidden_states =
@@ -2139,6 +2286,36 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5FullAttnLayer<B> {
         residual + hidden_states
     }
 
+    /// `docs/MEMORY_STREAMING_PLAN.md` streamed sibling of [`Self::forward_decoder_with_cache`]:
+    /// identical attention/residual computation, but the MoE sublayer streams its routed experts
+    /// through `pool` (see [`Qwen3_5SharedMoeBlock::forward_streamed`]) instead of reading a
+    /// fully-resident expert stack.
+    pub fn forward_decoder_with_cache_streamed(
+        &self,
+        hidden_states: Tensor<3>,
+        position_ids: Tensor<2, Int>,
+        cache: &mut KVCache,
+        prec: Precision,
+        pool: &mut ExpertSlotPool,
+        layer_idx: usize,
+    ) -> Tensor<3> {
+        let prof_device = hidden_states.device();
+        let residual = hidden_states.clone();
+        let hidden_states = self.input_layernorm.forward(hidden_states);
+        let hidden_states = timed(&profile::FULL_ATTN, &prof_device, || {
+            self.self_attn
+                .forward_with_cache(hidden_states, position_ids, cache, prec)
+        });
+        let hidden_states = residual + hidden_states;
+
+        let residual = hidden_states.clone();
+        let hidden_states = self.post_attention_layernorm.forward(hidden_states);
+        let hidden_states = self
+            .mlp
+            .forward_streamed(hidden_states, prec, pool, layer_idx);
+        residual + hidden_states
+    }
+
     /// CUDA-graph-capturable full-attention decode layer: one `[B,1,H]` token, device-`pos`
     /// static KV write, pre-hoisted partial-RoPE frequency table, and fixed-`T_max` masked SDPA.
     /// The MoE goes through the static [`Qwen3_5SharedMoeBlock::forward_static`], NOT the eager
@@ -2146,13 +2323,13 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5FullAttnLayer<B> {
     #[allow(clippy::too_many_arguments)]
     pub fn forward_decoder_with_cache_static_pre(
         &self,
-        hidden_states: Tensor<B, 3>,
-        pos: Tensor<B, 1, Int>,
-        cache: &mut KVCache<B>,
+        hidden_states: Tensor<3>,
+        pos: Tensor<1, Int>,
+        cache: &mut KVCache,
         prec: Precision,
-        freqs: &Tensor<B, 1>,
-        arange_tmax: &Tensor<B, 1, Int>,
-    ) -> Tensor<B, 3> {
+        freqs: &Tensor<1>,
+        arange_tmax: &Tensor<1, Int>,
+    ) -> Tensor<3> {
         let residual = hidden_states.clone();
         let hidden_states = self.input_layernorm.forward(hidden_states);
         let hidden_states = self.self_attn.forward_with_cache_static_pre(
@@ -2174,11 +2351,11 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5FullAttnLayer<B> {
     #[cfg(feature = "cuda")]
     pub fn forward_decoder_with_cache_sdpa_reference(
         &self,
-        hidden_states: Tensor<B, 3>,
-        position_ids: Tensor<B, 2, Int>,
-        cache: &mut KVCache<B>,
+        hidden_states: Tensor<3>,
+        position_ids: Tensor<2, Int>,
+        cache: &mut KVCache,
         prec: Precision,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         let residual = hidden_states.clone();
         let hidden_states = self.input_layernorm.forward(hidden_states);
         let hidden_states = self.self_attn.forward_with_cache_sdpa_reference(
@@ -2196,15 +2373,15 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5FullAttnLayer<B> {
     }
 }
 
-impl<B: Qwen3_5DenseQuantBackend> Qwen3_5GdnLayer<B> {
+impl Qwen3_5GdnLayer {
     /// Recurrent single-token decode for a linear-attention layer, stopping after the attention
     /// residual just like the full-attention lane.
     pub fn forward_recurrent(
         &self,
-        hidden_states: Tensor<B, 3>,
-        cache: &mut GdnStateCache<B>,
+        hidden_states: Tensor<3>,
+        cache: &mut GdnStateCache,
         prec: Precision,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         let residual = hidden_states.clone();
         let hidden_states = self.input_layernorm.forward(hidden_states);
         residual
@@ -2216,10 +2393,10 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5GdnLayer<B> {
     /// Static-cache recurrent single-token decode for a linear-attention layer.
     pub fn step_recurrent_static(
         &self,
-        hidden_states: Tensor<B, 3>,
-        cache: &mut GdnStateCache<B>,
+        hidden_states: Tensor<3>,
+        cache: &mut GdnStateCache,
         prec: Precision,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         let residual = hidden_states.clone();
         let hidden_states = self.input_layernorm.forward(hidden_states);
         residual
@@ -2235,10 +2412,10 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5GdnLayer<B> {
     /// identical to the eager path.
     pub fn forward_decoder_recurrent_static(
         &self,
-        hidden_states: Tensor<B, 3>,
-        cache: &mut GdnStateCache<B>,
+        hidden_states: Tensor<3>,
+        cache: &mut GdnStateCache,
         prec: Precision,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         let hidden_states = self.step_recurrent_static(hidden_states, cache, prec);
 
         let residual = hidden_states.clone();
@@ -2250,10 +2427,10 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5GdnLayer<B> {
     /// O(S) sequential prefill helper: applies the recurrent decode step token-by-token.
     pub fn forward_prefill_recurrent(
         &self,
-        hidden_states: Tensor<B, 3>,
-        cache: &mut GdnStateCache<B>,
+        hidden_states: Tensor<3>,
+        cache: &mut GdnStateCache,
         prec: Precision,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         let [_batch, seq_len, hidden] = hidden_states.dims();
         let mut outs = Vec::with_capacity(seq_len);
         for t in 0..seq_len {
@@ -2269,10 +2446,10 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5GdnLayer<B> {
     /// O(S) static-cache prefill helper: applies the recurrent static step token-by-token.
     pub fn forward_prefill_recurrent_static(
         &self,
-        hidden_states: Tensor<B, 3>,
-        cache: &mut GdnStateCache<B>,
+        hidden_states: Tensor<3>,
+        cache: &mut GdnStateCache,
         prec: Precision,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         assert!(
             cache.is_static(),
             "Qwen3_5GdnLayer::forward_prefill_recurrent_static requires \
@@ -2292,10 +2469,10 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5GdnLayer<B> {
 
     pub fn forward_decoder_recurrent(
         &self,
-        hidden_states: Tensor<B, 3>,
-        cache: &mut GdnStateCache<B>,
+        hidden_states: Tensor<3>,
+        cache: &mut GdnStateCache,
         prec: Precision,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         let [_, seq_len, _] = hidden_states.dims();
         let hidden_states = if seq_len == 1 {
             self.forward_recurrent(hidden_states, cache, prec)
@@ -2308,6 +2485,35 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5GdnLayer<B> {
         let hidden_states = self.mlp.forward(hidden_states, prec);
         residual + hidden_states
     }
+
+    /// `docs/MEMORY_STREAMING_PLAN.md` streamed sibling of [`Self::forward_decoder_recurrent`]:
+    /// identical GDN recurrence/residual computation, but the MoE sublayer streams its routed
+    /// experts through `pool` instead of reading a fully-resident expert stack.
+    pub fn forward_decoder_recurrent_streamed(
+        &self,
+        hidden_states: Tensor<3>,
+        cache: &mut GdnStateCache,
+        prec: Precision,
+        pool: &mut ExpertSlotPool,
+        layer_idx: usize,
+    ) -> Tensor<3> {
+        let [_, seq_len, _] = hidden_states.dims();
+        let prof_device = hidden_states.device();
+        let hidden_states = timed(&profile::GDN_ATTN, &prof_device, || {
+            if seq_len == 1 {
+                self.forward_recurrent(hidden_states, cache, prec)
+            } else {
+                self.forward_prefill_recurrent(hidden_states, cache, prec)
+            }
+        });
+
+        let residual = hidden_states.clone();
+        let hidden_states = self.post_attention_layernorm.forward(hidden_states);
+        let hidden_states = self
+            .mlp
+            .forward_streamed(hidden_states, prec, pool, layer_idx);
+        residual + hidden_states
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2316,7 +2522,7 @@ enum GdnStateWriteMode {
     Static,
 }
 
-impl<B: Qwen3_5DenseQuantBackend> Qwen3_5GdnAttention<B> {
+impl Qwen3_5GdnAttention {
     /// Recurrent Qwen3.6/Qwen3.5-MoE Gated-DeltaNet decode for `hidden_states: [B, 1, H]`.
     ///
     /// Implements `docs/specs/L1.3-gdn-math.md`: qkv projection, depthwise causal conv over the
@@ -2324,20 +2530,20 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5GdnAttention<B> {
     /// readout from the updated state, RMSNorm before the SiLU z gate, then output projection.
     pub fn forward_recurrent(
         &self,
-        hidden_states: Tensor<B, 3>,
-        cache: &mut GdnStateCache<B>,
+        hidden_states: Tensor<3>,
+        cache: &mut GdnStateCache,
         prec: Precision,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         self.forward_recurrent_impl(hidden_states, cache, prec, GdnStateWriteMode::Functional)
     }
 
     /// Static-cache recurrent single-token decode for `hidden_states: [B, 1, H]`.
     pub fn step_recurrent_static(
         &self,
-        hidden_states: Tensor<B, 3>,
-        cache: &mut GdnStateCache<B>,
+        hidden_states: Tensor<3>,
+        cache: &mut GdnStateCache,
         prec: Precision,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         assert!(
             cache.is_static(),
             "Qwen3_5GdnAttention::step_recurrent_static requires \
@@ -2348,11 +2554,11 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5GdnAttention<B> {
 
     fn forward_recurrent_impl(
         &self,
-        hidden_states: Tensor<B, 3>,
-        cache: &mut GdnStateCache<B>,
+        hidden_states: Tensor<3>,
+        cache: &mut GdnStateCache,
         prec: Precision,
         write_mode: GdnStateWriteMode,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         let [batch_size, seq_len, hidden_size] = hidden_states.dims();
         debug_assert_eq!(seq_len, 1, "GDN recurrent decode expects [B, 1, H]");
         // Output the residual-stream dtype (F32 on the real model), NOT `prec` — `residual + gdn_out`
@@ -2506,7 +2712,7 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5GdnAttention<B> {
                 .take()
                 .unwrap_or_else(|| {
                     let device = q.device();
-                    Tensor::<B, 4>::zeros(
+                    Tensor::<4>::zeros(
                         [batch_size, num_value_heads, key_head_dim, value_head_dim],
                         &device,
                     )
@@ -2576,10 +2782,10 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5GdnAttention<B> {
     /// O(S) sequential prefill helper for the recurrent GDN state.
     pub fn forward_prefill_recurrent(
         &self,
-        hidden_states: Tensor<B, 3>,
-        cache: &mut GdnStateCache<B>,
+        hidden_states: Tensor<3>,
+        cache: &mut GdnStateCache,
         prec: Precision,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         let [batch, seq_len, hidden] = hidden_states.dims();
         let mut outs = Vec::with_capacity(seq_len);
         for t in 0..seq_len {
@@ -2594,10 +2800,10 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5GdnAttention<B> {
     /// O(S) sequential prefill helper for static recurrent GDN state.
     pub fn forward_prefill_recurrent_static(
         &self,
-        hidden_states: Tensor<B, 3>,
-        cache: &mut GdnStateCache<B>,
+        hidden_states: Tensor<3>,
+        cache: &mut GdnStateCache,
         prec: Precision,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         assert!(
             cache.is_static(),
             "Qwen3_5GdnAttention::forward_prefill_recurrent_static requires \
@@ -2615,13 +2821,13 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5GdnAttention<B> {
     }
 }
 
-impl<B: Qwen3_5DenseQuantBackend> Qwen3_5FullAttention<B> {
+impl Qwen3_5FullAttention {
     pub fn forward(
         &self,
-        hidden_states: Tensor<B, 3>,
-        position_ids: Tensor<B, 2, Int>,
+        hidden_states: Tensor<3>,
+        position_ids: Tensor<2, Int>,
         prec: Precision,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         const PARTIAL_ROTARY_FACTOR: f64 = 0.25;
         const ROPE_THETA: f64 = 10_000_000.0;
 
@@ -2682,10 +2888,10 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5FullAttention<B> {
 
         let row_idx: Vec<f32> = (0..seq_len).map(|i| i as f32).collect();
         let col_idx: Vec<f32> = (0..seq_len).map(|i| i as f32).collect();
-        let rows = Tensor::<B, 1>::from_floats(row_idx.as_slice(), &device)
+        let rows = Tensor::<1>::from_floats(row_idx.as_slice(), &device)
             .unsqueeze_dim::<2>(1)
             .repeat(&[1, seq_len]);
-        let cols = Tensor::<B, 1>::from_floats(col_idx.as_slice(), &device)
+        let cols = Tensor::<1>::from_floats(col_idx.as_slice(), &device)
             .unsqueeze_dim::<2>(0)
             .repeat(&[seq_len, 1]);
         let causal_mask = rows.lower(cols).unsqueeze_dims::<4>(&[0, 1]);
@@ -2711,11 +2917,11 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5FullAttention<B> {
 
     pub fn forward_with_cache(
         &self,
-        hidden_states: Tensor<B, 3>,
-        position_ids: Tensor<B, 2, Int>,
-        cache: &mut KVCache<B>,
+        hidden_states: Tensor<3>,
+        position_ids: Tensor<2, Int>,
+        cache: &mut KVCache,
         prec: Precision,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         self.forward_with_cache_impl(hidden_states, position_ids, cache, prec, true)
     }
 
@@ -2727,13 +2933,13 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5FullAttention<B> {
     /// frequency table (`rope_freqs(rotary_dim, 1e7)`) instead of per-step host staging.
     pub fn forward_with_cache_static_pre(
         &self,
-        hidden_states: Tensor<B, 3>,
-        pos: Tensor<B, 1, Int>,
-        cache: &mut KVCache<B>,
+        hidden_states: Tensor<3>,
+        pos: Tensor<1, Int>,
+        cache: &mut KVCache,
         prec: Precision,
-        freqs: &Tensor<B, 1>,
-        arange_tmax: &Tensor<B, 1, Int>,
-    ) -> Tensor<B, 3> {
+        freqs: &Tensor<1>,
+        arange_tmax: &Tensor<1, Int>,
+    ) -> Tensor<3> {
         const PARTIAL_ROTARY_FACTOR: f64 = 0.25;
 
         let [batch_size, seq_len, _] = hidden_states.dims();
@@ -2827,22 +3033,22 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5FullAttention<B> {
     #[cfg(feature = "cuda")]
     pub fn forward_with_cache_sdpa_reference(
         &self,
-        hidden_states: Tensor<B, 3>,
-        position_ids: Tensor<B, 2, Int>,
-        cache: &mut KVCache<B>,
+        hidden_states: Tensor<3>,
+        position_ids: Tensor<2, Int>,
+        cache: &mut KVCache,
         prec: Precision,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         self.forward_with_cache_impl(hidden_states, position_ids, cache, prec, false)
     }
 
     fn forward_with_cache_impl(
         &self,
-        hidden_states: Tensor<B, 3>,
-        position_ids: Tensor<B, 2, Int>,
-        cache: &mut KVCache<B>,
+        hidden_states: Tensor<3>,
+        position_ids: Tensor<2, Int>,
+        cache: &mut KVCache,
         prec: Precision,
         use_flash_decode: bool,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         const PARTIAL_ROTARY_FACTOR: f64 = 0.25;
         const ROPE_THETA: f64 = 10_000_000.0;
 
@@ -2892,7 +3098,13 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5FullAttention<B> {
                 let k4 = key.movedim(1, 2);
                 let v4 = value.movedim(1, 2);
                 let scale = (head_dim as f32).sqrt().recip();
-                let attn = B::flash_decode(q4, k4, v4, scale, flash_decode_n_splits(total_seq));
+                let attn = crate::flash_decode::flash_decode(
+                    q4,
+                    k4,
+                    v4,
+                    scale,
+                    flash_decode_n_splits(total_seq),
+                );
                 let gated = attn.movedim(1, 2) * sigmoid(output_gate);
                 return ql3(
                     &self.o_proj_fp8,
@@ -2925,10 +3137,10 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5FullAttention<B> {
             let q_offset = total_seq - seq_len;
             let row_idx: Vec<f32> = (0..seq_len).map(|i| (q_offset + i) as f32).collect();
             let col_idx: Vec<f32> = (0..total_seq).map(|i| i as f32).collect();
-            let rows = Tensor::<B, 1>::from_floats(row_idx.as_slice(), &device)
+            let rows = Tensor::<1>::from_floats(row_idx.as_slice(), &device)
                 .unsqueeze_dim::<2>(1)
                 .repeat(&[1, total_seq]);
-            let cols = Tensor::<B, 1>::from_floats(col_idx.as_slice(), &device)
+            let cols = Tensor::<1>::from_floats(col_idx.as_slice(), &device)
                 .unsqueeze_dim::<2>(0)
                 .repeat(&[seq_len, 1]);
             Some(rows.lower(cols).unsqueeze_dims::<4>(&[0, 1]))
@@ -2956,29 +3168,23 @@ impl<B: Qwen3_5DenseQuantBackend> Qwen3_5FullAttention<B> {
     }
 }
 
-impl<B: Backend> Qwen3_5Model<B> {
+impl Qwen3_5Model {
     pub fn forward(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        position_ids: Tensor<B, 2, Int>,
-        cache: &mut Qwen3_5HybridCache<B>,
-    ) -> Tensor<B, 3>
-    where
-        B: Qwen3_5DenseQuantBackend,
-    {
+        input_ids: Tensor<2, Int>,
+        position_ids: Tensor<2, Int>,
+        cache: &mut Qwen3_5HybridCache,
+    ) -> Tensor<3> {
         self.forward_prec(input_ids, position_ids, cache, Precision::F32)
     }
 
     pub fn forward_prec(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        position_ids: Tensor<B, 2, Int>,
-        cache: &mut Qwen3_5HybridCache<B>,
+        input_ids: Tensor<2, Int>,
+        position_ids: Tensor<2, Int>,
+        cache: &mut Qwen3_5HybridCache,
         prec: Precision,
-    ) -> Tensor<B, 3>
-    where
-        B: Qwen3_5DenseQuantBackend,
-    {
+    ) -> Tensor<3> {
         assert_eq!(
             self.layers.len(),
             cache.layers.len(),
@@ -3067,6 +3273,56 @@ impl<B: Backend> Qwen3_5Model<B> {
         self.norm.forward(hidden_states)
     }
 
+    /// `docs/MEMORY_STREAMING_PLAN.md` streamed sibling of [`Self::forward_prec`]: identical
+    /// embed/attention/norm computation, but every layer's MoE sublayer streams its routed experts
+    /// through `pool` instead of reading fully-resident expert stacks. Requires the model to have been
+    /// loaded via `Qwen3_5MoeForCausalLM::load_weights_sharded_resident_core`.
+    pub fn forward_prec_streamed(
+        &self,
+        input_ids: Tensor<2, Int>,
+        position_ids: Tensor<2, Int>,
+        cache: &mut Qwen3_5HybridCache,
+        prec: Precision,
+        pool: &mut ExpertSlotPool,
+    ) -> Tensor<3> {
+        assert_eq!(
+            self.layers.len(),
+            cache.layers.len(),
+            "Qwen3.5 hybrid cache layer count mismatch"
+        );
+        let prof_device = input_ids.device();
+        let mut hidden_states = timed(&profile::EMBED, &prof_device, || {
+            self.embed_tokens.forward(input_ids).cast(DType::F32)
+        });
+        for (idx, (layer, layer_cache)) in
+            self.layers.iter().zip(cache.layers.iter_mut()).enumerate()
+        {
+            hidden_states = match (layer, layer_cache) {
+                (Qwen3_5DecoderLayer::Linear(layer), Qwen3_5HybridLayerCache::Linear(cache)) => {
+                    layer.forward_decoder_recurrent_streamed(hidden_states, cache, prec, pool, idx)
+                }
+                (Qwen3_5DecoderLayer::Full(layer), Qwen3_5HybridLayerCache::Full(cache)) => layer
+                    .forward_decoder_with_cache_streamed(
+                        hidden_states,
+                        position_ids.clone(),
+                        cache,
+                        prec,
+                        pool,
+                        idx,
+                    ),
+                (Qwen3_5DecoderLayer::Linear(_), Qwen3_5HybridLayerCache::Full(_)) => {
+                    panic!("Qwen3.5 hybrid cache layer {idx} is Full but model layer is Linear")
+                }
+                (Qwen3_5DecoderLayer::Full(_), Qwen3_5HybridLayerCache::Linear(_)) => {
+                    panic!("Qwen3.5 hybrid cache layer {idx} is Linear but model layer is Full")
+                }
+            };
+        }
+        timed(&profile::FINAL_NORM, &prof_device, || {
+            self.norm.forward(hidden_states)
+        })
+    }
+
     /// CUDA-graph-capturable single-token decode tower (spec §4): one `[B,1]` token in, final-norm
     /// hidden `[B,1,H]` out. GDN layers use the T2 static recurrent step, full-attn layers use the T3
     /// static KV step, and every layer's MoE goes through the static
@@ -3076,16 +3332,13 @@ impl<B: Backend> Qwen3_5Model<B> {
     #[allow(clippy::too_many_arguments)]
     pub fn forward_decode_static_pre(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        pos: Tensor<B, 1, Int>,
-        cache: &mut Qwen3_5HybridCache<B>,
+        input_ids: Tensor<2, Int>,
+        pos: Tensor<1, Int>,
+        cache: &mut Qwen3_5HybridCache,
         prec: Precision,
-        freqs: &Tensor<B, 1>,
-        arange_tmax: &Tensor<B, 1, Int>,
-    ) -> Tensor<B, 3>
-    where
-        B: Qwen3_5DenseQuantBackend,
-    {
+        freqs: &Tensor<1>,
+        arange_tmax: &Tensor<1, Int>,
+    ) -> Tensor<3> {
         assert_eq!(
             self.layers.len(),
             cache.layers.len(),
@@ -3128,12 +3381,9 @@ impl<B: Backend> Qwen3_5Model<B> {
     /// (1 at B=1 decode).
     pub fn preflight_static(
         &self,
-        cache: &Qwen3_5HybridCache<B>,
+        cache: &Qwen3_5HybridCache,
         tokens: usize,
-    ) -> Result<(), String>
-    where
-        B: Qwen3_5DenseQuantBackend,
-    {
+    ) -> Result<(), String> {
         if self.layers.len() != cache.layers.len() {
             return Err(format!(
                 "hybrid cache layer count {} != model layers {}",
@@ -3180,7 +3430,7 @@ impl<B: Backend> Qwen3_5Model<B> {
     /// Allocate the capture-stable GDN state buffers (`init_static`) for every linear-attention layer
     /// in `cache` that is not already static. Full-attn KV caches are made static by
     /// [`Self::new_cache_with_capacity`]; this fills the GDN gap T2 left at the model level. Idempotent.
-    pub fn init_static_caches(&self, cache: &mut Qwen3_5HybridCache<B>, batch: usize) {
+    pub fn init_static_caches(&self, cache: &mut Qwen3_5HybridCache, batch: usize) {
         let device = self.device();
         for layer in cache.layers.iter_mut() {
             if let Qwen3_5HybridLayerCache::Linear(gdn) = layer {
@@ -3191,8 +3441,8 @@ impl<B: Backend> Qwen3_5Model<B> {
         }
     }
 
-    pub fn new_cache(&self) -> Qwen3_5HybridCache<B> {
-        let cfg = &self.config.0;
+    pub fn new_cache(&self) -> Qwen3_5HybridCache {
+        let cfg = &self.config;
         Qwen3_5HybridCache::new(
             &cfg.layer_types,
             cfg.linear_num_value_heads,
@@ -3203,8 +3453,8 @@ impl<B: Backend> Qwen3_5Model<B> {
         )
     }
 
-    pub fn new_cache_with_capacity(&self, capacity: usize) -> Qwen3_5HybridCache<B> {
-        let cfg = &self.config.0;
+    pub fn new_cache_with_capacity(&self, capacity: usize) -> Qwen3_5HybridCache {
+        let cfg = &self.config;
         Qwen3_5HybridCache::with_capacity(
             &cfg.layer_types,
             cfg.linear_num_value_heads,
@@ -3216,40 +3466,36 @@ impl<B: Backend> Qwen3_5Model<B> {
         )
     }
 
-    pub(crate) fn device(&self) -> B::Device {
+    pub(crate) fn device(&self) -> Device {
         self.embed_tokens.weight.lazy_device()
     }
 }
 
-fn lazy_linear<B: Backend>(d_input: usize, d_output: usize, device: &B::Device) -> Linear<B> {
+fn lazy_linear(d_input: usize, d_output: usize, device: &Device) -> Linear {
     Linear {
         weight: lazy_param2([d_input, d_output], device),
         bias: None,
     }
 }
 
-fn lazy_embedding<B: Backend>(
-    n_embedding: usize,
-    d_model: usize,
-    device: &B::Device,
-) -> Embedding<B> {
+fn lazy_embedding(n_embedding: usize, d_model: usize, device: &Device) -> Embedding {
     Embedding {
         weight: lazy_param2([n_embedding, d_model], device),
     }
 }
 
-fn lazy_rms_norm<B: Backend>(d_model: usize, epsilon: f64, device: &B::Device) -> RmsNorm<B> {
+fn lazy_rms_norm(d_model: usize, epsilon: f64, device: &Device) -> RmsNorm {
     RmsNorm {
         gamma: lazy_param1([d_model], device),
         epsilon,
     }
 }
 
-fn lazy_param1<B: Backend>(shape: [usize; 1], device: &B::Device) -> Param<Tensor<B, 1>> {
+fn lazy_param1(shape: [usize; 1], device: &Device) -> Param<Tensor<1>> {
     Param::uninitialized(
         ParamId::new(),
-        move |dev: &B::Device, _req_grad: bool| {
-            Tensor::<B, 1>::random(shape, Distribution::Normal(0.0, 0.02), dev)
+        move |dev: &Device, _req_grad: bool| {
+            Tensor::<1>::random(shape, Distribution::Normal(0.0, 0.02), dev)
         },
         device.clone(),
         false,
@@ -3257,11 +3503,11 @@ fn lazy_param1<B: Backend>(shape: [usize; 1], device: &B::Device) -> Param<Tenso
     )
 }
 
-fn lazy_param2<B: Backend>(shape: [usize; 2], device: &B::Device) -> Param<Tensor<B, 2>> {
+fn lazy_param2(shape: [usize; 2], device: &Device) -> Param<Tensor<2>> {
     Param::uninitialized(
         ParamId::new(),
-        move |dev: &B::Device, _req_grad: bool| {
-            Tensor::<B, 2>::random(shape, Distribution::Normal(0.0, 0.02), dev)
+        move |dev: &Device, _req_grad: bool| {
+            Tensor::<2>::random(shape, Distribution::Normal(0.0, 0.02), dev)
         },
         device.clone(),
         false,
@@ -3269,11 +3515,11 @@ fn lazy_param2<B: Backend>(shape: [usize; 2], device: &B::Device) -> Param<Tenso
     )
 }
 
-fn lazy_param3<B: Backend>(shape: [usize; 3], device: &B::Device) -> Param<Tensor<B, 3>> {
+fn lazy_param3(shape: [usize; 3], device: &Device) -> Param<Tensor<3>> {
     Param::uninitialized(
         ParamId::new(),
-        move |dev: &B::Device, _req_grad: bool| {
-            Tensor::<B, 3>::random(shape, Distribution::Normal(0.0, 0.02), dev)
+        move |dev: &Device, _req_grad: bool| {
+            Tensor::<3>::random(shape, Distribution::Normal(0.0, 0.02), dev)
         },
         device.clone(),
         false,
@@ -3469,13 +3715,11 @@ fn parse_json_string(bytes: &[u8], i: &mut usize) -> Result<String, String> {
 #[cfg(test)]
 mod nvfp4_sidecar_tests {
     use super::*;
-    use burn::backend::NdArray;
+    use burn::prelude::Device;
 
     use crate::nvfp4::{
         dequant_nvfp4, dequant_nvfp4_outmajor, quantize_nvfp4, repack_kmajor_to_outmajor,
     };
-
-    type B = NdArray;
 
     fn synth(seed: u64, len: usize, scale: f32) -> Vec<f32> {
         (0..len)
@@ -3500,7 +3744,7 @@ mod nvfp4_sidecar_tests {
 
     #[test]
     fn expert_nvfp4_from_expert_parts_shapes_and_gate_up_half_scales() {
-        let device = <B as Backend>::Device::default();
+        let device = Device::default();
         let (e, h, i) = (2usize, 32usize, 16usize);
         let mut parts = Vec::new();
         let mut expected_e1 = Vec::new();
@@ -3557,7 +3801,7 @@ mod nvfp4_sidecar_tests {
             });
         }
 
-        let sidecar = ExpertNvfp4::<B>::from_expert_parts(parts.clone(), h, i, &device);
+        let sidecar = ExpertNvfp4::from_expert_parts(parts.clone(), h, i, &device);
         assert_eq!((sidecar.e, sidecar.h, sidecar.i), (e, h, i));
         assert_eq!(sidecar.qw_gu.dims(), [e, h, i]);
         assert_eq!(sidecar.bs_gu.dims(), [e, i * 2, h / 16]);
@@ -3590,15 +3834,13 @@ mod nvfp4_sidecar_tests {
 mod full_attention_static_tests {
     use super::*;
     use burn::{
-        backend::NdArray,
         module::{Param, ParamId},
         nn::{Linear, RmsNorm},
+        prelude::Device,
         tensor::TensorData,
     };
 
     use crate::rope::rope_freqs;
-
-    type B = NdArray;
 
     fn synth_value(seed: u64, idx: usize, scale: f32) -> f32 {
         let mut z = seed.wrapping_add((idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
@@ -3613,16 +3855,16 @@ mod full_attention_static_tests {
     }
 
     fn linear_from(
-        device: &<B as Backend>::Device,
+        device: &Device,
         seed: u64,
         in_dim: usize,
         out_dim: usize,
         scale: f32,
-    ) -> Linear<B> {
+    ) -> Linear {
         Linear {
             weight: Param::initialized(
                 ParamId::new(),
-                Tensor::<B, 2>::from_data(
+                Tensor::<2>::from_data(
                     TensorData::new(synth_vec(seed, in_dim * out_dim, scale), [in_dim, out_dim]),
                     device,
                 ),
@@ -3631,17 +3873,17 @@ mod full_attention_static_tests {
         }
     }
 
-    fn rms_ones(dim: usize, device: &<B as Backend>::Device) -> RmsNorm<B> {
+    fn rms_ones(dim: usize, device: &Device) -> RmsNorm {
         RmsNorm {
             gamma: Param::initialized(
                 ParamId::new(),
-                Tensor::<B, 1>::from_data(TensorData::new(vec![1.0f32; dim], [dim]), device),
+                Tensor::<1>::from_data(TensorData::new(vec![1.0f32; dim], [dim]), device),
             ),
             epsilon: 1e-6,
         }
     }
 
-    fn test_attention(device: &<B as Backend>::Device) -> Qwen3_5FullAttention<B> {
+    fn test_attention(device: &Device) -> Qwen3_5FullAttention {
         let hidden = 32;
         let num_heads = 4;
         let num_kv_heads = 2;
@@ -3660,19 +3902,19 @@ mod full_attention_static_tests {
         }
     }
 
-    fn pos1(pos: usize, device: &<B as Backend>::Device) -> Tensor<B, 1, Int> {
-        Tensor::<B, 1, Int>::from_data([pos as i64], device)
+    fn pos1(pos: usize, device: &Device) -> Tensor<1, Int> {
+        Tensor::<1, Int>::from_data([pos as i64], device)
     }
 
-    fn pos2(pos: usize, device: &<B as Backend>::Device) -> Tensor<B, 2, Int> {
+    fn pos2(pos: usize, device: &Device) -> Tensor<2, Int> {
         pos1(pos, device).reshape([1, 1])
     }
 
-    fn step(x: Tensor<B, 3>, t: usize, hidden: usize) -> Tensor<B, 3> {
+    fn step(x: Tensor<3>, t: usize, hidden: usize) -> Tensor<3> {
         x.slice([0..1, t..(t + 1), 0..hidden])
     }
 
-    fn vec3(t: Tensor<B, 3>) -> Vec<f32> {
+    fn vec3(t: Tensor<3>) -> Vec<f32> {
         t.cast(DType::F32).into_data().to_vec::<f32>().unwrap()
     }
 
@@ -3699,18 +3941,18 @@ mod full_attention_static_tests {
         let total_tokens = 5;
         let t_max = 16;
         let rotary_dim = 2;
-        let x = Tensor::<B, 3>::from_data(
+        let x = Tensor::<3>::from_data(
             TensorData::new(
                 synth_vec(0xBEEF, total_tokens * hidden, 0.30),
                 [1, total_tokens, hidden],
             ),
             &device,
         );
-        let freqs = rope_freqs::<B>(rotary_dim, 10_000_000.0, &device);
-        let arange_tmax = Tensor::<B, 1, Int>::arange(0..t_max as i64, &device);
+        let freqs = rope_freqs(rotary_dim, 10_000_000.0, &device);
+        let arange_tmax = Tensor::<1, Int>::arange(0..t_max as i64, &device);
 
-        let mut eager_cache = KVCache::<B>::new();
-        let mut static_cache = KVCache::<B>::with_capacity(t_max);
+        let mut eager_cache = KVCache::new();
+        let mut static_cache = KVCache::with_capacity(t_max);
 
         for t in 0..total_tokens {
             let eager = vec3(attn.forward_with_cache(
@@ -3754,15 +3996,15 @@ mod full_attention_static_tests {
         let head_dim = 8;
         let t_max = 16;
         let rotary_dim = 2;
-        let x = Tensor::<B, 3>::from_data(
+        let x = Tensor::<3>::from_data(
             TensorData::new(synth_vec(0xCAFE, 4 * hidden, 0.30), [1, 4, hidden]),
             &device,
         );
-        let freqs = rope_freqs::<B>(rotary_dim, 10_000_000.0, &device);
-        let arange_tmax = Tensor::<B, 1, Int>::arange(0..t_max as i64, &device);
+        let freqs = rope_freqs(rotary_dim, 10_000_000.0, &device);
+        let arange_tmax = Tensor::<1, Int>::arange(0..t_max as i64, &device);
 
-        let mut clean_cache = KVCache::<B>::with_capacity(t_max);
-        let mut poisoned_cache = KVCache::<B>::with_capacity(t_max);
+        let mut clean_cache = KVCache::with_capacity(t_max);
+        let mut poisoned_cache = KVCache::with_capacity(t_max);
         for t in 0..3 {
             let _ = attn.forward_with_cache(
                 step(x.clone(), t, hidden),
@@ -3779,14 +4021,14 @@ mod full_attention_static_tests {
         }
 
         let future = pos1(4, &device);
-        let poison_k = Tensor::<B, 4>::from_data(
+        let poison_k = Tensor::<4>::from_data(
             TensorData::new(
                 vec![1_000.0f32; num_kv_heads * head_dim],
                 [1, 1, num_kv_heads, head_dim],
             ),
             &device,
         );
-        let poison_v = Tensor::<B, 4>::from_data(
+        let poison_v = Tensor::<4>::from_data(
             TensorData::new(
                 vec![-777.0f32; num_kv_heads * head_dim],
                 [1, 1, num_kv_heads, head_dim],
@@ -3843,9 +4085,7 @@ mod static_decode_tests {
     //! robust regardless of the lazily-initialized random weights.
     use super::*;
     use crate::rope::rope_freqs;
-    use burn::backend::NdArray;
-
-    type B = NdArray;
+    use burn::prelude::Device;
 
     fn tiny_config() -> Qwen3_5MoeConfig {
         Qwen3_5MoeConfig {
@@ -3877,11 +4117,11 @@ mod static_decode_tests {
         }
     }
 
-    fn int1(vals: &[i64], device: &<B as Backend>::Device) -> Tensor<B, 1, Int> {
-        Tensor::<B, 1, Int>::from_data(vals, device)
+    fn int1(vals: &[i64], device: &Device) -> Tensor<1, Int> {
+        Tensor::<1, Int>::from_data(vals, device)
     }
 
-    fn vecf(t: Tensor<B, 2>) -> Vec<f32> {
+    fn vecf(t: Tensor<2>) -> Vec<f32> {
         t.cast(DType::F32).into_data().to_vec::<f32>().unwrap()
     }
 
@@ -3903,17 +4143,17 @@ mod static_decode_tests {
 
     #[test]
     fn qwen35_mtp_forward_draft_shape_finite_and_chains() {
-        let device = <B as Backend>::Device::default();
-        <B as Backend>::seed(&device, 20_260_702);
+        let device = Device::default();
+        device.seed(20_260_702);
         let mut cfg = tiny_config();
         cfg.mtp_num_hidden_layers = 1;
         let vocab = cfg.vocab_size;
         let hidden_size = cfg.hidden_size;
-        let model = cfg.init_causal_lm::<B>(&device);
+        let model = cfg.init_causal_lm(&device);
 
         let mut mtp_cache = model.mtp_new_cache(8);
         let hidden =
-            Tensor::<B, 3>::random([1, 1, hidden_size], Distribution::Normal(0.0, 1.0), &device);
+            Tensor::<3>::random([1, 1, hidden_size], Distribution::Normal(0.0, 1.0), &device);
         let tok_next = int1(&[5], &device).reshape([1, 1]);
         let pos = int1(&[2], &device).reshape([1, 1]);
         let (logits, mtp_hidden) = model.mtp.forward_draft(
@@ -3958,11 +4198,11 @@ mod static_decode_tests {
 
     #[test]
     fn qwen35_static_decode_matches_eager_after_prefill() {
-        let device = <B as Backend>::Device::default();
-        <B as Backend>::seed(&device, 20_260_701);
+        let device = Device::default();
+        device.seed(20_260_701);
         let cfg = tiny_config();
         let vocab = cfg.vocab_size;
-        let model = cfg.init_causal_lm::<B>(&device);
+        let model = cfg.init_causal_lm(&device);
 
         let t_max = 16;
         let prompt_len = 3usize;
@@ -3990,8 +4230,8 @@ mod static_decode_tests {
 
         // Static-decode hoisted tables.
         let rotary_dim = (cfg.head_dim as f64 * cfg.partial_rotary_factor) as usize;
-        let freqs = rope_freqs::<B>(rotary_dim, cfg.rope_theta, &device);
-        let arange_tmax = Tensor::<B, 1, Int>::arange(0..t_max as i64, &device);
+        let freqs = rope_freqs(rotary_dim, cfg.rope_theta, &device);
+        let arange_tmax = Tensor::<1, Int>::arange(0..t_max as i64, &device);
 
         for step in 0..new_tokens {
             let t = prompt_len + step;
@@ -4031,8 +4271,8 @@ mod static_decode_tests {
 
     #[test]
     fn qwen35_preflight_static_missing_init_errors_then_ok() {
-        let device = <B as Backend>::Device::default();
-        let model = tiny_config().init_causal_lm::<B>(&device);
+        let device = Device::default();
+        let model = tiny_config().init_causal_lm(&device);
 
         // A static-capacity cache whose GDN layers have NOT been init_static'd must fail preflight.
         let mut cache = model.model.new_cache_with_capacity(16);
@@ -4054,8 +4294,8 @@ mod static_decode_tests {
 
     #[test]
     fn qwen35_preflight_static_rejects_non_static_kv() {
-        let device = <B as Backend>::Device::default();
-        let model = tiny_config().init_causal_lm::<B>(&device);
+        let device = Device::default();
+        let model = tiny_config().init_causal_lm(&device);
 
         // A legacy (non-capacity) cache: GDN not static AND full-attn KV not static-capacity.
         let mut cache = model.model.new_cache();
@@ -4081,15 +4321,13 @@ mod static_decode_tests {
 mod nvfp4_expert_oracle_tests {
     use super::*;
     use burn::{
-        backend::NdArray,
-        module::{Ignored, Param, ParamId},
+        module::{Param, ParamId},
         nn::Linear,
+        prelude::Device,
         tensor::TensorData,
     };
 
     use crate::nvfp4::{dequant_nvfp4_outmajor, quantize_nvfp4, repack_kmajor_to_outmajor};
-
-    type B = NdArray;
 
     fn synth_vec(seed: u64, len: usize, scale: f32) -> Vec<f32> {
         (0..len)
@@ -4103,26 +4341,17 @@ mod nvfp4_expert_oracle_tests {
             .collect()
     }
 
-    fn linf(
-        vals: Vec<f32>,
-        in_dim: usize,
-        out_dim: usize,
-        device: &<B as Backend>::Device,
-    ) -> Linear<B> {
+    fn linf(vals: Vec<f32>, in_dim: usize, out_dim: usize, device: &Device) -> Linear {
         Linear {
             weight: Param::initialized(
                 ParamId::new(),
-                Tensor::<B, 2>::from_data(TensorData::new(vals, [in_dim, out_dim]), device),
+                Tensor::<2>::from_data(TensorData::new(vals, [in_dim, out_dim]), device),
             ),
             bias: None,
         }
     }
 
-    fn dummy_shared(
-        hidden: usize,
-        inner: usize,
-        device: &<B as Backend>::Device,
-    ) -> Qwen3_5SharedExpert<B> {
+    fn dummy_shared(hidden: usize, inner: usize, device: &Device) -> Qwen3_5SharedExpert {
         // Unused by `expert_forward`; present only to satisfy the block type.
         Qwen3_5SharedExpert {
             gate_proj: linf(vec![0.0; hidden * inner], hidden, inner, device),
@@ -4135,26 +4364,26 @@ mod nvfp4_expert_oracle_tests {
     }
 
     fn block(
-        experts: Qwen3_5FusedExperts<B>,
+        experts: Qwen3_5FusedExperts,
         hidden: usize,
         inner: usize,
         num_experts: usize,
-        device: &<B as Backend>::Device,
-    ) -> Qwen3_5SharedMoeBlock<B> {
+        device: &Device,
+    ) -> Qwen3_5SharedMoeBlock {
         Qwen3_5SharedMoeBlock {
             gate: linf(vec![0.0; hidden * num_experts], hidden, num_experts, device),
             experts,
             shared_expert: dummy_shared(hidden, inner, device),
             shared_expert_gate: linf(vec![0.0; hidden], hidden, 1, device),
-            num_experts_per_tok: Ignored(num_experts),
-            norm_topk_prob: Ignored(true),
+            num_experts_per_tok: (num_experts),
+            norm_topk_prob: (true),
         }
     }
 
-    fn placeholder_stack(device: &<B as Backend>::Device) -> Param<Tensor<B, 3>> {
+    fn placeholder_stack(device: &Device) -> Param<Tensor<3>> {
         Param::initialized(
             ParamId::new(),
-            Tensor::<B, 3>::from_data(TensorData::new(vec![0.0f32], [1, 1, 1]), device),
+            Tensor::<3>::from_data(TensorData::new(vec![0.0f32], [1, 1, 1]), device),
         )
     }
 
@@ -4171,7 +4400,7 @@ mod nvfp4_expert_oracle_tests {
 
     #[test]
     fn nvfp4_expert_forward_matches_dequant_bf16_oracle() {
-        let device = <B as Backend>::Device::default();
+        let device = Device::default();
         let (num_experts, hidden, inner, m) = (2usize, 32usize, 16usize, 3usize);
 
         let mut parts = Vec::with_capacity(num_experts);
@@ -4250,14 +4479,14 @@ mod nvfp4_expert_oracle_tests {
             Qwen3_5FusedExperts {
                 gate_up_proj: Param::initialized(
                     ParamId::new(),
-                    Tensor::<B, 3>::from_data(
+                    Tensor::<3>::from_data(
                         TensorData::new(gate_up_stack, [num_experts, inner * 2, hidden]),
                         &device,
                     ),
                 ),
                 down_proj: Param::initialized(
                     ParamId::new(),
-                    Tensor::<B, 3>::from_data(
+                    Tensor::<3>::from_data(
                         TensorData::new(down_stack, [num_experts, hidden, inner]),
                         &device,
                     ),
@@ -4284,7 +4513,7 @@ mod nvfp4_expert_oracle_tests {
             // so silu(a*g)*(u/a) ~= silu(g)*u — i.e. a gate<->up gscale swap (inflate gate by a, deflate
             // up by a) would CANCEL in the product and hide. Driving x@gate into silu's nonlinear region
             // breaks that cancellation, so the swap moves max|diff| far past 1e-4 (verified: ~0.38).
-            let x = Tensor::<B, 3>::from_data(
+            let x = Tensor::<3>::from_data(
                 TensorData::new(
                     synth_vec(0xAB00 + e as u64, m * hidden, 4.0),
                     [1, m, hidden],
@@ -4323,9 +4552,9 @@ mod nvfp4_expert_oracle_tests {
 mod fp8_expert_tests {
     use super::*;
     use burn::{
-        backend::cuda::{Cuda, CudaDevice},
         module::{Ignored, Param, ParamId},
         nn::LinearConfig,
+        prelude::Device,
         tensor::TensorData,
     };
 
@@ -4374,11 +4603,11 @@ mod fp8_expert_tests {
         in_dim: usize,
         out_dim: usize,
         scale: f32,
-    ) -> Linear<Cuda> {
+    ) -> Linear {
         Linear {
             weight: Param::initialized(
                 ParamId::new(),
-                Tensor::<Cuda, 2>::from_data(
+                Tensor::<2>::from_data(
                     TensorData::new(synth_vec(seed, in_dim * out_dim, scale), [in_dim, out_dim]),
                     device,
                 ),
@@ -4387,7 +4616,7 @@ mod fp8_expert_tests {
         }
     }
 
-    fn synthetic_fused35_block(device: &CudaDevice) -> Qwen3_5SharedMoeBlock<Cuda> {
+    fn synthetic_fused35_block(device: &CudaDevice) -> Qwen3_5SharedMoeBlock {
         let (experts, hidden, inner, top_k) = (8usize, 32usize, 16usize, 2usize);
         let gate_up_host = synth_vec(0xA501, experts * inner * 2 * hidden, 0.015);
         let down_host = synth_vec(0xD052, experts * hidden * inner, 0.015);
@@ -4398,7 +4627,7 @@ mod fp8_expert_tests {
             experts: Qwen3_5FusedExperts {
                 gate_up_proj: Param::initialized(
                     ParamId::new(),
-                    Tensor::<Cuda, 3>::from_data(
+                    Tensor::<3>::from_data(
                         TensorData::new(gate_up_host, [experts, inner * 2, hidden]),
                         device,
                     )
@@ -4406,7 +4635,7 @@ mod fp8_expert_tests {
                 ),
                 down_proj: Param::initialized(
                     ParamId::new(),
-                    Tensor::<Cuda, 3>::from_data(
+                    Tensor::<3>::from_data(
                         TensorData::new(down_host, [experts, hidden, inner]),
                         device,
                     )
@@ -4419,7 +4648,7 @@ mod fp8_expert_tests {
                 gate_proj: Linear {
                     weight: Param::initialized(
                         ParamId::new(),
-                        Tensor::<Cuda, 2>::from_data(
+                        Tensor::<2>::from_data(
                             TensorData::new(zeros_hi.clone(), [hidden, inner]),
                             device,
                         ),
@@ -4430,10 +4659,7 @@ mod fp8_expert_tests {
                 up_proj: Linear {
                     weight: Param::initialized(
                         ParamId::new(),
-                        Tensor::<Cuda, 2>::from_data(
-                            TensorData::new(zeros_hi, [hidden, inner]),
-                            device,
-                        ),
+                        Tensor::<2>::from_data(TensorData::new(zeros_hi, [hidden, inner]), device),
                     ),
                     bias: None,
                 },
@@ -4441,27 +4667,24 @@ mod fp8_expert_tests {
                 down_proj: Linear {
                     weight: Param::initialized(
                         ParamId::new(),
-                        Tensor::<Cuda, 2>::from_data(
-                            TensorData::new(zeros_ih, [inner, hidden]),
-                            device,
-                        ),
+                        Tensor::<2>::from_data(TensorData::new(zeros_ih, [inner, hidden]), device),
                     ),
                     bias: None,
                 },
                 down_proj_fp8: QuantSidecar(None),
             },
             shared_expert_gate: linear_from(device, 0x6600, hidden, 1, 0.0),
-            num_experts_per_tok: Ignored(top_k),
-            norm_topk_prob: Ignored(true),
+            num_experts_per_tok: (top_k),
+            norm_topk_prob: (true),
         }
     }
 
     #[test]
     fn fused35_bf16_forward_matches_host_loop_cuda() {
-        let device = CudaDevice::default();
+        let device = Device::cuda(0);
         let block = synthetic_fused35_block(&device);
         for tokens in [1usize, 4, 40] {
-            let x = Tensor::<Cuda, 3>::from_data(
+            let x = Tensor::<3>::from_data(
                 TensorData::new(
                     synth_vec(0x1A2B + tokens as u64, tokens * 32, 0.25),
                     [1, tokens, 32],
@@ -4500,7 +4723,7 @@ mod fp8_expert_tests {
         out_dim: usize,
         in_dim: usize,
         device: &CudaDevice,
-    ) -> (Tensor<Cuda, 3, Int>, Tensor<Cuda, 2>) {
+    ) -> (Tensor<3, Int>, Tensor<2>) {
         let mut q_all = vec![0i8; experts * in_dim * out_dim];
         let mut s_all = vec![0.0f32; experts * out_dim];
         let mut transposed = vec![0.0f32; in_dim * out_dim];
@@ -4522,18 +4745,17 @@ mod fp8_expert_tests {
             s_all[s_base..s_base + out_dim].copy_from_slice(&s);
         }
 
-        let q = Tensor::<Cuda, 3, Int>::from_data_dtype(
-            TensorData::new(q_all, [experts, in_dim, out_dim]),
-            device,
-            DType::I8,
+        let q = Tensor::<3, Int>::from_data(
+            TensorData::new(q_all, ([experts, in_dim, out_dim])),
+            (device, DType::I8),
         );
-        let s = Tensor::<Cuda, 2>::from_data(TensorData::new(s_all, [experts, out_dim]), device);
+        let s = Tensor::<2>::from_data(TensorData::new(s_all, [experts, out_dim]), device);
         (q, s)
     }
 
     #[test]
     fn fp8_expert_forward_matches_bf16_path() {
-        let device = CudaDevice::default();
+        let device = Device::cuda(0);
         let (experts, hidden, inner) = (2usize, 32usize, 64usize);
         let gate_up_host: Vec<f32> = (0..experts * inner * 2 * hidden)
             .map(|idx| ((idx % 97) as f32 - 48.0) * 0.0005)
@@ -4549,14 +4771,14 @@ mod fp8_expert_tests {
             experts: Qwen3_5FusedExperts {
                 gate_up_proj: Param::initialized(
                     ParamId::new(),
-                    Tensor::<Cuda, 3>::from_data(
+                    Tensor::<3>::from_data(
                         TensorData::new(gate_up_host.clone(), [experts, inner * 2, hidden]),
                         &device,
                     ),
                 ),
                 down_proj: Param::initialized(
                     ParamId::new(),
-                    Tensor::<Cuda, 3>::from_data(
+                    Tensor::<3>::from_data(
                         TensorData::new(down_host.clone(), [experts, hidden, inner]),
                         &device,
                     ),
@@ -4579,11 +4801,11 @@ mod fp8_expert_tests {
                 down_proj_fp8: QuantSidecar(None),
             },
             shared_expert_gate: LinearConfig::new(hidden, 1).with_bias(false).init(&device),
-            num_experts_per_tok: Ignored(1),
-            norm_topk_prob: Ignored(false),
+            num_experts_per_tok: (1),
+            norm_topk_prob: (false),
         };
 
-        let x = Tensor::<Cuda, 3>::random([1, 3, hidden], Distribution::Normal(0.0, 1.0), &device);
+        let x = Tensor::<3>::random([1, 3, hidden], Distribution::Normal(0.0, 1.0), &device);
         let reference = block
             .expert_forward(0, x.clone(), Precision::F32)
             .into_data()
@@ -4625,7 +4847,7 @@ mod fp8_expert_tests {
 
     #[test]
     fn fused35_fp8_forward_matches_host_fp8_loop_cuda() {
-        let device = CudaDevice::default();
+        let device = Device::cuda(0);
         let (experts, hidden, inner, top_k) = (8usize, 32usize, 64usize, 2usize);
         let gate_up_host = synth_vec(0xF805, experts * inner * 2 * hidden, 0.010);
         let down_host = synth_vec(0xD8F7, experts * hidden * inner, 0.010);
@@ -4638,11 +4860,11 @@ mod fp8_expert_tests {
             experts: Qwen3_5FusedExperts {
                 gate_up_proj: Param::initialized(
                     ParamId::new(),
-                    Tensor::<Cuda, 3>::from_data(TensorData::new(vec![0.0f32], [1, 1, 1]), &device),
+                    Tensor::<3>::from_data(TensorData::new(vec![0.0f32], [1, 1, 1]), &device),
                 ),
                 down_proj: Param::initialized(
                     ParamId::new(),
-                    Tensor::<Cuda, 3>::from_data(TensorData::new(vec![0.0f32], [1, 1, 1]), &device),
+                    Tensor::<3>::from_data(TensorData::new(vec![0.0f32], [1, 1, 1]), &device),
                 ),
                 fp8: ExpertQuantSidecar(Some(ExpertFp8 {
                     q_gu,
@@ -4659,7 +4881,7 @@ mod fp8_expert_tests {
                 gate_proj: Linear {
                     weight: Param::initialized(
                         ParamId::new(),
-                        Tensor::<Cuda, 2>::from_data(
+                        Tensor::<2>::from_data(
                             TensorData::new(zeros_hi.clone(), [hidden, inner]),
                             &device,
                         ),
@@ -4670,10 +4892,7 @@ mod fp8_expert_tests {
                 up_proj: Linear {
                     weight: Param::initialized(
                         ParamId::new(),
-                        Tensor::<Cuda, 2>::from_data(
-                            TensorData::new(zeros_hi, [hidden, inner]),
-                            &device,
-                        ),
+                        Tensor::<2>::from_data(TensorData::new(zeros_hi, [hidden, inner]), &device),
                     ),
                     bias: None,
                 },
@@ -4681,22 +4900,19 @@ mod fp8_expert_tests {
                 down_proj: Linear {
                     weight: Param::initialized(
                         ParamId::new(),
-                        Tensor::<Cuda, 2>::from_data(
-                            TensorData::new(zeros_ih, [inner, hidden]),
-                            &device,
-                        ),
+                        Tensor::<2>::from_data(TensorData::new(zeros_ih, [inner, hidden]), &device),
                     ),
                     bias: None,
                 },
                 down_proj_fp8: QuantSidecar(None),
             },
             shared_expert_gate: linear_from(&device, 0x6600, hidden, 1, 0.0),
-            num_experts_per_tok: Ignored(top_k),
-            norm_topk_prob: Ignored(true),
+            num_experts_per_tok: (top_k),
+            norm_topk_prob: (true),
         };
 
         for tokens in [1usize, 4] {
-            let x = Tensor::<Cuda, 3>::from_data(
+            let x = Tensor::<3>::from_data(
                 TensorData::new(
                     synth_vec(0xA8A8 + tokens as u64, tokens * hidden, 0.25),
                     [1, tokens, hidden],
@@ -4736,7 +4952,7 @@ mod fp8_expert_tests {
 
     #[test]
     fn preflight_static_gates_fused_moe_preconditions() {
-        let device = CudaDevice::default();
+        let device = Device::cuda(0);
 
         // Non-placeholder bf16 expert stacks, no fp8 sidecar: a decode-sized step preflights OK.
         let ok_block = synthetic_fused35_block(&device);
@@ -4758,11 +4974,11 @@ mod fp8_expert_tests {
         placeholder.experts = Qwen3_5FusedExperts {
             gate_up_proj: Param::initialized(
                 ParamId::new(),
-                Tensor::<Cuda, 3>::from_data(TensorData::new(vec![0.0f32], [1, 1, 1]), &device),
+                Tensor::<3>::from_data(TensorData::new(vec![0.0f32], [1, 1, 1]), &device),
             ),
             down_proj: Param::initialized(
                 ParamId::new(),
-                Tensor::<Cuda, 3>::from_data(TensorData::new(vec![0.0f32], [1, 1, 1]), &device),
+                Tensor::<3>::from_data(TensorData::new(vec![0.0f32], [1, 1, 1]), &device),
             ),
             fp8: ExpertQuantSidecar(None),
             nvfp4: ExpertNvfp4Sidecar(None),

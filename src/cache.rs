@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use burn::{
-    prelude::Backend,
+    prelude::Device,
     tensor::{DType, IndexingUpdateOp, Int, Tensor},
 };
 
@@ -22,24 +22,24 @@ use crate::qwen3_5::Qwen3_5LayerType;
 
 /// KV cache for a single attention layer.
 #[derive(Debug, Clone)]
-pub struct KVCache<B: Backend> {
+pub struct KVCache {
     /// Cached keys: `[batch, seq_len, num_kv_heads, head_dim]` (the static buffer when `capacity` is set).
-    pub key: Option<Tensor<B, 4>>,
+    pub key: Option<Tensor<4>>,
     /// Cached values: `[batch, seq_len, num_kv_heads, head_dim]`.
-    pub value: Option<Tensor<B, 4>>,
+    pub value: Option<Tensor<4>>,
     /// `Some(T_max)` ⇒ static pre-allocated buffer of this capacity; `None` ⇒ legacy `cat`.
     capacity: Option<usize>,
     /// Number of valid positions written into the static buffer.
     filled: usize,
 }
 
-impl<B: Backend> Default for KVCache<B> {
+impl Default for KVCache {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<B: Backend> KVCache<B> {
+impl KVCache {
     /// Create a new empty cache using the legacy `cat` path (O(T^2)).
     pub fn new() -> Self {
         KVCache {
@@ -64,11 +64,7 @@ impl<B: Backend> KVCache<B> {
     /// Update the cache with new key-value pairs and return the full (valid) K/V for attention.
     ///
     /// * `new_key` / `new_value` — `[batch, new_seq_len, num_kv_heads, head_dim]`.
-    pub fn update(
-        &mut self,
-        new_key: Tensor<B, 4>,
-        new_value: Tensor<B, 4>,
-    ) -> (Tensor<B, 4>, Tensor<B, 4>) {
+    pub fn update(&mut self, new_key: Tensor<4>, new_value: Tensor<4>) -> (Tensor<4>, Tensor<4>) {
         match self.capacity {
             // ---- legacy cat path (unchanged) ----
             None => {
@@ -95,8 +91,8 @@ impl<B: Backend> KVCache<B> {
                     // lazy-allocate once we know [B, kv_heads, head_dim] + the dtype (bf16 on the real model).
                     let device = new_key.device();
                     let dtype = new_key.dtype();
-                    self.key = Some(Tensor::<B, 4>::zeros([b, cap, h, d], &device).cast(dtype));
-                    self.value = Some(Tensor::<B, 4>::zeros([b, cap, h, d], &device).cast(dtype));
+                    self.key = Some(Tensor::<4>::zeros([b, cap, h, d], &device).cast(dtype));
+                    self.value = Some(Tensor::<4>::zeros([b, cap, h, d], &device).cast(dtype));
                 }
                 // `take()` so the buffer is the sole owner during slice_assign ⇒ Burn can write in place.
                 let kbuf = self
@@ -176,10 +172,10 @@ impl<B: Backend> KVCache<B> {
     /// * `new_key` / `new_value` — `[B, 1, kv_heads, head_dim]` (one decode token).
     pub fn update_static(
         &mut self,
-        pos: &Tensor<B, 1, Int>,
-        new_key: Tensor<B, 4>,
-        new_value: Tensor<B, 4>,
-    ) -> (Tensor<B, 4>, Tensor<B, 4>) {
+        pos: &Tensor<1, Int>,
+        new_key: Tensor<4>,
+        new_value: Tensor<4>,
+    ) -> (Tensor<4>, Tensor<4>) {
         let cap = self
             .capacity
             .expect("update_static requires a static (with_capacity) cache");
@@ -200,8 +196,8 @@ impl<B: Backend> KVCache<B> {
             // lazy-allocate once we know [B, kv_heads, head_dim] + the dtype (bf16 on the real model).
             let device = new_key.device();
             let dtype = new_key.dtype();
-            self.key = Some(Tensor::<B, 4>::zeros([b, cap, h, d], &device).cast(dtype));
-            self.value = Some(Tensor::<B, 4>::zeros([b, cap, h, d], &device).cast(dtype));
+            self.key = Some(Tensor::<4>::zeros([b, cap, h, d], &device).cast(dtype));
+            self.value = Some(Tensor::<4>::zeros([b, cap, h, d], &device).cast(dtype));
         }
         // Device-pos scatter: buffer[:, pos, :, :] += new (== assign; the column is still zero).
         // `take()` so the buffer is the sole owner ⇒ Burn can write in place. Returns the FULL buffer.
@@ -230,7 +226,7 @@ impl<B: Backend> KVCache<B> {
     /// preserved, so a subsequent `update` keeps writing at the same offset `filled`. A no-op until
     /// the buffer is allocated (i.e. before the first `update`). Kept rows' cached K/V are bit-for-bit
     /// unchanged, which is exactly why a shrunk decode is numerically identical for the rows it keeps.
-    pub fn select_rows(&mut self, row_idx: &Tensor<B, 1, Int>) {
+    pub fn select_rows(&mut self, row_idx: &Tensor<1, Int>) {
         if let Some(k) = self.key.take() {
             self.key = Some(k.select(0, row_idx.clone()));
         }
@@ -274,9 +270,9 @@ impl<B: Backend> KVCache<B> {
 
 /// Cache for all layers in the model.
 #[derive(Debug)]
-pub struct ModelCache<B: Backend> {
+pub struct ModelCache {
     /// Per-layer KV caches.
-    pub layers: Vec<KVCache<B>>,
+    pub layers: Vec<KVCache>,
 }
 
 /// Recurrent Gated-DeltaNet state for one Qwen3.6/Qwen3.5-MoE linear-attention layer.
@@ -284,11 +280,11 @@ pub struct ModelCache<B: Backend> {
 /// The delta-rule matrix is kept in f32 regardless of activation dtype. The convolution buffer keeps
 /// the native projection dtype and stores the last `kernel_dim - 1` unactivated qkv projections.
 #[derive(Debug, Clone)]
-pub struct GdnStateCache<B: Backend> {
+pub struct GdnStateCache {
     /// Delta-rule state: `[batch, num_value_heads, key_dim, value_dim]`, always f32.
-    pub state: Option<Tensor<B, 4>>,
+    pub state: Option<Tensor<4>>,
     /// Depthwise causal-conv history: `[batch, kernel_dim - 1, qkv_dim]`.
-    pub conv: Option<Tensor<B, 3>>,
+    pub conv: Option<Tensor<3>>,
     pub num_value_heads: usize,
     pub key_dim: usize,
     pub value_dim: usize,
@@ -304,13 +300,13 @@ pub struct GdnStateCache<B: Backend> {
 /// the buffers. The next in-place-ish [`GdnStateCache::push_conv`] or [`GdnStateCache::set_state`]
 /// mutation may therefore copy-on-write to preserve the snapshot's exact contents.
 #[derive(Debug, Clone)]
-pub struct GdnStateSnapshot<B: Backend> {
-    pub state: Option<Tensor<B, 4>>,
-    pub conv: Option<Tensor<B, 3>>,
+pub struct GdnStateSnapshot {
+    pub state: Option<Tensor<4>>,
+    pub conv: Option<Tensor<3>>,
     snap_token: Arc<()>,
 }
 
-impl<B: Backend> GdnStateCache<B> {
+impl GdnStateCache {
     pub fn new(
         num_value_heads: usize,
         key_dim: usize,
@@ -339,18 +335,18 @@ impl<B: Backend> GdnStateCache<B> {
     pub fn ensure_allocated(
         &mut self,
         batch: usize,
-        device: &B::Device,
+        device: &Device,
         conv_dtype: burn::tensor::DType,
     ) {
         if self.state.is_none() {
-            self.state = Some(Tensor::<B, 4>::zeros(
+            self.state = Some(Tensor::<4>::zeros(
                 [batch, self.num_value_heads, self.key_dim, self.value_dim],
                 device,
             ));
         }
         if self.conv.is_none() {
             self.conv = Some(
-                Tensor::<B, 3>::zeros([batch, self.kernel_dim - 1, self.qkv_dim], device)
+                Tensor::<3>::zeros([batch, self.kernel_dim - 1, self.qkv_dim], device)
                     .cast(conv_dtype),
             );
         }
@@ -360,7 +356,7 @@ impl<B: Backend> GdnStateCache<B> {
     ///
     /// Static mode keeps the delta-rule state storage alive and requires all future state updates to
     /// use [`Self::set_state_static`], which copies into this buffer instead of replacing it.
-    pub fn init_static(&mut self, batch: usize, device: &B::Device) {
+    pub fn init_static(&mut self, batch: usize, device: &Device) {
         let state_dims = [batch, self.num_value_heads, self.key_dim, self.value_dim];
         if let Some(state) = &self.state {
             assert_eq!(
@@ -370,7 +366,7 @@ impl<B: Backend> GdnStateCache<B> {
                  static state buffer"
             );
         } else {
-            self.state = Some(Tensor::<B, 4>::zeros(state_dims, device));
+            self.state = Some(Tensor::<4>::zeros(state_dims, device));
         }
         let conv_dims = [batch, self.kernel_dim - 1, self.qkv_dim];
         if let Some(conv) = &self.conv {
@@ -381,7 +377,7 @@ impl<B: Backend> GdnStateCache<B> {
                  conv ring buffer"
             );
         } else {
-            self.conv = Some(Tensor::<B, 3>::zeros(conv_dims, device).cast(DType::F32));
+            self.conv = Some(Tensor::<3>::zeros(conv_dims, device).cast(DType::F32));
         }
         self.static_mode = true;
     }
@@ -394,7 +390,7 @@ impl<B: Backend> GdnStateCache<B> {
     ///
     /// Tensor clones are cheap handle copies. While the snapshot is alive, later mutations may
     /// trigger copy-on-write because the cache no longer owns the only reference.
-    pub fn snapshot(&self) -> GdnStateSnapshot<B> {
+    pub fn snapshot(&self) -> GdnStateSnapshot {
         assert!(
             !self.static_mode,
             "GdnStateCache::snapshot is incompatible with init_static; use non-static cache mode \
@@ -408,7 +404,7 @@ impl<B: Backend> GdnStateCache<B> {
     }
 
     /// Restore a previously captured recurrent-state snapshot.
-    pub fn restore(&mut self, snap: GdnStateSnapshot<B>) {
+    pub fn restore(&mut self, snap: GdnStateSnapshot) {
         assert!(
             !self.static_mode,
             "GdnStateCache::restore is incompatible with init_static; use non-static cache mode \
@@ -425,7 +421,7 @@ impl<B: Backend> GdnStateCache<B> {
     }
 
     /// Shift in the current unactivated qkv projection and return the full history buffer.
-    pub fn push_conv(&mut self, current_qkv: Tensor<B, 2>) -> Tensor<B, 3> {
+    pub fn push_conv(&mut self, current_qkv: Tensor<2>) -> Tensor<3> {
         let [batch, qkv_dim] = current_qkv.dims();
         debug_assert_eq!(qkv_dim, self.qkv_dim);
         let device = current_qkv.device();
@@ -447,7 +443,7 @@ impl<B: Backend> GdnStateCache<B> {
     }
 
     /// Static-mode convolution push that preserves the persistent buffer address.
-    pub fn push_conv_static(&mut self, current_qkv: Tensor<B, 2>) -> Tensor<B, 3> {
+    pub fn push_conv_static(&mut self, current_qkv: Tensor<2>) -> Tensor<3> {
         assert!(
             self.static_mode,
             "GdnStateCache::push_conv_static requires init_static(batch, device) before capture; \
@@ -501,12 +497,12 @@ impl<B: Backend> GdnStateCache<B> {
         new_window
     }
 
-    pub fn set_state(&mut self, state: Tensor<B, 4>) {
+    pub fn set_state(&mut self, state: Tensor<4>) {
         self.state = Some(state.cast(DType::F32));
     }
 
     /// Copy a newly computed state into the capture-stable static state buffer.
-    pub fn set_state_static(&mut self, new_state: Tensor<B, 4>) {
+    pub fn set_state_static(&mut self, new_state: Tensor<4>) {
         assert!(
             self.static_mode,
             "GdnStateCache::set_state_static requires init_static(batch, device) before capture; \
@@ -534,7 +530,7 @@ impl<B: Backend> GdnStateCache<B> {
         ));
     }
 
-    pub fn select_rows(&mut self, row_idx: &Tensor<B, 1, Int>) {
+    pub fn select_rows(&mut self, row_idx: &Tensor<1, Int>) {
         if let Some(state) = self.state.take() {
             self.state = Some(state.select(0, row_idx.clone()));
         }
@@ -562,24 +558,24 @@ impl<B: Backend> GdnStateCache<B> {
 
 /// Per-layer recurrent GDN state cache.
 #[derive(Debug)]
-pub struct GdnModelCache<B: Backend> {
-    pub layers: Vec<GdnStateCache<B>>,
+pub struct GdnModelCache {
+    pub layers: Vec<GdnStateCache>,
 }
 
 /// Per-layer cache for the Qwen3.6/Qwen3.5-MoE hybrid tower.
 #[derive(Debug)]
-pub enum Qwen3_5HybridLayerCache<B: Backend> {
-    Linear(GdnStateCache<B>),
-    Full(KVCache<B>),
+pub enum Qwen3_5HybridLayerCache {
+    Linear(GdnStateCache),
+    Full(KVCache),
 }
 
 /// Hybrid cache matching `Qwen3_5MoeConfig::layer_types`.
 #[derive(Debug)]
-pub struct Qwen3_5HybridCache<B: Backend> {
-    pub layers: Vec<Qwen3_5HybridLayerCache<B>>,
+pub struct Qwen3_5HybridCache {
+    pub layers: Vec<Qwen3_5HybridLayerCache>,
 }
 
-impl<B: Backend> GdnModelCache<B> {
+impl GdnModelCache {
     pub fn new_qwen3_5(num_layers: usize) -> Self {
         Self {
             layers: (0..num_layers)
@@ -588,7 +584,7 @@ impl<B: Backend> GdnModelCache<B> {
         }
     }
 
-    pub fn select_rows(&mut self, row_idx: &Tensor<B, 1, Int>) {
+    pub fn select_rows(&mut self, row_idx: &Tensor<1, Int>) {
         for layer in &mut self.layers {
             layer.select_rows(row_idx);
         }
@@ -607,7 +603,7 @@ impl<B: Backend> GdnModelCache<B> {
     }
 }
 
-impl<B: Backend> Qwen3_5HybridCache<B> {
+impl Qwen3_5HybridCache {
     pub fn new(
         layer_types: &[Qwen3_5LayerType],
         num_value_heads: usize,
@@ -671,7 +667,7 @@ impl<B: Backend> Qwen3_5HybridCache<B> {
         Self { layers }
     }
 
-    pub fn select_rows(&mut self, row_idx: &Tensor<B, 1, Int>) {
+    pub fn select_rows(&mut self, row_idx: &Tensor<1, Int>) {
         for layer in &mut self.layers {
             match layer {
                 Qwen3_5HybridLayerCache::Linear(cache) => cache.select_rows(row_idx),
@@ -698,7 +694,7 @@ impl<B: Backend> Qwen3_5HybridCache<B> {
         }
     }
 
-    pub fn snapshot_gdn(&self) -> Vec<Option<GdnStateSnapshot<B>>> {
+    pub fn snapshot_gdn(&self) -> Vec<Option<GdnStateSnapshot>> {
         self.layers
             .iter()
             .map(|layer| match layer {
@@ -708,7 +704,7 @@ impl<B: Backend> Qwen3_5HybridCache<B> {
             .collect()
     }
 
-    pub fn restore_gdn(&mut self, snaps: Vec<Option<GdnStateSnapshot<B>>>) {
+    pub fn restore_gdn(&mut self, snaps: Vec<Option<GdnStateSnapshot>>) {
         assert_eq!(
             snaps.len(),
             self.layers.len(),
@@ -737,7 +733,7 @@ impl<B: Backend> Qwen3_5HybridCache<B> {
     }
 }
 
-impl<B: Backend> ModelCache<B> {
+impl ModelCache {
     /// Create a new (legacy `cat`) cache for a model with the given number of layers.
     pub fn new(num_layers: usize) -> Self {
         ModelCache {
@@ -763,7 +759,7 @@ impl<B: Backend> ModelCache<B> {
     /// Batch-shrink: gather the same subset of batch rows (`row_idx`, LOCAL positions into the
     /// current batch) in EVERY layer's K/V buffer, so the decode loop forwards only the still-active
     /// sequences. See [`KVCache::select_rows`].
-    pub fn select_rows(&mut self, row_idx: &Tensor<B, 1, Int>) {
+    pub fn select_rows(&mut self, row_idx: &Tensor<1, Int>) {
         for cache in &mut self.layers {
             cache.select_rows(row_idx);
         }
@@ -789,25 +785,23 @@ impl<B: Backend> ModelCache<B> {
 mod tests {
     use super::*;
 
-    type B = burn::backend::NdArray;
-
-    fn dev() -> <B as Backend>::Device {
+    fn dev() -> Device {
         Default::default()
     }
 
-    fn t2(vals: &[f32], dims: [usize; 2], device: &<B as Backend>::Device) -> Tensor<B, 2> {
-        Tensor::<B, 1>::from_floats(vals, device).reshape(dims)
+    fn t2(vals: &[f32], dims: [usize; 2], device: &Device) -> Tensor<2> {
+        Tensor::<1>::from_floats(vals, device).reshape(dims)
     }
 
-    fn t4(vals: &[f32], dims: [usize; 4], device: &<B as Backend>::Device) -> Tensor<B, 4> {
-        Tensor::<B, 1>::from_floats(vals, device).reshape(dims)
+    fn t4(vals: &[f32], dims: [usize; 4], device: &Device) -> Tensor<4> {
+        Tensor::<1>::from_floats(vals, device).reshape(dims)
     }
 
-    fn vec3(t: Tensor<B, 3>) -> Vec<f32> {
+    fn vec3(t: Tensor<3>) -> Vec<f32> {
         t.into_data().to_vec::<f32>().unwrap()
     }
 
-    fn vec4(t: Tensor<B, 4>) -> Vec<f32> {
+    fn vec4(t: Tensor<4>) -> Vec<f32> {
         t.into_data().to_vec::<f32>().unwrap()
     }
 
@@ -827,7 +821,7 @@ mod tests {
     #[test]
     fn kvcache_rewind_reuses_columns() {
         let device = dev();
-        let mut cache = KVCache::<B>::with_capacity(6);
+        let mut cache = KVCache::with_capacity(6);
 
         let (k, v) = cache.update(
             t4(&[1.0, 2.0], [1, 2, 1, 1], &device),
@@ -858,7 +852,7 @@ mod tests {
     #[test]
     fn gdn_snapshot_restore_exact() {
         let device = dev();
-        let mut cache = GdnStateCache::<B>::new(2, 2, 2, 3, 3);
+        let mut cache = GdnStateCache::new(2, 2, 2, 3, 3);
 
         let state_a = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let conv_a = vec![11.0, 12.0, 13.0, 21.0, 22.0, 23.0];
@@ -884,8 +878,8 @@ mod tests {
     #[test]
     fn gdn_static_set_state_matches_functional_sequence() {
         let device = dev();
-        let mut static_cache = GdnStateCache::<B>::new(2, 2, 2, 3, 3);
-        let mut functional_cache = GdnStateCache::<B>::new(2, 2, 2, 3, 3);
+        let mut static_cache = GdnStateCache::new(2, 2, 2, 3, 3);
+        let mut functional_cache = GdnStateCache::new(2, 2, 2, 3, 3);
         static_cache.init_static(2, &device);
 
         let states = [
@@ -916,8 +910,8 @@ mod tests {
     #[test]
     fn gdn_static_push_conv_matches_functional_kernel_dim_4() {
         let device = dev();
-        let mut static_cache = GdnStateCache::<B>::new(1, 2, 2, 3, 4);
-        let mut functional_cache = GdnStateCache::<B>::new(1, 2, 2, 3, 4);
+        let mut static_cache = GdnStateCache::new(1, 2, 2, 3, 4);
+        let mut functional_cache = GdnStateCache::new(1, 2, 2, 3, 4);
         static_cache.init_static(2, &device);
 
         let pushes: [[f32; 6]; 5] = [
@@ -945,7 +939,7 @@ mod tests {
     #[should_panic(expected = "GdnStateCache::snapshot is incompatible with init_static")]
     fn gdn_static_snapshot_panics() {
         let device = dev();
-        let mut cache = GdnStateCache::<B>::new(2, 2, 2, 3, 3);
+        let mut cache = GdnStateCache::new(2, 2, 2, 3, 3);
         cache.init_static(1, &device);
         let _ = cache.snapshot();
     }
@@ -954,7 +948,7 @@ mod tests {
     #[should_panic(expected = "live snapshot token")]
     fn gdn_static_set_state_with_live_snapshot_token_panics() {
         let device = dev();
-        let mut cache = GdnStateCache::<B>::new(2, 2, 2, 3, 3);
+        let mut cache = GdnStateCache::new(2, 2, 2, 3, 3);
         cache.init_static(1, &device);
         let _live_snapshot_token = cache.snap_token.clone();
         cache.set_state_static(t4(
@@ -967,7 +961,7 @@ mod tests {
     #[test]
     fn gdn_static_reset_for_replay_zeros_and_keeps_usable() {
         let device = dev();
-        let mut cache = GdnStateCache::<B>::new(2, 2, 2, 3, 3);
+        let mut cache = GdnStateCache::new(2, 2, 2, 3, 3);
         cache.init_static(1, &device);
         cache.set_state_static(t4(
             &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
@@ -1002,7 +996,7 @@ mod tests {
             Qwen3_5LayerType::FullAttention,
             Qwen3_5LayerType::LinearAttention,
         ];
-        let mut cache = Qwen3_5HybridCache::<B>::with_capacity(&layer_types, 2, 2, 2, 3, 3, 6);
+        let mut cache = Qwen3_5HybridCache::with_capacity(&layer_types, 2, 2, 2, 3, 3, 6);
 
         for (i, layer) in cache.layers.iter_mut().enumerate() {
             match layer {

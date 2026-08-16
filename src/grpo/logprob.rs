@@ -13,12 +13,11 @@
 //! `logsumexp` reduces over `V` to a `[B, T, 1]`. (Adapted from burn-ppo's `log_prob_categorical`,
 //! made memory-safe and extended from `[B, V]` to the sequence dimension `[B, T, V]`.)
 
-use burn::prelude::Backend;
 use burn::tensor::{Int, Tensor};
 
 /// `logsumexp` over the last axis of a 3-D tensor, keeping that axis as size 1.
 /// Numerically stable: subtract the per-row max before exp.
-fn logsumexp_last<B: Backend>(x: Tensor<B, 3>) -> Tensor<B, 3> {
+fn logsumexp_last(x: Tensor<3>) -> Tensor<3> {
     let m = x.clone().max_dim(2); // [b, t, 1]
     let shifted = x - m.clone(); // broadcast subtract
     shifted.exp().sum_dim(2).log() + m // [b, t, 1]
@@ -35,7 +34,7 @@ fn logsumexp_last<B: Backend>(x: Tensor<B, 3>) -> Tensor<B, 3> {
 /// for position `t`. When scoring a *generated* token at position `t`, pass the logits from
 /// position `t-1` (i.e. the caller shifts), or pass already-aligned `(logits, targets)`. This
 /// function does not shift — it scores `targets[b,t]` against `logits[b,t,:]` exactly.
-pub fn token_logprobs<B: Backend>(logits: Tensor<B, 3>, targets: Tensor<B, 2, Int>) -> Tensor<B, 2> {
+pub fn token_logprobs(logits: Tensor<3>, targets: Tensor<2, Int>) -> Tensor<2> {
     let [b, t, _v] = logits.dims();
     let lse = logsumexp_last(logits.clone()); // [b, t, 1]
     let idx = targets.unsqueeze_dim::<3>(2); // [b, t, 1]

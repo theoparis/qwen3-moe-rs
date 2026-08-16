@@ -5,9 +5,9 @@
 //!   ./target/release/examples/qwen35_gdn_check
 
 use burn::{
-    backend::cuda::{Cuda, CudaDevice},
     module::{Ignored, Param, ParamId},
     nn::{Linear, RmsNorm},
+    prelude::Device,
     tensor::{DType, Tensor, TensorData},
 };
 use qwen3_burn::{
@@ -256,46 +256,39 @@ fn rmsnorm(x: &[f32], gamma: &[f32], eps: f32) -> Vec<f32> {
         .collect()
 }
 
-fn linear_from(
-    device: &CudaDevice,
-    data: &[f32],
-    din: usize,
-    dout: usize,
-    dtype: DType,
-) -> Linear<B> {
+fn linear_from(device: &CudaDevice, data: &[f32], din: usize, dout: usize, dtype: DType) -> Linear {
     Linear {
         weight: Param::initialized(
             ParamId::new(),
-            Tensor::<B, 2>::from_data(TensorData::new(data.to_vec(), [din, dout]), device)
-                .cast(dtype),
+            Tensor::<2>::from_data(TensorData::new(data.to_vec(), [din, dout]), device).cast(dtype),
         ),
         bias: None,
     }
 }
 
-fn rms_norm_from(device: &CudaDevice, data: Vec<f32>, dtype: DType) -> RmsNorm<B> {
+fn rms_norm_from(device: &CudaDevice, data: Vec<f32>, dtype: DType) -> RmsNorm {
     let len = data.len();
     RmsNorm {
         gamma: Param::initialized(
             ParamId::new(),
-            Tensor::<B, 1>::from_data(TensorData::new(data, [len]), device).cast(dtype),
+            Tensor::<1>::from_data(TensorData::new(data, [len]), device).cast(dtype),
         ),
         epsilon: 1e-6,
     }
 }
 
-fn dummy_mlp(device: &CudaDevice) -> Qwen3_5SharedMoeBlock<B> {
+fn dummy_mlp(device: &CudaDevice) -> Qwen3_5SharedMoeBlock {
     let z1 = vec![0.0f32];
     Qwen3_5SharedMoeBlock {
         gate: linear_from(device, &z1, 1, 1, DType::F32),
         experts: Qwen3_5FusedExperts {
             gate_up_proj: Param::initialized(
                 ParamId::new(),
-                Tensor::<B, 3>::from_data(TensorData::new(z1.clone(), [1, 1, 1]), device),
+                Tensor::<3>::from_data(TensorData::new(z1.clone(), [1, 1, 1]), device),
             ),
             down_proj: Param::initialized(
                 ParamId::new(),
-                Tensor::<B, 3>::from_data(TensorData::new(z1.clone(), [1, 1, 1]), device),
+                Tensor::<3>::from_data(TensorData::new(z1.clone(), [1, 1, 1]), device),
             ),
             fp8: ExpertQuantSidecar(None),
             nvfp4: ExpertNvfp4Sidecar(None),
@@ -309,8 +302,8 @@ fn dummy_mlp(device: &CudaDevice) -> Qwen3_5SharedMoeBlock<B> {
             down_proj_fp8: QuantSidecar(None),
         },
         shared_expert_gate: linear_from(device, &z1, 1, 1, DType::F32),
-        num_experts_per_tok: Ignored(1),
-        norm_topk_prob: Ignored(true),
+        num_experts_per_tok: (1),
+        norm_topk_prob: (true),
     }
 }
 
@@ -319,7 +312,7 @@ fn build_layer(
     w: &HostWeights,
     input_norm: &[f32],
     dtype: DType,
-) -> Qwen3_5GdnLayer<B> {
+) -> Qwen3_5GdnLayer {
     let attn = Qwen3_5GdnAttention::<B> {
         in_proj_qkv: linear_from(device, &w.w_qkv, H, QKV, dtype),
         in_proj_qkv_fp8: QuantSidecar(None),
@@ -331,26 +324,23 @@ fn build_layer(
         in_proj_z_fp8: QuantSidecar(None),
         A_log: Param::initialized(
             ParamId::new(),
-            Tensor::<B, 1>::from_data(TensorData::new(w.a_log.clone(), [VH]), device).cast(dtype),
+            Tensor::<1>::from_data(TensorData::new(w.a_log.clone(), [VH]), device).cast(dtype),
         ),
         dt_bias: Param::initialized(
             ParamId::new(),
-            Tensor::<B, 1>::from_data(TensorData::new(w.dt_bias.clone(), [VH]), device).cast(dtype),
+            Tensor::<1>::from_data(TensorData::new(w.dt_bias.clone(), [VH]), device).cast(dtype),
         ),
         conv1d: Qwen3_5Conv1d {
             weight: Param::initialized(
                 ParamId::new(),
-                Tensor::<B, 3>::from_data(
-                    TensorData::new(w.conv.clone(), [QKV, 1, KERNEL]),
-                    device,
-                )
-                .cast(dtype),
+                Tensor::<3>::from_data(TensorData::new(w.conv.clone(), [QKV, 1, KERNEL]), device)
+                    .cast(dtype),
             ),
         },
         norm: RmsNorm {
             gamma: Param::initialized(
                 ParamId::new(),
-                Tensor::<B, 1>::from_data(TensorData::new(w.norm.clone(), [D]), device).cast(dtype),
+                Tensor::<1>::from_data(TensorData::new(w.norm.clone(), [D]), device).cast(dtype),
             ),
             epsilon: 1e-6,
         },
@@ -387,8 +377,7 @@ fn run_case(
         for i in 0..H {
             cpu_out[i] += x[i];
         }
-        let xb =
-            Tensor::<B, 3>::from_data(TensorData::new(x.clone(), [1, 1, H]), device).cast(dtype);
+        let xb = Tensor::<3>::from_data(TensorData::new(x.clone(), [1, 1, H]), device).cast(dtype);
         let burn_out = layer
             .forward_recurrent(xb, &mut cache, prec)
             .cast(DType::F32)
@@ -441,7 +430,7 @@ fn run_case(
 }
 
 fn main() {
-    let device = CudaDevice::default();
+    let device = Device::cuda(0);
     let w = HostWeights::new();
     let input_norm = vec![1.0f32; H];
     let mut rng = Rng64::new(0x1234_5678_9abc_def0);

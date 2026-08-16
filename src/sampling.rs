@@ -31,7 +31,11 @@ pub fn sample_index(probs: &[f32], top_k: usize, top_p: f32, r: f32) -> usize {
     idx.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
     // top-k: keep the k highest
-    let k = if top_k > 0 && top_k < idx.len() { top_k } else { idx.len() };
+    let k = if top_k > 0 && top_k < idx.len() {
+        top_k
+    } else {
+        idx.len()
+    };
     idx.truncate(k);
 
     // top-p (nucleus): keep the smallest prefix whose cumulative (renormalized) mass >= top_p
@@ -74,7 +78,11 @@ mod tests {
     fn top_k_one_is_argmax() {
         let p = [0.1, 0.7, 0.2];
         for r in [0.0, 0.3, 0.99] {
-            assert_eq!(sample_index(&p, 1, 1.0, r), 1, "top_k=1 must always pick argmax");
+            assert_eq!(
+                sample_index(&p, 1, 1.0, r),
+                1,
+                "top_k=1 must always pick argmax"
+            );
         }
     }
 

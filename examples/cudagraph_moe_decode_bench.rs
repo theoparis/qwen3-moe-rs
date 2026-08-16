@@ -37,8 +37,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use burn::tensor::backend::Backend;
-use burn::tensor::{DType, Int, Tensor};
+use burn::tensor::{DType, Device, Int, Tensor};
 use cubecl::Runtime;
 use cubecl::cuda::CudaRuntime;
 use qwen3_burn::capture::{
@@ -130,9 +129,9 @@ struct Captured {
 /// reset to clean post-prefill state, replay `max_new` times. Mirrors P-final's `captured_greedy_decode`,
 /// batch=1, greedy (no RNG => no C3 needed). Returns the token ids + arena high-water + replay ms/token.
 fn captured_greedy_decode(
-    model: &Qwen3MoeForCausalLM<B>,
-    input_ids: Tensor<B, 2, Int>,
-    sd: &MoeStaticDecode<B>,
+    model: &Qwen3MoeForCausalLM,
+    input_ids: Tensor<2, Int>,
+    sd: &MoeStaticDecode,
     max_new: usize,
     eos: &[i64],
     vocab: usize,
@@ -151,8 +150,8 @@ fn captured_greedy_decode(
     let cache = model.model.new_cache_with_capacity(total);
 
     // ---- prefill (eager, variable-shape — NOT captured): KV cols 0..lp + first logits -> last_buf ----
-    let prefill = |state: &mut DecodeState<B>| {
-        let pos0 = Tensor::<B, 1, Int>::arange(0..lp as i64, &device)
+    let prefill = |state: &mut DecodeState| {
+        let pos0 = Tensor::<1, Int>::arange(0..lp as i64, &device)
             .unsqueeze_dim::<2>(0)
             .repeat(&[b, 1]);
         let logits =
@@ -174,14 +173,14 @@ fn captured_greedy_decode(
 
     // ---- the captured ONE-STEP closure: structurally identical to generate_greedy_static's loop body,
     //      but with in-place writeback into the persistent buffers (take()+single-op, NEVER clone). ----
-    let step = |state: &mut DecodeState<B>| {
+    let step = |state: &mut DecodeState| {
         let last = state.last.take().unwrap(); // storage L (unique)
         let sampled = last.clone().argmax(1); // [b,1] Int (greedy argmax, device)
 
         // EOS / finished (Int 0/1): pre-step state drives the emit, then update.
         let fin = state.finished.take().unwrap(); // [b,1] Int (unique)
         let emit = sampled.mask_where(fin.clone().equal_elem(1i64), state.pad.clone()); // pad finished rows
-        let mut is_eos = Tensor::<B, 2, Int>::zeros([b, 1], &device).equal_elem(1i64); // all false
+        let mut is_eos = Tensor::<2, Int>::zeros([b, 1], &device).equal_elem(1i64); // all false
         for &e in eos {
             is_eos = is_eos.bool_or(emit.clone().equal_elem(e));
         }
@@ -270,7 +269,7 @@ fn run() -> Result<(), String> {
     // Fusion, so the capture records them — same hazard surface (no `CubeCount::Dynamic`).
     let fused = args.iter().any(|x| x == "--fused");
 
-    let device: <B as Backend>::Device = Default::default();
+    let device: Device = Default::default();
     let client = CudaRuntime::client(&device);
     println!("device: {device:?} | RAW CubeBackend<CudaRuntime> (below Fusion)");
     println!(
@@ -290,7 +289,7 @@ fn run() -> Result<(), String> {
     );
 
     let tokenizer = Qwen3Tokenizer::from_file(dir.join("tokenizer.json"))?;
-    let mut model = cfg.init_causal_lm::<B>(&device);
+    let mut model = cfg.init_causal_lm(&device);
     println!("loading sharded weights from {dir:?} (RAW backend, below Fusion) ...");
     let t0 = Instant::now();
     model
@@ -305,8 +304,8 @@ fn run() -> Result<(), String> {
     let (ids_u32, _) = tokenizer.encode_no_pad(&prompt)?;
     let prompt_ids: Vec<i64> = ids_u32.iter().map(|&x| x as i64).collect();
     let lp = prompt_ids.len();
-    let input: Tensor<B, 2, Int> =
-        Tensor::<B, 1, Int>::from_data(prompt_ids.as_slice(), &device).unsqueeze();
+    let input: Tensor<2, Int> =
+        Tensor::<1, Int>::from_data(prompt_ids.as_slice(), &device).unsqueeze();
     println!("\nprompt ({lp} tok): {prompt:?}");
 
     let total = lp + max_new;
@@ -334,7 +333,7 @@ fn run() -> Result<(), String> {
     block_sync(&client);
     // prefill-only (subtracted from e2e): reuse one cache, reset in place between reps.
     let mut pcache = model.model.new_cache_with_capacity(total);
-    let pos0 = Tensor::<B, 1, Int>::arange(0..lp as i64, &device).unsqueeze_dim::<2>(0);
+    let pos0 = Tensor::<1, Int>::arange(0..lp as i64, &device).unsqueeze_dim::<2>(0);
     let _ = model.forward_with_cache(input.clone(), None, pos0.clone(), &mut pcache); // warm+alloc
     block_sync(&client);
     let mut prefill_ms = Vec::new();

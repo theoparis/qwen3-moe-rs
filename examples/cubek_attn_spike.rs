@@ -72,7 +72,10 @@ fn read_f32(client: &Client, out: &TensorHandle<R>) -> Vec<f32> {
 
 fn read_bf16(client: &Client, out: &TensorHandle<R>) -> Vec<f32> {
     let bytes = client.read_one_tensor(out.as_copy_descriptor());
-    bf16::from_bytes(&bytes).iter().map(|x| x.to_f32()).collect()
+    bf16::from_bytes(&bytes)
+        .iter()
+        .map(|x| x.to_f32())
+        .collect()
 }
 fn read_f16(client: &Client, out: &TensorHandle<R>) -> Vec<f32> {
     let bytes = client.read_one_tensor(out.as_copy_descriptor());
@@ -93,7 +96,10 @@ impl Lcg {
         Lcg(s)
     }
     fn next(&mut self, amp: f32) -> f32 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u = ((self.0 >> 33) as u32) as f32 / (u32::MAX as f32);
         (u * 2.0 - 1.0) * amp
     }
@@ -130,13 +136,16 @@ fn reference(
                 let mut mx = f32::NEG_INFINITY;
                 for j in 0..skv {
                     let masked = (causal && j > i)
-                        || mask.map(|m| m[((bi * hq + h) * sq + i) * skv + j]).unwrap_or(false);
+                        || mask
+                            .map(|m| m[((bi * hq + h) * sq + i) * skv + j])
+                            .unwrap_or(false);
                     if masked {
                         continue;
                     }
                     let mut dot = 0.0f32;
                     for dd in 0..d {
-                        dot += q[((bi * hq + h) * sq + i) * d + dd] * k[((bi * hkv + hk) * skv + j) * d + dd];
+                        dot += q[((bi * hq + h) * sq + i) * d + dd]
+                            * k[((bi * hkv + hk) * skv + j) * d + dd];
                     }
                     dot *= scale;
                     scores[j] = dot;
@@ -180,7 +189,10 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     (dot / (na.sqrt() * nb.sqrt())) as f32
 }
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max)
 }
 fn has_nan(a: &[f32]) -> bool {
     a.iter().any(|x| x.is_nan())
@@ -210,7 +222,7 @@ fn run(
     q: &[f32],
     k: &[f32],
     v: &[f32],
-    q_shape: &[usize], // [b,hq,sq,d]
+    q_shape: &[usize],  // [b,hq,sq,d]
     kv_shape: &[usize], // [b,hkv,skv,d]
     mask: Option<(&[u8], &[usize])>,
     causal: bool,
@@ -250,7 +262,10 @@ fn run(
     let out_shape = [q_shape[0], q_shape[1], q_shape[2], kv_shape[3]];
     let out = empty_out(client, &out_shape, float_st);
 
-    let opts = AttentionOptions { causal, ..Default::default() };
+    let opts = AttentionOptions {
+        causal,
+        ..Default::default()
+    };
     launch::<R>(strategy, client, qh, kh, vh, mh, out.clone(), &gtypes, opts)
         .map_err(|e| format!("setup: {e:?}"))?;
     block_sync(client).map_err(|e| format!("exec: {e}"))?;
@@ -270,7 +285,11 @@ fn report(label: &str, dev: &Result<Vec<f32>, String>, oracle: &[f32], thresh: f
         }
         Ok(out) => {
             if out.len() != oracle.len() {
-                println!("  {label:30} -> LEN MISMATCH dev={} oracle={}", out.len(), oracle.len());
+                println!(
+                    "  {label:30} -> LEN MISMATCH dev={} oracle={}",
+                    out.len(),
+                    oracle.len()
+                );
                 return false;
             }
             let cos = cosine(out, oracle);
@@ -288,7 +307,7 @@ fn report(label: &str, dev: &Result<Vec<f32>, String>, oracle: &[f32], thresh: f
 }
 
 fn main() {
-    let device = CudaDevice::default();
+    let device = Device::cuda(0);
     let client = CudaRuntime::client(&device);
     println!("device: {device:?} | RAW cubek_attention::launch on CudaRuntime (sm_121 / GB10)");
     println!("oracle: CPU f32 softmax(QKᵀ/√d + mask)·V  (independent reference)\n");
@@ -309,16 +328,71 @@ fn main() {
         let oracle = reference(&q, &k, &v, b, h, h, sq, skv, d, true, None);
         let qs = [b, h, sq, d];
         let kvs = [b, h, skv, d];
-        let r_acc_f32 = run(&client, Strat::Accel, Dtype::F32, &q, &k, &v, &qs, &kvs, None, true);
+        let r_acc_f32 = run(
+            &client,
+            Strat::Accel,
+            Dtype::F32,
+            &q,
+            &k,
+            &v,
+            &qs,
+            &kvs,
+            None,
+            true,
+        );
         report("Accelerated f32", &r_acc_f32, &oracle, 0.99);
-        let r_unit_f32 = run(&client, Strat::Unit, Dtype::F32, &q, &k, &v, &qs, &kvs, None, true);
+        let r_unit_f32 = run(
+            &client,
+            Strat::Unit,
+            Dtype::F32,
+            &q,
+            &k,
+            &v,
+            &qs,
+            &kvs,
+            None,
+            true,
+        );
         report("Unit f32", &r_unit_f32, &oracle, 0.9999);
-        let r_acc_bf16 = run(&client, Strat::Accel, Dtype::Bf16, &q, &k, &v, &qs, &kvs, None, true);
+        let r_acc_bf16 = run(
+            &client,
+            Strat::Accel,
+            Dtype::Bf16,
+            &q,
+            &k,
+            &v,
+            &qs,
+            &kvs,
+            None,
+            true,
+        );
         report("Accelerated bf16", &r_acc_bf16, &oracle, 0.98);
-        let r_unit_bf16 = run(&client, Strat::Unit, Dtype::Bf16, &q, &k, &v, &qs, &kvs, None, true);
+        let r_unit_bf16 = run(
+            &client,
+            Strat::Unit,
+            Dtype::Bf16,
+            &q,
+            &k,
+            &v,
+            &qs,
+            &kvs,
+            None,
+            true,
+        );
         report("Unit bf16", &r_unit_bf16, &oracle, 0.98);
         // Does ANY tensor-core dtype compile on sm_121? Probe f16 (sometimes registered when bf16 isn't).
-        let r_acc_f16 = run(&client, Strat::Accel, Dtype::F16, &q, &k, &v, &qs, &kvs, None, true);
+        let r_acc_f16 = run(
+            &client,
+            Strat::Accel,
+            Dtype::F16,
+            &q,
+            &k,
+            &v,
+            &qs,
+            &kvs,
+            None,
+            true,
+        );
         report("Accelerated f16", &r_acc_f16, &oracle, 0.98);
     }
 
@@ -326,7 +400,9 @@ fn main() {
     // TEST 3a — DECODE shape, VARIABLE KV length, no causal/mask (single query attends ALL keys).
     //           This is the O(pos) decode path: KV length is a free runtime dim (re-launch grows it).
     // =========================================================================================
-    println!("\n== TEST 3a: DECODE  b1 h8 sq1 skv={{64,1024}} d128  causal=false, no mask (attend all) ==");
+    println!(
+        "\n== TEST 3a: DECODE  b1 h8 sq1 skv={{64,1024}} d128  causal=false, no mask (attend all) =="
+    );
     for &skv in &[64usize, 1024usize] {
         let (b, h, sq) = (1, 8, 1);
         let q = make_data(b * h * sq * d, 10 + skv as u64);
@@ -335,12 +411,50 @@ fn main() {
         let oracle = reference(&q, &k, &v, b, h, h, sq, skv, d, false, None);
         let qs = [b, h, sq, d];
         let kvs = [b, h, skv, d];
-        let r_acc = run(&client, Strat::Accel, Dtype::F32, &q, &k, &v, &qs, &kvs, None, false);
+        let r_acc = run(
+            &client,
+            Strat::Accel,
+            Dtype::F32,
+            &q,
+            &k,
+            &v,
+            &qs,
+            &kvs,
+            None,
+            false,
+        );
         report(&format!("Accelerated f32 skv={skv}"), &r_acc, &oracle, 0.99);
-        let r_unit = run(&client, Strat::Unit, Dtype::F32, &q, &k, &v, &qs, &kvs, None, false);
+        let r_unit = run(
+            &client,
+            Strat::Unit,
+            Dtype::F32,
+            &q,
+            &k,
+            &v,
+            &qs,
+            &kvs,
+            None,
+            false,
+        );
         report(&format!("Unit f32 skv={skv}"), &r_unit, &oracle, 0.9999);
-        let r_bf16 = run(&client, Strat::Accel, Dtype::Bf16, &q, &k, &v, &qs, &kvs, None, false);
-        report(&format!("Accelerated bf16 skv={skv}"), &r_bf16, &oracle, 0.98);
+        let r_bf16 = run(
+            &client,
+            Strat::Accel,
+            Dtype::Bf16,
+            &q,
+            &k,
+            &v,
+            &qs,
+            &kvs,
+            None,
+            false,
+        );
+        report(
+            &format!("Accelerated bf16 skv={skv}"),
+            &r_bf16,
+            &oracle,
+            0.98,
+        );
     }
 
     // =========================================================================================
@@ -369,9 +483,31 @@ fn main() {
         let qs = [b, h, sq, d];
         let kvs = [b, h, skv, d];
         let ms = [b, h, sq, skv];
-        let r_acc = run(&client, Strat::Accel, Dtype::F32, &q, &k, &v, &qs, &kvs, Some((&mu, &ms)), false);
+        let r_acc = run(
+            &client,
+            Strat::Accel,
+            Dtype::F32,
+            &q,
+            &k,
+            &v,
+            &qs,
+            &kvs,
+            Some((&mu, &ms)),
+            false,
+        );
         report("Accelerated f32 (masked)", &r_acc, &oracle, 0.99);
-        let r_unit = run(&client, Strat::Unit, Dtype::F32, &q, &k, &v, &qs, &kvs, Some((&mu, &ms)), false);
+        let r_unit = run(
+            &client,
+            Strat::Unit,
+            Dtype::F32,
+            &q,
+            &k,
+            &v,
+            &qs,
+            &kvs,
+            Some((&mu, &ms)),
+            false,
+        );
         report("Unit f32 (masked)", &r_unit, &oracle, 0.9999);
     }
 
@@ -387,7 +523,9 @@ fn main() {
     //          to mismatch the GQA reference (or fault). A device fault here can't taint earlier
     //          results, which are already printed.  Compared against a GQA (expand) reference.
     // =========================================================================================
-    println!("\n== TEST 2: GQA probe (LAST)  q heads=8, K/V heads=2, sq1 skv64 d128  causal=false ==");
+    println!(
+        "\n== TEST 2: GQA probe (LAST)  q heads=8, K/V heads=2, sq1 skv64 d128  causal=false =="
+    );
     {
         let (b, hq, hkv, sq, skv) = (1, 8, 2, 1, 64);
         let q = make_data(b * hq * sq * d, 7);
@@ -396,7 +534,18 @@ fn main() {
         let oracle = reference(&q, &k, &v, b, hq, hkv, sq, skv, d, false, None); // expands 2->8
         let qs = [b, hq, sq, d];
         let kvs = [b, hkv, skv, d];
-        let r = run(&client, Strat::Unit, Dtype::F32, &q, &k, &v, &qs, &kvs, None, false);
+        let r = run(
+            &client,
+            Strat::Unit,
+            Dtype::F32,
+            &q,
+            &k,
+            &v,
+            &qs,
+            &kvs,
+            None,
+            false,
+        );
         let ok = report("Unit f32 (mismatched heads)", &r, &oracle, 0.99);
         println!(
             "  -> GQA verdict: {}",
@@ -446,7 +595,10 @@ fn perf(client: &Client, d: usize) {
             None,
             out,
             &gtypes,
-            AttentionOptions { causal: false, ..Default::default() },
+            AttentionOptions {
+                causal: false,
+                ..Default::default()
+            },
         )
     };
     // warmup
@@ -460,13 +612,15 @@ fn perf(client: &Client, d: usize) {
     }
     let _ = block_sync(client);
     let cubek_us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
-    println!("  cubek-attention (Unit f32, SIMT):  {cubek_us:8.2} us/call  (Accelerated/CMMA unavailable on sm_121)");
+    println!(
+        "  cubek-attention (Unit f32, SIMT):  {cubek_us:8.2} us/call  (Accelerated/CMMA unavailable on sm_121)"
+    );
 
     // --- Burn attention_fallback (the path we use today) ---
     use burn::backend::cuda::Cuda;
-    use burn::tensor::{TensorData, ops::AttentionModuleOptions};
-    type T4 = burn::tensor::Tensor<Cuda, 4>;
-    let bdev = <Cuda as burn::prelude::Backend>::Device::default();
+    use burn::tensor::{Device, TensorData, ops::AttentionModuleOptions};
+    type T4 = burn::tensor::Tensor<4>;
+    let bdev = <Cuda as burn::prelude::Device>::Device::default();
     let qb = T4::from_data(TensorData::new(q.clone(), qs), &bdev);
     let kb = T4::from_data(TensorData::new(k.clone(), kvs), &bdev);
     let vb = T4::from_data(TensorData::new(v.clone(), kvs), &bdev);
@@ -493,7 +647,9 @@ fn perf(client: &Client, d: usize) {
     }
     let _ = last.into_data(); // force the whole queue
     let fb_us = t1.elapsed().as_secs_f64() * 1e6 / iters as f64;
-    println!("  Burn attention_fallback (f32):     {fb_us:8.2} us/call  (reference SDPA, what we use now)");
+    println!(
+        "  Burn attention_fallback (f32):     {fb_us:8.2} us/call  (reference SDPA, what we use now)"
+    );
     println!(
         "  -> cubek is ~{:.2}x {} than the fallback on this shape (rough; input-upload included for cubek)",
         (fb_us / cubek_us).max(cubek_us / fb_us),

@@ -1,7 +1,7 @@
 #![cfg(feature = "cuda")]
 
 use burn::{
-    prelude::Backend,
+    prelude::Device,
     tensor::{Int, Tensor},
 };
 use cubecl::{Runtime, cuda::CudaRuntime};
@@ -46,7 +46,7 @@ fn tiny_config() -> Qwen3_5MoeConfig {
     }
 }
 
-fn sync(device: &<B as Backend>::Device) {
+fn sync(device: &Device) {
     let client = CudaRuntime::client(device);
     cubecl::future::block_on(client.sync()).expect("sync failed");
 }
@@ -56,8 +56,8 @@ fn sync(device: &<B as Backend>::Device) {
 #[test]
 #[ignore = "GPU VA/allocator-stability probe; run explicitly on the CUDA orchestrator"]
 fn qwen35_hybrid_decode_state_va_and_allocs_stay_stable() {
-    let device = <B as Backend>::Device::default();
-    <B as Backend>::seed(&device, 20_260_702);
+    let device = Device::default();
+    device.seed(20_260_702);
 
     let cfg = tiny_config();
     let vocab = cfg.vocab_size;
@@ -66,12 +66,12 @@ fn qwen35_hybrid_decode_state_va_and_allocs_stay_stable() {
     let prompt_len = 1usize;
     assert!(prompt_len + max_new <= t_max);
 
-    let model = cfg.init_causal_lm::<B>(&device);
+    let model = cfg.init_causal_lm(&device);
     let mut cache = model.model.new_cache_with_capacity(t_max);
     model.init_static_caches(&mut cache, 1);
 
-    let prompt_ids = Tensor::<B, 2, Int>::from_data([[3i64]], &device);
-    let prompt_pos = Tensor::<B, 2, Int>::from_data([[0i64]], &device);
+    let prompt_ids = Tensor::<2, Int>::from_data([[3i64]], &device);
+    let prompt_pos = Tensor::<2, Int>::from_data([[0i64]], &device);
     let _ = model.forward_prec(prompt_ids, prompt_pos, &mut cache, Precision::F32);
     sync(&device);
 
@@ -86,7 +86,7 @@ fn qwen35_hybrid_decode_state_va_and_allocs_stay_stable() {
 
     let rotary_dim = (cfg.head_dim as f64 * cfg.partial_rotary_factor) as usize;
     let freqs = rope_freqs::<B>(rotary_dim, cfg.rope_theta, &device);
-    let arange_tmax = Tensor::<B, 1, Int>::arange(0..t_max as i64, &device);
+    let arange_tmax = Tensor::<1, Int>::arange(0..t_max as i64, &device);
     let client = CudaRuntime::client(&device);
 
     let snapshot = Qwen35VaSnapshot::from_hybrid(&state);

@@ -16,23 +16,22 @@
 //!    (`O(T)`). Bit-identical to `group_sample` under greedy sampling (parity-tested); the trainer
 //!    uses this one.
 
-use burn::prelude::Backend;
-use burn::tensor::{Bool, IndexingUpdateOp, Int, Tensor};
+use burn::tensor::{Bool, DType, Device, IndexingUpdateOp, Int, Tensor};
 use rand::Rng;
 
+use crate::Qwen3ForCausalLM;
 use crate::sampling::sample_index;
 use crate::sampling_device::{device_select_tokens, device_token_logp, logsumexp_dim1};
-use crate::Qwen3ForCausalLM;
 
 /// Result of a group rollout. `N = num_prompts * group_size`, laid out prompt-major.
-pub struct Rollouts<B: Backend> {
+pub struct Rollouts {
     /// Prompt + completion token ids, right-padded. `[N, prompt_len + gen_len]`.
-    pub seq_ids: Tensor<B, 2, Int>,
+    pub seq_ids: Tensor<2, Int>,
     /// `1.0` for real completion tokens (up to & incl. each sequence's first EOS), else `0.0`.
     /// `[N, gen_len]`.
-    pub completion_mask: Tensor<B, 2>,
+    pub completion_mask: Tensor<2>,
     /// Raw model log-prob of each sampled completion token (pre-warp). `[N, gen_len]`.
-    pub old_logprobs: Tensor<B, 2>,
+    pub old_logprobs: Tensor<2>,
     pub prompt_len: usize,
     pub gen_len: usize,
 }
@@ -49,7 +48,13 @@ pub struct RolloutConfig {
 
 impl Default for RolloutConfig {
     fn default() -> Self {
-        RolloutConfig { group_size: 8, max_new_tokens: 256, temperature: 1.0, top_p: 1.0, top_k: 0 }
+        RolloutConfig {
+            group_size: 8,
+            max_new_tokens: 256,
+            temperature: 1.0,
+            top_p: 1.0,
+            top_k: 0,
+        }
     }
 }
 
@@ -58,7 +63,11 @@ impl Default for RolloutConfig {
 /// `steps[t][s]` is the token sampled at step `t` for sequence `s`. Returns per-sequence response
 /// lengths and a row-major `[N * gen_len]` mask: `1.0` up to AND INCLUDING each sequence's first
 /// EOS token, `0.0` afterward (padding). Sequences with no EOS are fully unmasked.
-pub(crate) fn build_completion_mask(steps: &[Vec<i64>], eos: &[i64], n: usize) -> (Vec<usize>, Vec<f32>) {
+pub(crate) fn build_completion_mask(
+    steps: &[Vec<i64>],
+    eos: &[i64],
+    n: usize,
+) -> (Vec<usize>, Vec<f32>) {
     let gen_len = steps.len();
     let mut mask = vec![0.0f32; n * gen_len];
     let mut lengths = vec![gen_len; n];
@@ -86,7 +95,11 @@ pub(crate) fn raw_token_logprob(logits_row: &[f32], token: usize) -> f32 {
     // A sampled/EOS token id should always be < vocab; assert in debug to surface a tokenizer/EOS
     // mismatch instead of silently clamping it to a wrong logit (review fix). The clamp remains a
     // release-mode safety net.
-    debug_assert!(token < logits_row.len(), "token id {token} out of range for vocab {}", logits_row.len());
+    debug_assert!(
+        token < logits_row.len(),
+        "token id {token} out of range for vocab {}",
+        logits_row.len()
+    );
     let m = logits_row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let lse = m + logits_row.iter().map(|x| (x - m).exp()).sum::<f32>().ln();
     logits_row[token.min(logits_row.len() - 1)] - lse
@@ -98,7 +111,9 @@ fn softmax_temp(row: &[f32], temp: f32) -> Vec<f32> {
         let argmax = row
             .iter()
             .enumerate()
-            .fold((0usize, f32::NEG_INFINITY), |b, (i, &x)| if x > b.1 { (i, x) } else { b })
+            .fold((0usize, f32::NEG_INFINITY), |b, (i, &x)| {
+                if x > b.1 { (i, x) } else { b }
+            })
             .0;
         let mut p = vec![0.0f32; row.len()];
         p[argmax] = 1.0;
@@ -122,7 +137,7 @@ fn sample_step(
     v: usize,
     finished: &[bool],
     cfg: &RolloutConfig,
-    rng: &mut impl Rng,
+    _rng: &mut impl Rng,
     eos: &[i64],
 ) -> (Vec<i64>, Vec<f32>) {
     let mut next = Vec::with_capacity(n);
@@ -133,7 +148,7 @@ fn sample_step(
             eos.first().copied().unwrap_or(0) // pad finished sequences
         } else {
             let probs = softmax_temp(row, cfg.temperature);
-            let r: f32 = rng.random();
+            let r: f32 = rand::random::<f32>();
             sample_index(&probs, cfg.top_k, cfg.top_p, r) as i64
         };
         logp.push(raw_token_logprob(row, tok as usize)); // RAW logp (pre-warp)
@@ -146,15 +161,15 @@ fn sample_step(
 ///
 /// `steps_*` are step-major (`[t][s]`); we transpose `old_logprobs` to the `[N, gen_len]` row-major
 /// layout that aligns with `completion_mask`.
-fn finalize_rollouts<B: Backend>(
-    seq_ids: Tensor<B, 2, Int>,
+fn finalize_rollouts(
+    seq_ids: Tensor<2, Int>,
     steps_tokens: &[Vec<i64>],
     steps_logp: &[Vec<f32>],
     eos: &[i64],
     n: usize,
     prompt_len: usize,
-    device: &B::Device,
-) -> Rollouts<B> {
+    device: &Device,
+) -> Rollouts {
     let gen_len = steps_tokens.len();
     let (_lengths, mask_flat) = build_completion_mask(steps_tokens, eos, n);
     let mut logp_flat = vec![0.0f32; n * gen_len];
@@ -165,8 +180,9 @@ fn finalize_rollouts<B: Backend>(
     }
     Rollouts {
         seq_ids,
-        completion_mask: Tensor::<B, 1>::from_floats(mask_flat.as_slice(), device).reshape([n, gen_len]),
-        old_logprobs: Tensor::<B, 1>::from_floats(logp_flat.as_slice(), device).reshape([n, gen_len]),
+        completion_mask: Tensor::<1>::from_floats(mask_flat.as_slice(), device)
+            .reshape([n, gen_len]),
+        old_logprobs: Tensor::<1>::from_floats(logp_flat.as_slice(), device).reshape([n, gen_len]),
         prompt_len,
         gen_len,
     }
@@ -177,17 +193,20 @@ fn finalize_rollouts<B: Backend>(
 ///
 /// Captures, per generated token: the sampled id, the RAW (pre-warp) log-prob, and per-sequence
 /// EOS. Precision is the model's training precision (f32 by default for rollouts).
-pub fn group_sample<B: Backend>(
-    model: &Qwen3ForCausalLM<B>,
-    prompt_ids: Tensor<B, 2, Int>,
+pub fn group_sample(
+    model: &Qwen3ForCausalLM,
+    prompt_ids: Tensor<2, Int>,
     cfg: &RolloutConfig,
     eos: &[i64],
-) -> Rollouts<B> {
+) -> Rollouts {
     let device = prompt_ids.device();
     let [p, lp] = prompt_ids.dims();
     let n = p * cfg.group_size;
 
-    let mut generated = prompt_ids.unsqueeze_dim::<3>(1).repeat(&[1, cfg.group_size, 1]).reshape([n, lp]);
+    let mut generated = prompt_ids
+        .unsqueeze_dim::<3>(1)
+        .repeat(&[1, cfg.group_size, 1])
+        .reshape([n, lp]);
     let mut steps_tokens: Vec<Vec<i64>> = Vec::with_capacity(cfg.max_new_tokens);
     let mut steps_logp: Vec<Vec<f32>> = Vec::with_capacity(cfg.max_new_tokens);
     let mut finished = vec![false; n];
@@ -208,7 +227,7 @@ pub fn group_sample<B: Backend>(
         steps_tokens.push(next.clone());
         steps_logp.push(logp_step);
 
-        let next_t = Tensor::<B, 1, Int>::from_data(next.as_slice(), &device).reshape([n, 1]);
+        let next_t = Tensor::<1, Int>::from_data(next.as_slice(), &device).reshape([n, 1]);
         generated = Tensor::cat(vec![generated, next_t], 1);
         if finished.iter().all(|&f| f) {
             break;
@@ -227,21 +246,26 @@ pub fn group_sample<B: Backend>(
 ///
 /// Assumes uniform prompt length `Lp` (variable-length prompts are a separate task that needs a
 /// prompt padding mask + RoPE position offsets).
-pub fn group_sample_cached<B: Backend>(
-    model: &Qwen3ForCausalLM<B>,
-    prompt_ids: Tensor<B, 2, Int>,
+pub fn group_sample_cached(
+    model: &Qwen3ForCausalLM,
+    prompt_ids: Tensor<2, Int>,
     cfg: &RolloutConfig,
     eos: &[i64],
-) -> Rollouts<B> {
+) -> Rollouts {
     let device = prompt_ids.device();
     let [p, lp] = prompt_ids.dims();
     let n = p * cfg.group_size;
 
-    let mut generated = prompt_ids.unsqueeze_dim::<3>(1).repeat(&[1, cfg.group_size, 1]).reshape([n, lp]);
+    let mut generated = prompt_ids
+        .unsqueeze_dim::<3>(1)
+        .repeat(&[1, cfg.group_size, 1])
+        .reshape([n, lp]);
     let mut cache = model.new_cache_with_capacity(lp + cfg.max_new_tokens); // Phase 2: static KV, no O(T^2) cat
 
     // ---- prefill: prompt positions 0..lp -> last-token logits predict completion token 0 ----
-    let pos0 = Tensor::<B, 1, Int>::arange(0..lp as i64, &device).unsqueeze_dim::<2>(0).repeat(&[n, 1]); // [n, lp]
+    let pos0 = Tensor::<1, Int>::arange(0..lp as i64, &device)
+        .unsqueeze_dim::<2>(0)
+        .repeat(&[n, 1]); // [n, lp]
     let logits = model.forward_with_cache(generated.clone(), None, pos0, &mut cache); // [n, lp, v]
     let [_, _, v] = logits.dims();
     let mut last = logits.slice([0..n, (lp - 1)..lp, 0..v]).reshape([n, v]); // [n, v]
@@ -262,7 +286,7 @@ pub fn group_sample_cached<B: Backend>(
         steps_tokens.push(next.clone());
         steps_logp.push(logp_step);
 
-        let next_t = Tensor::<B, 1, Int>::from_data(next.as_slice(), &device).reshape([n, 1]);
+        let next_t = Tensor::<1, Int>::from_data(next.as_slice(), &device).reshape([n, 1]);
         generated = Tensor::cat(vec![generated, next_t.clone()], 1);
 
         // stop after recording this step if everyone is done or the budget is exhausted; no need to
@@ -272,7 +296,7 @@ pub fn group_sample_cached<B: Backend>(
         }
 
         // decode: feed completion token `t` at position `lp + t` -> logits for completion token t+1.
-        let pos = Tensor::<B, 1, Int>::from_data([(lp + t) as i64].as_slice(), &device)
+        let pos = Tensor::<1, Int>::from_data([(lp + t) as i64].as_slice(), &device)
             .unsqueeze_dim::<2>(0)
             .repeat(&[n, 1]); // [n, 1]
         let lg = model.forward_with_cache(next_t, None, pos, &mut cache); // [n, 1, v]
@@ -303,12 +327,12 @@ pub fn group_sample_cached<B: Backend>(
 /// ONLY the Gumbel-max token selection. UNFILTERED only (the GRPO default `top_k == 0 && top_p >= 1.0`);
 /// device top-k/top-p filtering is an explicit follow-on. Uniform prompt length, like
 /// [`group_sample_cached`].
-pub fn group_sample_cached_device<B: Backend>(
-    model: &Qwen3ForCausalLM<B>,
-    prompt_ids: Tensor<B, 2, Int>,
+pub fn group_sample_cached_device(
+    model: &Qwen3ForCausalLM,
+    prompt_ids: Tensor<2, Int>,
     cfg: &RolloutConfig,
     eos: &[i64],
-) -> Rollouts<B> {
+) -> Rollouts {
     // The device sampler is UNFILTERED-only (the GRPO default). Fail LOUD on a top-k/top-p config —
     // otherwise the filtering would be SILENTLY ignored and we'd sample from the full distribution
     // (wrong completions + wrong old_logprob). Device top-k/top-p is the documented follow-on.
@@ -316,18 +340,24 @@ pub fn group_sample_cached_device<B: Backend>(
         cfg.top_k == 0 && cfg.top_p >= 1.0,
         "group_sample_cached_device is unfiltered-only (got top_k={}, top_p={}); device top-k/top-p \
          filtering is not yet implemented — use group_sample_cached for filtered sampling.",
-        cfg.top_k, cfg.top_p,
+        cfg.top_k,
+        cfg.top_p,
     );
     let device = prompt_ids.device();
     let [p, lp] = prompt_ids.dims();
     let n = p * cfg.group_size;
     let eos0 = eos.first().copied().unwrap_or(0); // pad token for finished rows
 
-    let mut generated = prompt_ids.unsqueeze_dim::<3>(1).repeat(&[1, cfg.group_size, 1]).reshape([n, lp]);
+    let mut generated = prompt_ids
+        .unsqueeze_dim::<3>(1)
+        .repeat(&[1, cfg.group_size, 1])
+        .reshape([n, lp]);
     let mut cache = model.new_cache_with_capacity(lp + cfg.max_new_tokens);
 
     // ---- prefill: prompt positions 0..lp -> last-token logits predict completion token 0 ----
-    let pos0 = Tensor::<B, 1, Int>::arange(0..lp as i64, &device).unsqueeze_dim::<2>(0).repeat(&[n, 1]);
+    let pos0 = Tensor::<1, Int>::arange(0..lp as i64, &device)
+        .unsqueeze_dim::<2>(0)
+        .repeat(&[n, 1]);
     let logits = model.forward_with_cache(generated.clone(), None, pos0, &mut cache); // [n, lp, v]
     let [_, _, v] = logits.dims();
     let mut last = logits.slice([0..n, (lp - 1)..lp, 0..v]).reshape([n, v]); // [n, v] RAW logits, ON device
@@ -345,8 +375,15 @@ pub fn group_sample_cached_device<B: Backend>(
 
         // ---- host: per-sequence EOS / finished masking ([N], tiny). Finished rows emit the pad token
         //      (mirror sample_step's finished handling); record the chosen token id. ----
-        let next: Vec<i64> =
-            (0..n).map(|s| if finished[s] { eos0 } else { *cand.get(s).unwrap_or(&eos0) }).collect();
+        let next: Vec<i64> = (0..n)
+            .map(|s| {
+                if finished[s] {
+                    eos0
+                } else {
+                    *cand.get(s).unwrap_or(&eos0)
+                }
+            })
+            .collect();
         for s in 0..n {
             if !finished[s] && eos.contains(&next[s]) {
                 finished[s] = true;
@@ -355,9 +392,11 @@ pub fn group_sample_cached_device<B: Backend>(
 
         // ---- DEVICE log-prob of the FINAL token, then copy back ONLY [N]. Finished rows gather the pad
         //      token's RAW logp from the live logits — identical to sample_step's raw_token_logprob. ----
-        let next_t = Tensor::<B, 1, Int>::from_data(next.as_slice(), &device).reshape([n, 1]);
-        let logp_step: Vec<f32> =
-            device_token_logp(&last, &next_t, &lse).into_data().to_vec::<f32>().unwrap_or_default();
+        let next_t = Tensor::<1, Int>::from_data(next.as_slice(), &device).reshape([n, 1]);
+        let logp_step: Vec<f32> = device_token_logp(&last, &next_t, &lse)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap_or_default();
 
         steps_tokens.push(next.clone());
         steps_logp.push(logp_step);
@@ -368,7 +407,7 @@ pub fn group_sample_cached_device<B: Backend>(
         }
 
         // decode: feed completion token `t` at position `lp + t` -> logits for completion token t+1.
-        let pos = Tensor::<B, 1, Int>::from_data([(lp + t) as i64].as_slice(), &device)
+        let pos = Tensor::<1, Int>::from_data([(lp + t) as i64].as_slice(), &device)
             .unsqueeze_dim::<2>(0)
             .repeat(&[n, 1]); // [n, 1]
         let lg = model.forward_with_cache(next_t, None, pos, &mut cache); // [n, 1, v]
@@ -429,21 +468,25 @@ pub fn group_sample_cached_device<B: Backend>(
 ///    which graphs don't touch — they only cut launch latency, which Fusion already largely removes
 ///    (the measured eager ~1.0× confirms forward+vocab-GEMM dominate). Expect ~1.1-1.4× at batch-1/short
 ///    context at best. ⇒ The real next decode lever is the bandwidth-bound logits GEMM, not CUDA-graphs.
-pub fn group_sample_cached_device_loop<B: Backend>(
-    model: &Qwen3ForCausalLM<B>,
-    prompt_ids: Tensor<B, 2, Int>,
+pub fn group_sample_cached_device_loop(
+    model: &Qwen3ForCausalLM,
+    prompt_ids: Tensor<2, Int>,
     cfg: &RolloutConfig,
     eos: &[i64],
-) -> Rollouts<B> {
+) -> Rollouts {
     assert!(
         cfg.top_k == 0 && cfg.top_p >= 1.0,
         "group_sample_cached_device_loop is unfiltered-only (got top_k={}, top_p={}); device \
          top-k/top-p filtering is not yet implemented — use group_sample_cached for filtered sampling.",
-        cfg.top_k, cfg.top_p,
+        cfg.top_k,
+        cfg.top_p,
     );
     // `eos` must be non-empty: the device EOS test is `emit == eos[..]`, and `eos0 = eos.first()` falls
     // back to token 0 — so an empty `eos` would silently make token 0 a stop token (Codex/Gemini review).
-    assert!(!eos.is_empty(), "group_sample_cached_device_loop needs a non-empty eos set");
+    assert!(
+        !eos.is_empty(),
+        "group_sample_cached_device_loop needs a non-empty eos set"
+    );
     let device = prompt_ids.device();
     let [p, lp] = prompt_ids.dims();
     let n = p * cfg.group_size;
@@ -451,27 +494,33 @@ pub fn group_sample_cached_device_loop<B: Backend>(
     let total = lp + max_new;
     let eos0 = eos.first().copied().unwrap_or(0); // pad token for finished rows
 
-    let prompt_rep =
-        prompt_ids.unsqueeze_dim::<3>(1).repeat(&[1, cfg.group_size, 1]).reshape([n, lp]);
+    let prompt_rep = prompt_ids
+        .unsqueeze_dim::<3>(1)
+        .repeat(&[1, cfg.group_size, 1])
+        .reshape([n, lp]);
     let mut cache = model.new_cache_with_capacity(total); // static KV: fixed-shape, the graph-capture prereq
 
     // ---- preallocated, fixed-shape device buffers (NO Tensor::cat) ----
     // token buffer [N, lp+max_new]: prompt written ONCE, completion slice-assigned at col lp+t per step.
-    let mut tok_buf =
-        Tensor::<B, 2, Int>::zeros([n, total], &device).slice_assign([0..n, 0..lp], prompt_rep.clone());
-    let mut logp_buf = Tensor::<B, 2>::zeros([n, max_new], &device); // RAW pre-warp logp, per step
-    let mut mask_buf = Tensor::<B, 2>::zeros([n, max_new], &device); // completion mask, per step
+    // Flex default int is I32; token ids / `device_select_tokens` are I64.
+    let mut tok_buf = Tensor::<2, Int>::zeros([n, total], &device)
+        .cast(DType::I64)
+        .slice_assign([0..n, 0..lp], prompt_rep.clone().cast(DType::I64));
+    let mut logp_buf = Tensor::<2>::zeros([n, max_new], &device); // RAW pre-warp logp, per step
+    let mut mask_buf = Tensor::<2>::zeros([n, max_new], &device); // completion mask, per step
 
     // device-side EOS state: `finished` [N,1] Bool (starts all-false); constant pad token [N,1] Int.
-    let mut finished = Tensor::<B, 2, Int>::zeros([n, 1], &device).equal_elem(1i64); // 0 != 1 ⇒ all false
-    let pad = Tensor::<B, 2, Int>::full([n, 1], eos0, &device);
+    let mut finished = Tensor::<2, Int>::zeros([n, 1], &device).equal_elem(1i64); // 0 != 1 ⇒ all false
+    let pad = Tensor::<2, Int>::full([n, 1], eos0, &device).cast(DType::I64);
     // decode RoPE positions, col t = lp + t; sliced per step (device slice, no per-step host upload).
-    let pos_all = Tensor::<B, 1, Int>::arange(lp as i64..total as i64, &device)
+    let pos_all = Tensor::<1, Int>::arange(lp as i64..total as i64, &device)
         .unsqueeze_dim::<2>(0)
         .repeat(&[n, 1]); // [N, max_new]
 
     // ---- prefill: prompt positions 0..lp -> last-token logits predict completion token 0 ----
-    let pos0 = Tensor::<B, 1, Int>::arange(0..lp as i64, &device).unsqueeze_dim::<2>(0).repeat(&[n, 1]);
+    let pos0 = Tensor::<1, Int>::arange(0..lp as i64, &device)
+        .unsqueeze_dim::<2>(0)
+        .repeat(&[n, 1]);
     let logits = model.forward_with_cache(prompt_rep, None, pos0, &mut cache); // [n, lp, v]
     let [_, _, v] = logits.dims();
     let mut last = logits.slice([0..n, (lp - 1)..lp, 0..v]).reshape([n, v]); // [n, v] RAW logits, ON device
@@ -511,7 +560,13 @@ pub fn group_sample_cached_device_loop<B: Backend>(
 
     // ZERO device→host transfers above. Return the device buffers directly; the caller's read is the
     // single, final sync (the per-step EOS round-trip is gone — the loop is static + sync-free).
-    Rollouts { seq_ids: tok_buf, completion_mask: mask_buf, old_logprobs: logp_buf, prompt_len: lp, gen_len: max_new }
+    Rollouts {
+        seq_ids: tok_buf,
+        completion_mask: mask_buf,
+        old_logprobs: logp_buf,
+        prompt_len: lp,
+        gen_len: max_new,
+    }
 }
 
 /// Sample `cfg.group_size` completions per prompt — FULLY DEVICE-SIDE decode loop where EVERY per-step
@@ -575,19 +630,23 @@ pub fn group_sample_cached_device_loop<B: Backend>(
 ///    host→device upload (`rope.rs`) and the per-step `arange(T_max)` alloc (`attention.rs`) must be
 ///    precomputed once; and the IO/`pos` buffers must be re-zeroed per replay (else the `Add`-scatter
 ///    accumulates across replays).
-pub fn group_sample_cached_device_static<B: Backend>(
-    model: &Qwen3ForCausalLM<B>,
-    prompt_ids: Tensor<B, 2, Int>,
+pub fn group_sample_cached_device_static(
+    model: &Qwen3ForCausalLM,
+    prompt_ids: Tensor<2, Int>,
     cfg: &RolloutConfig,
     eos: &[i64],
-) -> Rollouts<B> {
+) -> Rollouts {
     assert!(
         cfg.top_k == 0 && cfg.top_p >= 1.0,
         "group_sample_cached_device_static is unfiltered-only (got top_k={}, top_p={}); device \
          top-k/top-p filtering is not yet implemented — use group_sample_cached for filtered sampling.",
-        cfg.top_k, cfg.top_p,
+        cfg.top_k,
+        cfg.top_p,
     );
-    assert!(!eos.is_empty(), "group_sample_cached_device_static needs a non-empty eos set");
+    assert!(
+        !eos.is_empty(),
+        "group_sample_cached_device_static needs a non-empty eos set"
+    );
     let device = prompt_ids.device();
     let [p, lp] = prompt_ids.dims();
     let n = p * cfg.group_size;
@@ -595,29 +654,35 @@ pub fn group_sample_cached_device_static<B: Backend>(
     let total = lp + max_new;
     let eos0 = eos.first().copied().unwrap_or(0); // pad token for finished rows
 
-    let prompt_rep =
-        prompt_ids.unsqueeze_dim::<3>(1).repeat(&[1, cfg.group_size, 1]).reshape([n, lp]);
+    let prompt_rep = prompt_ids
+        .unsqueeze_dim::<3>(1)
+        .repeat(&[1, cfg.group_size, 1])
+        .reshape([n, lp]);
     let mut cache = model.new_cache_with_capacity(total); // static KV: fixed-shape, device-pos written
 
     // ---- preallocated, fixed-shape device buffers (NO Tensor::cat, NO host-`t` slice_assign) ----
     // token buffer [N, lp+max_new]: prompt written ONCE; completion scattered at DEVICE column `pos`.
-    let mut tok_buf =
-        Tensor::<B, 2, Int>::zeros([n, total], &device).slice_assign([0..n, 0..lp], prompt_rep.clone());
-    let mut logp_buf = Tensor::<B, 2>::zeros([n, max_new], &device); // RAW pre-warp logp, at col `pos-lp`
-    let mut mask_buf = Tensor::<B, 2>::zeros([n, max_new], &device); // completion mask, at col `pos-lp`
+    // Flex default int is I32; token ids / `device_select_tokens` are I64.
+    let mut tok_buf = Tensor::<2, Int>::zeros([n, total], &device)
+        .cast(DType::I64)
+        .slice_assign([0..n, 0..lp], prompt_rep.clone().cast(DType::I64));
+    let mut logp_buf = Tensor::<2>::zeros([n, max_new], &device); // RAW pre-warp logp, at col `pos-lp`
+    let mut mask_buf = Tensor::<2>::zeros([n, max_new], &device); // completion mask, at col `pos-lp`
 
     // device-side EOS state: `finished` [N,1] Bool (starts all-false); constant pad token [N,1] Int.
-    let mut finished = Tensor::<B, 2, Int>::zeros([n, 1], &device).equal_elem(1i64); // 0 != 1 ⇒ all false
-    let pad = Tensor::<B, 2, Int>::full([n, 1], eos0, &device);
+    let mut finished = Tensor::<2, Int>::zeros([n, 1], &device).equal_elem(1i64); // 0 != 1 ⇒ all false
+    let pad = Tensor::<2, Int>::full([n, 1], eos0, &device).cast(DType::I64);
 
     // ---- the DEVICE position counter (§7). [1] Int, starts at `lp` (= absolute position of completion
     //      token 0), incremented on-device each step. The single source of every per-step index: the KV
     //      write column, the tok_buf column, the RoPE position, and (via `pos - lp`) the logp/mask column.
-    let mut pos = Tensor::<B, 1, Int>::full([1], lp as i64, &device);
+    let mut pos = Tensor::<1, Int>::full([1], lp as i64, &device);
 
     // ---- prefill: prompt positions 0..lp -> last-token logits predict completion token 0 (host path;
     //      one-shot, variable-shape — NOT part of the capture-ready decode region) ----
-    let pos0 = Tensor::<B, 1, Int>::arange(0..lp as i64, &device).unsqueeze_dim::<2>(0).repeat(&[n, 1]);
+    let pos0 = Tensor::<1, Int>::arange(0..lp as i64, &device)
+        .unsqueeze_dim::<2>(0)
+        .repeat(&[n, 1]);
     let logits = model.forward_with_cache(prompt_rep, None, pos0, &mut cache); // [n, lp, v]
     let [_, _, v] = logits.dims();
     let mut last = logits.slice([0..n, (lp - 1)..lp, 0..v]).reshape([n, v]); // [n, v] RAW logits, ON device
@@ -660,7 +725,13 @@ pub fn group_sample_cached_device_static<B: Backend>(
     }
 
     // ZERO device→host transfers above; the loop body is fixed-shape + device-pos-indexed (capture-ready).
-    Rollouts { seq_ids: tok_buf, completion_mask: mask_buf, old_logprobs: logp_buf, prompt_len: lp, gen_len: max_new }
+    Rollouts {
+        seq_ids: tok_buf,
+        completion_mask: mask_buf,
+        old_logprobs: logp_buf,
+        prompt_len: lp,
+        gen_len: max_new,
+    }
 }
 
 /// Compact (drop finished rows from the live decode batch) once the finished FRACTION of the live
@@ -700,22 +771,27 @@ const SHRINK_THRESHOLD: f32 = 0.5;
 /// `[n_active, ..]`, keep an `active → original` index map, and decode only that subset. Each step we
 /// sample the active rows and scatter the sampled token + raw log-prob back to their ORIGINAL row in
 /// the full `[N, ..]` records (so `seq_ids` / `completion_mask` / `old_logprobs` stay `[N, gen_len]`).
-pub fn group_sample_cached_shrink<B: Backend>(
-    model: &Qwen3ForCausalLM<B>,
-    prompt_ids: Tensor<B, 2, Int>,
+pub fn group_sample_cached_shrink(
+    model: &Qwen3ForCausalLM,
+    prompt_ids: Tensor<2, Int>,
     cfg: &RolloutConfig,
     eos: &[i64],
-) -> Rollouts<B> {
+) -> Rollouts {
     let device = prompt_ids.device();
     let [p, lp] = prompt_ids.dims();
     let n = p * cfg.group_size;
     let eos0 = eos.first().copied().unwrap_or(0);
 
-    let mut generated = prompt_ids.unsqueeze_dim::<3>(1).repeat(&[1, cfg.group_size, 1]).reshape([n, lp]);
+    let mut generated = prompt_ids
+        .unsqueeze_dim::<3>(1)
+        .repeat(&[1, cfg.group_size, 1])
+        .reshape([n, lp]);
     let mut cache = model.new_cache_with_capacity(lp + cfg.max_new_tokens);
 
     // ---- prefill: ALL N rows (everyone is active at prefill) ----
-    let pos0 = Tensor::<B, 1, Int>::arange(0..lp as i64, &device).unsqueeze_dim::<2>(0).repeat(&[n, 1]);
+    let pos0 = Tensor::<1, Int>::arange(0..lp as i64, &device)
+        .unsqueeze_dim::<2>(0)
+        .repeat(&[n, 1]);
     let logits = model.forward_with_cache(generated.clone(), None, pos0, &mut cache); // [n, lp, v]
     let [_, _, v] = logits.dims();
     let mut last = logits.slice([0..n, (lp - 1)..lp, 0..v]).reshape([n, v]); // [n_active=N, v]
@@ -733,7 +809,8 @@ pub fn group_sample_cached_shrink<B: Backend>(
         // sample over the LIVE batch only; `finished` for live rows (finished-but-not-yet-compacted
         // rows are still forwarded, exactly like the no-shrink path, so their pad logp also matches).
         let finished_active: Vec<bool> = active_idx.iter().map(|&o| finished[o]).collect();
-        let (next_active, logp_active) = sample_step(&raw, n_active, v, &finished_active, cfg, &mut rng, eos);
+        let (next_active, logp_active) =
+            sample_step(&raw, n_active, v, &finished_active, cfg, &mut rng, eos);
 
         // scatter the live results back to the ORIGINAL [N] step records; compacted-out rows are all
         // finished -> emit eos padding (`mask == 0`), with a placeholder pad logp that the loss ignores.
@@ -750,7 +827,8 @@ pub fn group_sample_cached_shrink<B: Backend>(
         steps_tokens.push(next_full.clone());
         steps_logp.push(logp_full);
 
-        let next_t_full = Tensor::<B, 1, Int>::from_data(next_full.as_slice(), &device).reshape([n, 1]);
+        let next_t_full =
+            Tensor::<1, Int>::from_data(next_full.as_slice(), &device).reshape([n, 1]);
         generated = Tensor::cat(vec![generated, next_t_full], 1);
 
         if finished.iter().all(|&f| f) || t + 1 == cfg.max_new_tokens {
@@ -760,9 +838,11 @@ pub fn group_sample_cached_shrink<B: Backend>(
         // ---- lazy/threshold compaction: drop finished rows from the live batch ----
         let finished_live = active_idx.iter().filter(|&&o| finished[o]).count();
         if finished_live > 0 && (finished_live as f32 / n_active as f32) >= SHRINK_THRESHOLD {
-            let keep_local: Vec<i64> =
-                (0..n_active).filter(|&i| !finished[active_idx[i]]).map(|i| i as i64).collect();
-            let keep_t = Tensor::<B, 1, Int>::from_data(keep_local.as_slice(), &device);
+            let keep_local: Vec<i64> = (0..n_active)
+                .filter(|&i| !finished[active_idx[i]])
+                .map(|i| i as i64)
+                .collect();
+            let keep_t = Tensor::<1, Int>::from_data(keep_local.as_slice(), &device);
             cache.select_rows(&keep_t); // gather kept rows of every layer's K/V buffer
             active_idx = keep_local.iter().map(|&i| active_idx[i as usize]).collect();
         }
@@ -771,8 +851,9 @@ pub fn group_sample_cached_shrink<B: Backend>(
         // the live batch — every kept row advanced one token every step) -> logits for token t+1.
         let n_fwd = active_idx.len();
         let next_tokens: Vec<i64> = active_idx.iter().map(|&o| next_full[o]).collect();
-        let next_t = Tensor::<B, 1, Int>::from_data(next_tokens.as_slice(), &device).reshape([n_fwd, 1]);
-        let pos = Tensor::<B, 1, Int>::from_data([(lp + t) as i64].as_slice(), &device)
+        let next_t =
+            Tensor::<1, Int>::from_data(next_tokens.as_slice(), &device).reshape([n_fwd, 1]);
+        let pos = Tensor::<1, Int>::from_data([(lp + t) as i64].as_slice(), &device)
             .unsqueeze_dim::<2>(0)
             .repeat(&[n_fwd, 1]); // [n_fwd, 1]
         let lg = model.forward_with_cache(next_t, None, pos, &mut cache); // [n_fwd, 1, v]
@@ -811,20 +892,27 @@ fn positions_from_mask(mask_rows: &[Vec<bool>]) -> Vec<i64> {
 /// Same `Rollouts` contract as [`group_sample`]; the completion region is uniform (starts at column
 /// `lp` for every sequence), so the trainer's completion alignment is unchanged. Uniform-prompt
 /// batches should use the faster [`group_sample_cached`]; this path exists for ragged prompts.
-pub fn group_sample_padded<B: Backend>(
-    model: &Qwen3ForCausalLM<B>,
-    prompt_ids: Tensor<B, 2, Int>,
+pub fn group_sample_padded(
+    model: &Qwen3ForCausalLM,
+    prompt_ids: Tensor<2, Int>,
     prompt_lens: &[usize],
     cfg: &RolloutConfig,
     eos: &[i64],
-) -> Rollouts<B> {
+) -> Rollouts {
     let device = prompt_ids.device();
     let [p, lp] = prompt_ids.dims();
-    assert_eq!(prompt_lens.len(), p, "prompt_lens must have one entry per prompt");
+    assert_eq!(
+        prompt_lens.len(),
+        p,
+        "prompt_lens must have one entry per prompt"
+    );
     let g = cfg.group_size;
     let n = p * g;
 
-    let mut generated = prompt_ids.unsqueeze_dim::<3>(1).repeat(&[1, g, 1]).reshape([n, lp]);
+    let mut generated = prompt_ids
+        .unsqueeze_dim::<3>(1)
+        .repeat(&[1, g, 1])
+        .reshape([n, lp]);
 
     // Per-sequence attention mask rows (prompt left-pad), repeated G times. Grows by one `true` per
     // generated token (completions are always real).
@@ -846,13 +934,17 @@ pub fn group_sample_padded<B: Backend>(
     for _ in 0..cfg.max_new_tokens {
         let cur_len = mask_rows[0].len();
         let mask_flat: Vec<bool> = mask_rows.iter().flatten().copied().collect();
-        let mask_t = Tensor::<B, 1, Bool>::from_data(mask_flat.as_slice(), &device).reshape([n, cur_len]);
-        let pos_t = Tensor::<B, 1, Int>::from_data(positions_from_mask(&mask_rows).as_slice(), &device)
-            .reshape([n, cur_len]);
+        let mask_t =
+            Tensor::<1, Bool>::from_data(mask_flat.as_slice(), &device).reshape([n, cur_len]);
+        let pos_t =
+            Tensor::<1, Int>::from_data(positions_from_mask(&mask_rows).as_slice(), &device)
+                .reshape([n, cur_len]);
 
         let logits = model.forward_with_positions(generated.clone(), Some(mask_t), pos_t); // [n, cur_len, v]
         let [_, _, v] = logits.dims();
-        let last = logits.slice([0..n, (cur_len - 1)..cur_len, 0..v]).reshape([n, v]);
+        let last = logits
+            .slice([0..n, (cur_len - 1)..cur_len, 0..v])
+            .reshape([n, v]);
         let raw: Vec<f32> = last.into_data().to_vec::<f32>().unwrap_or_default();
 
         let (next, logp_step) = sample_step(&raw, n, v, &finished, cfg, &mut rng, eos);
@@ -865,7 +957,7 @@ pub fn group_sample_padded<B: Backend>(
         steps_tokens.push(next.clone());
         steps_logp.push(logp_step);
 
-        let next_t = Tensor::<B, 1, Int>::from_data(next.as_slice(), &device).reshape([n, 1]);
+        let next_t = Tensor::<1, Int>::from_data(next.as_slice(), &device).reshape([n, 1]);
         generated = Tensor::cat(vec![generated, next_t], 1);
         if finished.iter().all(|&f| f) {
             break;

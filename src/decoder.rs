@@ -6,15 +6,18 @@
 use burn::{
     Tensor,
     config::Config,
-    module::{Ignored, Module},
+    module::Module,
     nn::{Embedding, EmbeddingConfig, Linear, LinearConfig, RmsNorm, RmsNormConfig},
-    prelude::Backend,
-    tensor::{Bool, Int, activation::{silu, softmax}},
+    prelude::Device,
+    tensor::{
+        Bool, Int,
+        activation::{silu, softmax},
+    },
 };
 
 use super::attention::{Qwen3Attention, Qwen3AttentionConfig};
 use super::cache::{KVCache, ModelCache};
-use super::linear2d::{linear3, Precision};
+use super::linear2d::{Precision, linear3};
 
 /// Configuration for Qwen3 model.
 #[derive(Config, Debug)]
@@ -64,7 +67,8 @@ impl Default for Qwen3Config {
 impl Qwen3Config {
     /// Get the effective head dimension.
     pub fn get_head_dim(&self) -> usize {
-        self.head_dim.unwrap_or(self.hidden_size / self.num_attention_heads)
+        self.head_dim
+            .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
 
     /// Configuration for Qwen3-0.6B model.
@@ -140,13 +144,13 @@ impl Qwen3Config {
 
 impl Qwen3Config {
     /// Initialize the model.
-    pub fn init<B: Backend>(&self, device: &B::Device) -> Qwen3Model<B> {
-        let layers: Vec<Qwen3DecoderLayer<B>> = (0..self.num_hidden_layers)
+    pub fn init(&self, device: &Device) -> Qwen3Model {
+        let layers: Vec<Qwen3DecoderLayer> = (0..self.num_hidden_layers)
             .map(|_| Qwen3DecoderLayerConfig::from_model_config(self).init(device))
             .collect();
 
         Qwen3Model {
-            config: Ignored(self.clone()),
+            config: (self.clone()),
             embed_tokens: EmbeddingConfig::new(self.vocab_size, self.hidden_size).init(device),
             layers,
             norm: RmsNormConfig::new(self.hidden_size)
@@ -158,16 +162,17 @@ impl Qwen3Config {
 
 /// Qwen3 decoder-only transformer model.
 #[derive(Module, Debug)]
-pub struct Qwen3Model<B: Backend> {
-    config: Ignored<Qwen3Config>,
-    embed_tokens: Embedding<B>,
-    layers: Vec<Qwen3DecoderLayer<B>>,
-    norm: RmsNorm<B>,
+pub struct Qwen3Model {
+    #[module(skip)]
+    config: Qwen3Config,
+    embed_tokens: Embedding,
+    layers: Vec<Qwen3DecoderLayer>,
+    norm: RmsNorm,
 }
 
-impl<B: Backend> Qwen3Model<B> {
+impl Qwen3Model {
     /// Get embedding weight tensor for debugging.
-    pub fn embed_tokens_weight(&self) -> Tensor<B, 2> {
+    pub fn embed_tokens_weight(&self) -> Tensor<2> {
         self.embed_tokens.weight.val()
     }
 
@@ -181,16 +186,16 @@ impl<B: Backend> Qwen3Model<B> {
     /// A vector of hidden states from each layer, plus the final normalized output.
     pub fn forward(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        attention_mask: Option<Tensor<B, 2, Bool>>,
+        input_ids: Tensor<2, Int>,
+        attention_mask: Option<Tensor<2, Bool>>,
         prec: Precision,
-    ) -> Vec<Tensor<B, 3>> {
+    ) -> Vec<Tensor<3>> {
         let [batch_size, seq_len] = input_ids.dims();
         let device = input_ids.device();
 
         // Default RoPE positions are the column indices. `forward_with_positions` takes explicit
         // ones for left-padded / packed sequences.
-        let position_ids = Tensor::<B, 1, Int>::arange(0..seq_len as i64, &device)
+        let position_ids = Tensor::<1, Int>::arange(0..seq_len as i64, &device)
             .unsqueeze_dim::<2>(0)
             .repeat(&[batch_size, 1]);
         self.forward_with_positions(input_ids, attention_mask, position_ids, prec)
@@ -203,11 +208,11 @@ impl<B: Backend> Qwen3Model<B> {
     /// clamped to 0). `forward` is exactly this with `position_ids = arange(0..seq_len)`.
     pub fn forward_with_positions(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        attention_mask: Option<Tensor<B, 2, Bool>>,
-        position_ids: Tensor<B, 2, Int>,
+        input_ids: Tensor<2, Int>,
+        attention_mask: Option<Tensor<2, Bool>>,
+        position_ids: Tensor<2, Int>,
         prec: Precision,
-    ) -> Vec<Tensor<B, 3>> {
+    ) -> Vec<Tensor<3>> {
         // Token embeddings
         let mut hidden_states = self.embed_tokens.forward(input_ids);
 
@@ -221,12 +226,18 @@ impl<B: Backend> Qwen3Model<B> {
 
         // Pass through decoder layers
         for (i, layer) in self.layers.iter().enumerate() {
-            hidden_states = layer.forward(hidden_states, attention_mask.clone(), position_ids.clone(), prec);
+            hidden_states = layer.forward(
+                hidden_states,
+                attention_mask.clone(),
+                position_ids.clone(),
+                prec,
+            );
             all_hidden_states.push(hidden_states.clone()); // Push AFTER processing
 
             // Debug: print first layer output
             if i == 0 && std::env::var("QWEN3_DEBUG").is_ok() {
-                let debug_vals: Vec<f32> = hidden_states.clone()
+                let debug_vals: Vec<f32> = hidden_states
+                    .clone()
                     .cast(burn::tensor::DType::F32)
                     .slice([0..1, 0..1, 0..10])
                     .reshape([10])
@@ -254,10 +265,10 @@ impl<B: Backend> Qwen3Model<B> {
     /// * `attention_mask` - Attention mask [batch, seq] (true = valid token)
     pub fn encode(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        attention_mask: Tensor<B, 2, Bool>,
+        input_ids: Tensor<2, Int>,
+        attention_mask: Tensor<2, Bool>,
         prec: Precision,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         // Explicit precision (Gemini review): callers choose; inference embeddings pass `F32`.
         let all_hidden_states = self.forward(input_ids, Some(attention_mask.clone()), prec);
 
@@ -282,12 +293,12 @@ impl<B: Backend> Qwen3Model<B> {
     /// Final hidden states tensor [batch, seq, hidden_size]
     pub fn forward_with_cache(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        attention_mask: Option<Tensor<B, 2, Bool>>,
-        position_ids: Tensor<B, 2, Int>,
-        cache: &mut ModelCache<B>,
+        input_ids: Tensor<2, Int>,
+        attention_mask: Option<Tensor<2, Bool>>,
+        position_ids: Tensor<2, Int>,
+        cache: &mut ModelCache,
         prec: Precision,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         // Token embeddings
         let mut hidden_states = self.embed_tokens.forward(input_ids);
 
@@ -313,14 +324,15 @@ impl<B: Backend> Qwen3Model<B> {
     /// `[B, 1, hidden]`.
     pub fn forward_with_cache_static(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        pos: Tensor<B, 1, Int>,
-        cache: &mut ModelCache<B>,
+        input_ids: Tensor<2, Int>,
+        pos: Tensor<1, Int>,
+        cache: &mut ModelCache,
         prec: Precision,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         let mut hidden_states = self.embed_tokens.forward(input_ids);
         for (layer, layer_cache) in self.layers.iter().zip(cache.layers.iter_mut()) {
-            hidden_states = layer.forward_with_cache_static(hidden_states, pos.clone(), layer_cache, prec);
+            hidden_states =
+                layer.forward_with_cache_static(hidden_states, pos.clone(), layer_cache, prec);
         }
         self.norm.forward(hidden_states)
     }
@@ -330,13 +342,13 @@ impl<B: Backend> Qwen3Model<B> {
     /// staging). Numerically identical.
     pub fn forward_with_cache_static_pre(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        pos: Tensor<B, 1, Int>,
-        cache: &mut ModelCache<B>,
+        input_ids: Tensor<2, Int>,
+        pos: Tensor<1, Int>,
+        cache: &mut ModelCache,
         prec: Precision,
-        freqs: &Tensor<B, 1>,
-        arange_tmax: &Tensor<B, 1, Int>,
-    ) -> Tensor<B, 3> {
+        freqs: &Tensor<1>,
+        arange_tmax: &Tensor<1, Int>,
+    ) -> Tensor<3> {
         self.forward_with_cache_static_pre_lp(input_ids, pos, cache, prec, freqs, arange_tmax, None)
     }
 
@@ -346,14 +358,14 @@ impl<B: Backend> Qwen3Model<B> {
     #[allow(clippy::too_many_arguments)]
     pub fn forward_with_cache_static_pre_lp(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        pos: Tensor<B, 1, Int>,
-        cache: &mut ModelCache<B>,
+        input_ids: Tensor<2, Int>,
+        pos: Tensor<1, Int>,
+        cache: &mut ModelCache,
         prec: Precision,
-        freqs: &Tensor<B, 1>,
-        arange_tmax: &Tensor<B, 1, Int>,
-        lo: Option<&Tensor<B, 1, Int>>,
-    ) -> Tensor<B, 3> {
+        freqs: &Tensor<1>,
+        arange_tmax: &Tensor<1, Int>,
+        lo: Option<&Tensor<1, Int>>,
+    ) -> Tensor<3> {
         let mut hidden_states = self.embed_tokens.forward(input_ids);
         for (layer, layer_cache) in self.layers.iter().zip(cache.layers.iter_mut()) {
             hidden_states = layer.forward_with_cache_static_pre_lp(
@@ -370,12 +382,12 @@ impl<B: Backend> Qwen3Model<B> {
     }
 
     /// Create a new cache for this model.
-    pub fn new_cache(&self) -> ModelCache<B> {
+    pub fn new_cache(&self) -> ModelCache {
         ModelCache::new(self.layers.len())
     }
 
     /// Create a STATIC pre-allocated cache (Phase 2) for `capacity = prompt_len + max_new_tokens`.
-    pub fn new_cache_with_capacity(&self, capacity: usize) -> ModelCache<B> {
+    pub fn new_cache_with_capacity(&self, capacity: usize) -> ModelCache {
         ModelCache::with_capacity(self.layers.len(), capacity)
     }
 
@@ -410,7 +422,7 @@ impl Qwen3DecoderLayerConfig {
         )
     }
 
-    fn init<B: Backend>(&self, device: &B::Device) -> Qwen3DecoderLayer<B> {
+    fn init(&self, device: &Device) -> Qwen3DecoderLayer {
         Qwen3DecoderLayer {
             self_attn: Qwen3AttentionConfig::new(
                 self.hidden_size,
@@ -434,25 +446,27 @@ impl Qwen3DecoderLayerConfig {
 
 /// A single Qwen3 decoder layer.
 #[derive(Module, Debug)]
-struct Qwen3DecoderLayer<B: Backend> {
-    self_attn: Qwen3Attention<B>,
-    mlp: Qwen3MLP<B>,
-    input_layernorm: RmsNorm<B>,
-    post_attention_layernorm: RmsNorm<B>,
+struct Qwen3DecoderLayer {
+    self_attn: Qwen3Attention,
+    mlp: Qwen3MLP,
+    input_layernorm: RmsNorm,
+    post_attention_layernorm: RmsNorm,
 }
 
-impl<B: Backend> Qwen3DecoderLayer<B> {
+impl Qwen3DecoderLayer {
     fn forward(
         &self,
-        hidden_states: Tensor<B, 3>,
-        attention_mask: Option<Tensor<B, 2, Bool>>,
-        position_ids: Tensor<B, 2, Int>,
+        hidden_states: Tensor<3>,
+        attention_mask: Option<Tensor<2, Bool>>,
+        position_ids: Tensor<2, Int>,
         prec: Precision,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         // Self attention with pre-norm
         let residual = hidden_states.clone();
         let hidden_states = self.input_layernorm.forward(hidden_states);
-        let hidden_states = self.self_attn.forward(hidden_states, attention_mask, position_ids, prec);
+        let hidden_states =
+            self.self_attn
+                .forward(hidden_states, attention_mask, position_ids, prec);
         let hidden_states = residual + hidden_states;
 
         // MLP with pre-norm
@@ -464,16 +478,22 @@ impl<B: Backend> Qwen3DecoderLayer<B> {
 
     fn forward_with_cache(
         &self,
-        hidden_states: Tensor<B, 3>,
-        attention_mask: Option<Tensor<B, 2, Bool>>,
-        position_ids: Tensor<B, 2, Int>,
-        cache: &mut KVCache<B>,
+        hidden_states: Tensor<3>,
+        attention_mask: Option<Tensor<2, Bool>>,
+        position_ids: Tensor<2, Int>,
+        cache: &mut KVCache,
         prec: Precision,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         // Self attention with pre-norm and cache
         let residual = hidden_states.clone();
         let hidden_states = self.input_layernorm.forward(hidden_states);
-        let hidden_states = self.self_attn.forward_with_cache(hidden_states, attention_mask, position_ids, cache, prec);
+        let hidden_states = self.self_attn.forward_with_cache(
+            hidden_states,
+            attention_mask,
+            position_ids,
+            cache,
+            prec,
+        );
         let hidden_states = residual + hidden_states;
 
         // MLP with pre-norm
@@ -487,14 +507,16 @@ impl<B: Backend> Qwen3DecoderLayer<B> {
     /// counterpart of [`forward_with_cache`], over [`Qwen3Attention::forward_with_cache_static`].
     fn forward_with_cache_static(
         &self,
-        hidden_states: Tensor<B, 3>,
-        pos: Tensor<B, 1, Int>,
-        cache: &mut KVCache<B>,
+        hidden_states: Tensor<3>,
+        pos: Tensor<1, Int>,
+        cache: &mut KVCache,
         prec: Precision,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         let residual = hidden_states.clone();
         let hidden_states = self.input_layernorm.forward(hidden_states);
-        let hidden_states = self.self_attn.forward_with_cache_static(hidden_states, pos, cache, prec);
+        let hidden_states =
+            self.self_attn
+                .forward_with_cache_static(hidden_states, pos, cache, prec);
         let hidden_states = residual + hidden_states;
 
         let residual = hidden_states.clone();
@@ -512,18 +534,25 @@ impl<B: Backend> Qwen3DecoderLayer<B> {
     #[allow(clippy::too_many_arguments)]
     fn forward_with_cache_static_pre_lp(
         &self,
-        hidden_states: Tensor<B, 3>,
-        pos: Tensor<B, 1, Int>,
-        cache: &mut KVCache<B>,
+        hidden_states: Tensor<3>,
+        pos: Tensor<1, Int>,
+        cache: &mut KVCache,
         prec: Precision,
-        freqs: &Tensor<B, 1>,
-        arange_tmax: &Tensor<B, 1, Int>,
-        lo: Option<&Tensor<B, 1, Int>>,
-    ) -> Tensor<B, 3> {
+        freqs: &Tensor<1>,
+        arange_tmax: &Tensor<1, Int>,
+        lo: Option<&Tensor<1, Int>>,
+    ) -> Tensor<3> {
         let residual = hidden_states.clone();
         let hidden_states = self.input_layernorm.forward(hidden_states);
-        let hidden_states =
-            self.self_attn.forward_with_cache_static_pre_lp(hidden_states, pos, cache, prec, freqs, arange_tmax, lo);
+        let hidden_states = self.self_attn.forward_with_cache_static_pre_lp(
+            hidden_states,
+            pos,
+            cache,
+            prec,
+            freqs,
+            arange_tmax,
+            lo,
+        );
         let hidden_states = residual + hidden_states;
 
         let residual = hidden_states.clone();
@@ -536,14 +565,14 @@ impl<B: Backend> Qwen3DecoderLayer<B> {
 /// Qwen3 MLP with SiLU gating (SwiGLU style). `pub(crate)` so the MoE block (src/moe.rs) reuses it
 /// verbatim as a single expert.
 #[derive(Module, Debug)]
-pub(crate) struct Qwen3MLP<B: Backend> {
-    gate_proj: Linear<B>,
-    up_proj: Linear<B>,
-    down_proj: Linear<B>,
+pub(crate) struct Qwen3MLP {
+    gate_proj: Linear,
+    up_proj: Linear,
+    down_proj: Linear,
 }
 
-impl<B: Backend> Qwen3MLP<B> {
-    pub(crate) fn new(hidden_size: usize, intermediate_size: usize, device: &B::Device) -> Self {
+impl Qwen3MLP {
+    pub(crate) fn new(hidden_size: usize, intermediate_size: usize, device: &Device) -> Self {
         Qwen3MLP {
             gate_proj: LinearConfig::new(hidden_size, intermediate_size)
                 .with_bias(false)
@@ -557,7 +586,7 @@ impl<B: Backend> Qwen3MLP<B> {
         }
     }
 
-    pub(crate) fn forward(&self, x: Tensor<B, 3>, prec: Precision) -> Tensor<B, 3> {
+    pub(crate) fn forward(&self, x: Tensor<3>, prec: Precision) -> Tensor<3> {
         // Batch-safe 2-D Linear (see linear2d.rs): CubeCL's batched matmul corrupts rows
         // past the first at batch>1 for some shapes on sm_121.
         let gate = silu(linear3(&self.gate_proj, x.clone(), prec));
@@ -572,19 +601,23 @@ impl<B: Backend> Qwen3MLP<B> {
 
 impl Qwen3Config {
     /// Initialize a causal language model (for text generation).
-    pub fn init_causal_lm<B: Backend>(&self, device: &B::Device) -> Qwen3ForCausalLM<B> {
+    pub fn init_causal_lm(&self, device: &Device) -> Qwen3ForCausalLM {
         // Untied models (e.g. Qwen3-14B) get a separate no-bias lm_head; tied models keep `None`
         // and project from the embedding. See `lm_logits`.
         let lm_head = if self.tie_word_embeddings {
             None
         } else {
-            Some(LinearConfig::new(self.hidden_size, self.vocab_size).with_bias(false).init(device))
+            Some(
+                LinearConfig::new(self.hidden_size, self.vocab_size)
+                    .with_bias(false)
+                    .init(device),
+            )
         };
         Qwen3ForCausalLM {
             model: self.init(device),
             lm_head,
-            train_precision: Ignored(Precision::F32),
-            infer_precision: Ignored(Precision::F32),
+            train_precision: (Precision::F32),
+            infer_precision: (Precision::F32),
         }
     }
 }
@@ -595,15 +628,15 @@ impl Qwen3Config {
 /// projected from `model.embed_tokens.weight` directly in `forward` (`tied_logits`). There is
 /// deliberately no separate `lm_head` parameter — a detached copy would train untied.
 #[derive(Module, Debug)]
-pub struct Qwen3ForCausalLM<B: Backend> {
+pub struct Qwen3ForCausalLM {
     /// The base transformer model.
-    pub model: Qwen3Model<B>,
+    pub model: Qwen3Model,
     /// Separate output head for UNTIED models (`tie_word_embeddings = false`, e.g. Qwen3-14B).
     /// `None` for tied models, where logits project from `embed_tokens.weight` (see `lm_logits`).
-    lm_head: Option<Linear<B>>,
+    lm_head: Option<Linear>,
     /// Compute precision for the TRAINING forward (no cache). Default `F32`.
     ///
-    /// RUNTIME CONFIG, not model state: `Ignored<_>` is not serialized — `into_record` drops the
+    /// RUNTIME CONFIG, not model state: `_` is not serialized — `into_record` drops the
     /// value and `load_record` retains the in-memory one (verified: burn-core constant.rs:281,285).
     /// So `load_record` does NOT wipe an already-set precision, but the value also does not travel
     /// with a checkpoint: a freshly built + weight-loaded model defaults to `F32`, so set precision
@@ -615,14 +648,16 @@ pub struct Qwen3ForCausalLM<B: Backend> {
     /// default to f32 diverges silently. This pipeline is single-GPU + manual loop (no `Learner`),
     /// so it is safe today; BEFORE going multi-GPU, make precision serializable (move into
     /// `Qwen3Config`) so it syncs to workers.
-    train_precision: Ignored<Precision>,
+    #[module(skip)]
+    train_precision: Precision,
     /// Compute precision for INFERENCE (cached generation + non-cache `generate`). Default `F32`,
     /// decoupled from training so bf16 training never silently changes generation or HF parity.
-    /// Same `Ignored` runtime-config semantics as `train_precision`.
-    infer_precision: Ignored<Precision>,
+    /// Same runtime-config semantics as `train_precision`.
+    #[module(skip)]
+    infer_precision: Precision,
 }
 
-impl<B: Backend> Qwen3ForCausalLM<B> {
+impl Qwen3ForCausalLM {
     /// Forward pass returning logits over the vocabulary.
     ///
     /// # Arguments
@@ -633,21 +668,21 @@ impl<B: Backend> Qwen3ForCausalLM<B> {
     /// Logits tensor of shape [batch, seq, vocab_size]
     pub fn forward(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        attention_mask: Option<Tensor<B, 2, Bool>>,
-    ) -> Tensor<B, 3> {
+        input_ids: Tensor<2, Int>,
+        attention_mask: Option<Tensor<2, Bool>>,
+    ) -> Tensor<3> {
         // Training entry point: uses `train_precision` (default f32; set bf16 for mixed precision).
-        self.forward_with_precision(input_ids, attention_mask, *self.train_precision)
+        self.forward_with_precision(input_ids, attention_mask, self.train_precision)
     }
 
     /// Forward (no cache) at an explicit precision. `forward` uses `train_precision`; inference
     /// callers (e.g. `generate`) use `infer_precision`, so bf16 training never leaks into generation.
     fn forward_with_precision(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        attention_mask: Option<Tensor<B, 2, Bool>>,
+        input_ids: Tensor<2, Int>,
+        attention_mask: Option<Tensor<2, Bool>>,
         prec: Precision,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         let all_hidden_states = self.model.forward(input_ids, attention_mask, prec);
         // Get the last layer's hidden states. `Qwen3Model::forward` deliberately does
         // NOT apply the final RMSNorm (a Z-Image text-encoder artifact: it stops at the
@@ -666,12 +701,16 @@ impl<B: Backend> Qwen3ForCausalLM<B> {
     /// `attention_mask = None` and `position_ids = arange` it equals `forward`.
     pub fn forward_with_positions(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        attention_mask: Option<Tensor<B, 2, Bool>>,
-        position_ids: Tensor<B, 2, Int>,
-    ) -> Tensor<B, 3> {
-        let all_hidden_states =
-            self.model.forward_with_positions(input_ids, attention_mask, position_ids, *self.train_precision);
+        input_ids: Tensor<2, Int>,
+        attention_mask: Option<Tensor<2, Bool>>,
+        position_ids: Tensor<2, Int>,
+    ) -> Tensor<3> {
+        let all_hidden_states = self.model.forward_with_positions(
+            input_ids,
+            attention_mask,
+            position_ids,
+            self.train_precision,
+        );
         let hidden_states = all_hidden_states.last().unwrap().clone();
         let hidden_states = self.model.norm.forward(hidden_states);
         self.lm_logits(hidden_states)
@@ -689,12 +728,18 @@ impl<B: Backend> Qwen3ForCausalLM<B> {
     /// Logits tensor of shape [batch, seq, vocab_size]
     pub fn forward_with_cache(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        attention_mask: Option<Tensor<B, 2, Bool>>,
-        position_ids: Tensor<B, 2, Int>,
-        cache: &mut ModelCache<B>,
-    ) -> Tensor<B, 3> {
-        let hidden_states = self.model.forward_with_cache(input_ids, attention_mask, position_ids, cache, *self.infer_precision);
+        input_ids: Tensor<2, Int>,
+        attention_mask: Option<Tensor<2, Bool>>,
+        position_ids: Tensor<2, Int>,
+        cache: &mut ModelCache,
+    ) -> Tensor<3> {
+        let hidden_states = self.model.forward_with_cache(
+            input_ids,
+            attention_mask,
+            position_ids,
+            cache,
+            self.infer_precision,
+        );
         self.lm_logits(hidden_states)
     }
 
@@ -705,11 +750,13 @@ impl<B: Backend> Qwen3ForCausalLM<B> {
     /// decode branch (the growing-prefix path); see `group_sample_cached_device_static`.
     pub fn forward_with_cache_static(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        pos: Tensor<B, 1, Int>,
-        cache: &mut ModelCache<B>,
-    ) -> Tensor<B, 3> {
-        let hidden_states = self.model.forward_with_cache_static(input_ids, pos, cache, *self.infer_precision);
+        input_ids: Tensor<2, Int>,
+        pos: Tensor<1, Int>,
+        cache: &mut ModelCache,
+    ) -> Tensor<3> {
+        let hidden_states =
+            self.model
+                .forward_with_cache_static(input_ids, pos, cache, self.infer_precision);
         self.lm_logits(hidden_states)
     }
 
@@ -718,12 +765,12 @@ impl<B: Backend> Qwen3ForCausalLM<B> {
     /// whole step is recordable below Fusion. Numerically identical.
     pub fn forward_with_cache_static_pre(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        pos: Tensor<B, 1, Int>,
-        cache: &mut ModelCache<B>,
-        freqs: &Tensor<B, 1>,
-        arange_tmax: &Tensor<B, 1, Int>,
-    ) -> Tensor<B, 3> {
+        input_ids: Tensor<2, Int>,
+        pos: Tensor<1, Int>,
+        cache: &mut ModelCache,
+        freqs: &Tensor<1>,
+        arange_tmax: &Tensor<1, Int>,
+    ) -> Tensor<3> {
         self.forward_with_cache_static_pre_lp(input_ids, pos, cache, freqs, arange_tmax, None)
     }
 
@@ -733,18 +780,18 @@ impl<B: Backend> Qwen3ForCausalLM<B> {
     /// [`Qwen3Attention::forward_with_cache_static_pre_lp`] for the invariance argument.
     pub fn forward_with_cache_static_pre_lp(
         &self,
-        input_ids: Tensor<B, 2, Int>,
-        pos: Tensor<B, 1, Int>,
-        cache: &mut ModelCache<B>,
-        freqs: &Tensor<B, 1>,
-        arange_tmax: &Tensor<B, 1, Int>,
-        lo: Option<&Tensor<B, 1, Int>>,
-    ) -> Tensor<B, 3> {
+        input_ids: Tensor<2, Int>,
+        pos: Tensor<1, Int>,
+        cache: &mut ModelCache,
+        freqs: &Tensor<1>,
+        arange_tmax: &Tensor<1, Int>,
+        lo: Option<&Tensor<1, Int>>,
+    ) -> Tensor<3> {
         let hidden_states = self.model.forward_with_cache_static_pre_lp(
             input_ids,
             pos,
             cache,
-            *self.infer_precision,
+            self.infer_precision,
             freqs,
             arange_tmax,
             lo,
@@ -762,13 +809,19 @@ impl<B: Backend> Qwen3ForCausalLM<B> {
     /// gradients) and is discarded on tied-format export. So the training path MUST project from
     /// the embedding. The `lm_head` field is now vestigial (kept only so other examples compile).
     /// `[B*S,H] @ [H,V]` is 2-D, which dodges the CubeCL broadcast batched-matmul bug like `linear3`.
-    fn tied_logits(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
+    fn tied_logits(&self, hidden: Tensor<3>) -> Tensor<3> {
         let [b, s, h] = hidden.dims();
         // Keep the GEMM uniform-dtype: cast the tied embedding to the ACTIVATION's dtype (a mixed
         // bf16/f32 matmul silently corrupts on the CubeCL CUDA backend in BOTH directions — see the
         // linear3 F32-arm invariant in linear2d.rs). No-op when hidden and the embedding already
         // match (the f32-checkpoint GRPO setup); robust if a bf16 checkpoint is ever loaded.
-        let w = self.model.embed_tokens.weight.val().transpose().cast(hidden.dtype());
+        let w = self
+            .model
+            .embed_tokens
+            .weight
+            .val()
+            .transpose()
+            .cast(hidden.dtype());
         let vocab = w.dims()[1];
         hidden.reshape([b * s, h]).matmul(w).reshape([b, s, vocab])
     }
@@ -777,7 +830,7 @@ impl<B: Backend> Qwen3ForCausalLM<B> {
     /// = false`) use the separate `lm_head`; tied models project from the token embedding. Both go
     /// through the batch-safe 2-D GEMM (the head via `linear3`, tied via the reshape in
     /// `tied_logits`) to dodge the CubeCL broadcast batched-matmul bug; the head stays f32.
-    fn lm_logits(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
+    fn lm_logits(&self, hidden: Tensor<3>) -> Tensor<3> {
         match &self.lm_head {
             Some(head) => linear3(head, hidden, Precision::F32),
             None => self.tied_logits(hidden),
@@ -806,7 +859,7 @@ impl<B: Backend> Qwen3ForCausalLM<B> {
     /// in bf16 (f32 accumulation) while master weights, optimizer, norms, softmax and the tied
     /// LM head stay f32 — the mixed-precision recipe.
     pub fn with_train_precision(mut self, prec: Precision) -> Self {
-        self.train_precision = Ignored(prec);
+        self.train_precision = prec;
         self
     }
 
@@ -826,7 +879,7 @@ impl<B: Backend> Qwen3ForCausalLM<B> {
              on the Fusion backend). Use Precision::F32 for inference; bf16 is for TRAINING via \
              with_train_precision."
         );
-        self.infer_precision = Ignored(prec);
+        self.infer_precision = prec;
         self
     }
 
@@ -851,12 +904,12 @@ impl<B: Backend> Qwen3ForCausalLM<B> {
     /// Generated token IDs [batch, seq + generated]
     pub fn generate(
         &self,
-        input_ids: Tensor<B, 2, Int>,
+        input_ids: Tensor<2, Int>,
         max_new_tokens: usize,
         temperature: f32,
         top_p: f32,
         top_k: usize,
-    ) -> Tensor<B, 2, Int> {
+    ) -> Tensor<2, Int> {
         let device = input_ids.device();
         let [batch_size, _] = input_ids.dims();
 
@@ -864,11 +917,12 @@ impl<B: Backend> Qwen3ForCausalLM<B> {
 
         for _ in 0..max_new_tokens {
             // Get logits for the last position (inference precision, default f32)
-            let logits = self.forward_with_precision(generated.clone(), None, *self.infer_precision);
+            let logits = self.forward_with_precision(generated.clone(), None, self.infer_precision);
             let [_, seq_len, vocab_size] = logits.dims();
 
             // Extract last token logits: [batch, vocab_size]
-            let next_token_logits = logits.slice([0..batch_size, (seq_len - 1)..seq_len, 0..vocab_size])
+            let next_token_logits = logits
+                .slice([0..batch_size, (seq_len - 1)..seq_len, 0..vocab_size])
                 .reshape([batch_size, vocab_size]);
 
             // Apply temperature
@@ -880,7 +934,7 @@ impl<B: Backend> Qwen3ForCausalLM<B> {
 
             // Sample next token
             // argmax(1) returns [batch, 1], flatten to [batch]
-            let next_token: Tensor<B, 1, Int> = if temperature == 0.0 {
+            let next_token: Tensor<1, Int> = if temperature == 0.0 {
                 // Greedy decoding
                 next_token_logits.argmax(1).flatten(0, 1)
             } else {
@@ -912,14 +966,21 @@ impl<B: Backend> Qwen3ForCausalLM<B> {
     /// Generated token IDs [batch, seq + generated]
     pub fn generate_with_cache(
         &self,
-        input_ids: Tensor<B, 2, Int>,
+        input_ids: Tensor<2, Int>,
         max_new_tokens: usize,
         temperature: f32,
         top_p: f32,
         top_k: usize,
-    ) -> Tensor<B, 2, Int> {
+    ) -> Tensor<2, Int> {
         // Use default EOS tokens for Qwen3
-        self.generate_with_cache_eos(input_ids, max_new_tokens, temperature, top_p, top_k, &[151643, 151645])
+        self.generate_with_cache_eos(
+            input_ids,
+            max_new_tokens,
+            temperature,
+            top_p,
+            top_k,
+            &[151643, 151645],
+        )
     }
 
     /// Generate text autoregressively with KV cache and custom EOS tokens.
@@ -936,13 +997,13 @@ impl<B: Backend> Qwen3ForCausalLM<B> {
     /// Generated token IDs [batch, seq + generated]
     pub fn generate_with_cache_eos(
         &self,
-        input_ids: Tensor<B, 2, Int>,
+        input_ids: Tensor<2, Int>,
         max_new_tokens: usize,
         temperature: f32,
         top_p: f32,
         top_k: usize,
         eos_token_ids: &[i64],
-    ) -> Tensor<B, 2, Int> {
+    ) -> Tensor<2, Int> {
         let device = input_ids.device();
         let [batch_size, initial_seq_len] = input_ids.dims();
 
@@ -950,7 +1011,7 @@ impl<B: Backend> Qwen3ForCausalLM<B> {
         let mut cache = self.model.new_cache();
 
         // First forward pass: process all input tokens
-        let position_ids = Tensor::<B, 1, Int>::arange(0..initial_seq_len as i64, &device)
+        let position_ids = Tensor::<1, Int>::arange(0..initial_seq_len as i64, &device)
             .unsqueeze_dim::<2>(0)
             .repeat(&[batch_size, 1]);
 
@@ -958,7 +1019,12 @@ impl<B: Backend> Qwen3ForCausalLM<B> {
         let [_, _, vocab_size] = logits.dims();
 
         // Get first new token from the last position
-        let next_token_logits = logits.slice([0..batch_size, (initial_seq_len - 1)..initial_seq_len, 0..vocab_size])
+        let next_token_logits = logits
+            .slice([
+                0..batch_size,
+                (initial_seq_len - 1)..initial_seq_len,
+                0..vocab_size,
+            ])
             .reshape([batch_size, vocab_size]);
 
         let next_token_logits = if temperature != 1.0 && temperature != 0.0 {
@@ -968,7 +1034,7 @@ impl<B: Backend> Qwen3ForCausalLM<B> {
         };
 
         // argmax(1) returns [batch, 1], reshape to [batch]
-        let mut next_token: Tensor<B, 1, Int> = if temperature == 0.0 {
+        let mut next_token: Tensor<1, Int> = if temperature == 0.0 {
             next_token_logits.argmax(1).flatten(0, 1)
         } else {
             let probs = softmax(next_token_logits, 1);
@@ -977,7 +1043,13 @@ impl<B: Backend> Qwen3ForCausalLM<B> {
 
         // Check if first token is EOS
         // Cast to I64 first: CUDA Int tensors are i32, so reading them directly as i64 fails.
-        let token_id = next_token.clone().cast(burn::tensor::DType::I64).into_data().as_slice::<i64>().map(|s| s[0]).unwrap_or(0);
+        let token_id = next_token
+            .clone()
+            .cast(burn::tensor::DType::I64)
+            .into_data()
+            .as_slice::<i64>()
+            .map(|s| s[0])
+            .unwrap_or(0);
         if eos_token_ids.contains(&token_id) {
             return input_ids;
         }
@@ -990,7 +1062,7 @@ impl<B: Backend> Qwen3ForCausalLM<B> {
             current_pos += 1;
 
             // Position for the new token
-            let position_ids = Tensor::<B, 1, Int>::from_data([current_pos as i64 - 1], &device)
+            let position_ids = Tensor::<1, Int>::from_data([current_pos as i64 - 1], &device)
                 .unsqueeze_dim::<2>(0)
                 .repeat(&[batch_size, 1]);
 
@@ -1003,7 +1075,8 @@ impl<B: Backend> Qwen3ForCausalLM<B> {
             );
 
             // Extract logits for the single new token
-            let next_token_logits = logits.slice([0..batch_size, 0..1, 0..vocab_size])
+            let next_token_logits = logits
+                .slice([0..batch_size, 0..1, 0..vocab_size])
                 .reshape([batch_size, vocab_size]);
 
             let next_token_logits = if temperature != 1.0 && temperature != 0.0 {
@@ -1022,7 +1095,13 @@ impl<B: Backend> Qwen3ForCausalLM<B> {
 
             // Check for EOS token
             // Cast to I64 first: CUDA Int tensors are i32, so reading them directly as i64 fails.
-            let token_id = next_token.clone().cast(burn::tensor::DType::I64).into_data().as_slice::<i64>().map(|s| s[0]).unwrap_or(0);
+            let token_id = next_token
+                .clone()
+                .cast(burn::tensor::DType::I64)
+                .into_data()
+                .as_slice::<i64>()
+                .map(|s| s[0])
+                .unwrap_or(0);
             if eos_token_ids.contains(&token_id) {
                 break;
             }
@@ -1034,23 +1113,23 @@ impl<B: Backend> Qwen3ForCausalLM<B> {
     }
 
     /// Create a new cache for this model.
-    pub fn new_cache(&self) -> ModelCache<B> {
+    pub fn new_cache(&self) -> ModelCache {
         self.model.new_cache()
     }
 
     /// Create a STATIC pre-allocated cache (Phase 2) for `capacity = prompt_len + max_new_tokens`.
-    pub fn new_cache_with_capacity(&self, capacity: usize) -> ModelCache<B> {
+    pub fn new_cache_with_capacity(&self, capacity: usize) -> ModelCache {
         self.model.new_cache_with_capacity(capacity)
     }
 
     /// Get the vocabulary size.
     pub fn vocab_size(&self) -> usize {
-        self.model.config.0.vocab_size
+        self.model.config.vocab_size
     }
 
     /// Get the hidden size.
     pub fn hidden_size(&self) -> usize {
-        self.model.config.0.hidden_size
+        self.model.config.hidden_size
     }
 }
 
@@ -1058,19 +1137,18 @@ impl<B: Backend> Qwen3ForCausalLM<B> {
 ///
 /// Uses CPU-based sampling to avoid slow GPU random operations.
 /// Falls back to argmax if sampling fails.
-fn sample_from_probs<B: Backend>(
-    probs: Tensor<B, 2>,
+fn sample_from_probs(
+    probs: Tensor<2>,
     top_k: usize,
     top_p: f32,
-    device: &B::Device,
-) -> Tensor<B, 1, Int> {
-    use rand::Rng;
-
+    device: &Device,
+) -> Tensor<1, Int> {
     let [batch_size, vocab_size] = probs.dims();
 
     // Transfer probs to CPU for sampling (GPU random is extremely slow)
     let probs_data = probs.into_data();
-    let probs_slice: Vec<f32> = probs_data.as_slice::<half::bf16>()
+    let probs_slice: Vec<f32> = probs_data
+        .as_slice::<half::bf16>()
         .map(|s| s.iter().map(|x| x.to_f32()).collect())
         .or_else(|_| probs_data.as_slice::<f32>().map(|s| s.to_vec()))
         .unwrap_or_default();
@@ -1080,7 +1158,6 @@ fn sample_from_probs<B: Backend>(
         return Tensor::zeros([batch_size], device);
     }
 
-    let mut rng = rand::rng();
     let mut sampled_tokens = Vec::with_capacity(batch_size);
 
     for b in 0..batch_size {
@@ -1088,7 +1165,7 @@ fn sample_from_probs<B: Backend>(
         // Shared, unit-tested sampler (`crate::sampling`): top-k AND top-p are BOTH applied now.
         // The previous inline sampler silently ignored top_p; generation and GRPO rollouts now
         // sample identically and correctly.
-        let r: f32 = rng.random();
+        let r: f32 = rand::random::<f32>();
         sampled_tokens.push(crate::sampling::sample_index(row, top_k, top_p, r) as i64);
     }
 

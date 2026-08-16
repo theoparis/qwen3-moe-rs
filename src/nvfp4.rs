@@ -6,36 +6,11 @@
 //! - `block_scales_e4m3: [N, K/16]`, one E4M3 block scale per 16 K-values.
 //! - `gscale: [1]`, global f32 second-level scale.
 
-#[cfg(feature = "cuda")]
-use burn::backend::cuda::Cuda;
-#[cfg(feature = "cuda")]
-use burn::tensor::backend::Backend;
-#[cfg(feature = "cuda")]
-use burn::tensor::{DType, Int, Tensor, TensorPrimitive};
-#[cfg(feature = "cuda")]
-use burn_cubecl::kernel::into_contiguous;
-#[cfg(feature = "cuda")]
-use burn_cubecl::{CubeBackend, tensor::CubeTensor};
-#[cfg(feature = "cuda")]
-use cubecl::cuda::CudaRuntime;
-#[cfg(feature = "cuda")]
-use cubecl::prelude::*;
-#[cfg(feature = "cuda")]
-use cubecl::{CubeCount, CubeDim, e4m3};
-
-#[cfg(feature = "cuda")]
-use crate::capture::CaptureBackend;
-#[cfg(feature = "cuda")]
-use crate::cube_custom_op::CubeCustomOp;
-
 pub const E2M1_MAX: f32 = 6.0;
 pub const E4M3_MAX: f32 = 448.0;
 pub const E4M3_MIN_NORMAL: f32 = 0.015625;
 
 const E2M1_VALUES: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-
-#[cfg(feature = "cuda")]
-const NVFP4_COLS_PER_CTA: u32 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Nvfp4HadamardSite {
@@ -164,107 +139,8 @@ fn hadamard_signs(k: usize, g: usize, seed: u64) -> Vec<f32> {
     signs
 }
 
-#[cfg(feature = "cuda")]
-pub mod gpu {
-    use cubecl::e4m3;
-    use cubecl::prelude::*;
-
-    /// Decode one E2M1 (fp4) 4-bit code to f32, IN-KERNEL — avoids `Line::<f32>::cast_from(e2m1x2)`
-    /// which mis-codegens on this cubecl rev (undefined __half_16; docs/L2C-gemv-cubecl-blocker.md).
-    /// Layout: bit 3 = sign, bits 2..1 = exp (0..3), bit 0 = mantissa (0/1). Value set
-    /// {0,±.5,±1,±1.5,±2,±3,±4,±6} — mirrors the host `e2m1_bits_to_f32`. Branch-only (no runtime
-    /// shift / no runtime-indexed table), so it lowers to plain SIMT selects.
-    #[cube]
-    pub fn e2m1_decode(code: u32) -> f32 {
-        let mag = code & 7u32;
-        let m = f32::cast_from(mag & 1u32); // mantissa 0.0 / 1.0
-        let e = (mag >> 1u32) & 3u32; // exponent field 0..3
-        let val_mag = if e == 0u32 {
-            f32::new(0.5) * m // subnormal: 0 or 0.5
-        } else {
-            // normal: 2^(e-1) * (1 + 0.5*m)
-            let pe = if e == 1u32 {
-                f32::new(1.0)
-            } else if e == 2u32 {
-                f32::new(2.0)
-            } else {
-                f32::new(4.0)
-            };
-            pe * (f32::new(1.0) + f32::new(0.5) * m)
-        };
-        if (code >> 3u32) & 1u32 == 1u32 {
-            -val_mag
-        } else {
-            val_mag
-        }
-    }
-
-    #[cube(launch)]
-    #[allow(clippy::too_many_arguments)]
-    pub fn nvfp4_decode_gemv(
-        x: &Tensor<f32>,           // [M, K] activations f32
-        qw: &Tensor<u8>, // [N, K/2] packed e2m1x2 bytes (2 fp4/byte: low=even K, high=odd K)
-        bs: &Tensor<e4m3>, // [N, K/16] E4M3 block scales
-        gscale: &Tensor<f32>, // [1] persistent FP32 global scale
-        out: &mut Tensor<f32>, // [M, N]
-        m_dim: u32,      // runtime batch, guards x/out only
-        #[comptime] k: usize, // reduction dim
-        #[comptime] blocks: usize, // K/16
-        #[comptime] m_max: usize, // register-array bound
-    ) {
-        let col = (CUBE_POS_X * CUBE_DIM_Y + UNIT_POS_Y) as usize;
-        let lane = UNIT_POS_X;
-        let n = out.shape(1);
-
-        if col < n {
-            let g = gscale[0];
-            let bytes_per_col = blocks * 8usize; // K/2
-            let mut acc = Array::<f32>::new(m_max);
-            let mut val = Array::<f32>::new(16usize); // this block's 16 dequantized fp4 (reused per block)
-
-            #[unroll]
-            for m in 0..m_max {
-                acc[m] = f32::new(0.0);
-            }
-
-            let mut blk = lane as usize;
-            while blk < blocks {
-                // manual nibble unpack: 8 bytes -> 16 fp4 -> f32 (comptime-indexed register array)
-                let byte_base = col * bytes_per_col + blk * 8usize;
-                #[unroll]
-                for j in 0..8usize {
-                    let byte = u32::cast_from(qw[byte_base + j]);
-                    val[j * 2usize] = e2m1_decode(byte & 15u32); // low nibble = even K
-                    val[j * 2usize + 1usize] = e2m1_decode((byte >> 4u32) & 15u32); // high nibble = odd K
-                }
-                let s = f32::cast_from(bs[col * blocks + blk]);
-                let k0 = blk * 16usize;
-
-                #[unroll]
-                for m in 0..m_max {
-                    let mut part = f32::new(0.0);
-                    #[unroll]
-                    for p in 0..16usize {
-                        if (m as u32) < m_dim {
-                            part += val[p] * x[m * k + k0 + p];
-                        }
-                    }
-                    acc[m] += s * part;
-                }
-
-                blk += 32;
-            }
-
-            #[unroll]
-            for m in 0..m_max {
-                let full = plane_sum(acc[m]);
-                if lane == 0 && (m as u32) < m_dim {
-                    out[m * n + col] = g * full;
-                }
-            }
-        }
-    }
-}
+#[cfg(feature = "cubecl-gpu")]
+pub use crate::nvfp4_kernels::{fused_moe_gu2_down_nvfp4, nvfp4_gemv};
 
 /// Quantize a row-major Burn Linear weight `W:[K,N]` to NVFP4 host storage.
 ///
@@ -328,6 +204,107 @@ pub fn quantize_nvfp4(w: &[f32], k: usize, n: usize) -> (Vec<u8>, Vec<u8>, f32) 
                 let k_even = k0 + pair * 2;
                 let q0 = f32_to_e2m1_bits(w[k_even * n + nn] / block_scale);
                 let q1 = f32_to_e2m1_bits(w[(k_even + 1) * n + nn] / block_scale);
+                packed_qw[packed_block + pair] = q0 | (q1 << 4);
+            }
+        }
+    }
+
+    (packed_qw, block_scales_e4m3, gscale)
+}
+
+/// Fused bf16-transpose + NVFP4 quantize, for the streamed-expert decode path.
+///
+/// Bit-identical to `quantize_nvfp4(&transpose_to_kn(bf16_bytes), k, n)`, where the transpose is
+/// the `[N,K] bf16 -> [K,N] f32` one in `expert_stream::pack_out_in_nvfp4`. It exists because that
+/// two-step form is cache-hostile *twice over*:
+///
+/// 1. the transpose writes `kn[kk * n + nn]` with stride `n` (a scatter into a 4x-larger f32
+///    buffer), and then
+/// 2. `quantize_nvfp4` reads it straight back as `w[(k0 + offset) * n + nn]` -- also stride `n`.
+///
+/// But the source `bf16_bytes` is already `[N,K]` row-major, which is exactly the order the
+/// quantizer consumes: for output column `nn`, block `b` needs source elements
+/// `nn*k + k0 .. nn*k + k0 + 16`, i.e. contiguous. So both passes collapse into one sequential
+/// read of the source and one sequential write of the output, and the strided `k*n` f32 scratch
+/// disappears.
+///
+/// On the real Qwen3.6-35B-A3B expert shapes this is the dominant per-token CPU cost: the repack
+/// runs on every routed expert on every decode step, because the streamed-expert LRU pool has a
+/// structurally ~0% hit rate against a 68 GB / 10,240-expert checkpoint
+/// (`docs/MEMORY_STREAMING_PLAN.md`). See `examples/nvfp4_repack_bench.rs`.
+pub fn quantize_nvfp4_from_nk_bf16(
+    bf16_bytes: &[u8],
+    k: usize,
+    n: usize,
+) -> (Vec<u8>, Vec<u8>, f32) {
+    assert_eq!(
+        bf16_bytes.len(),
+        n * k * 2,
+        "byte length {} != N*K*2 = {}",
+        bf16_bytes.len(),
+        n * k * 2
+    );
+    assert_eq!(
+        k % 16,
+        0,
+        "NVFP4 requires K to be a multiple of 16, got {k}"
+    );
+
+    // Decode the source once into a contiguous [N,K] f32 buffer: same element count as the old
+    // `kn` scratch, but both filled and consumed sequentially instead of strided.
+    let mut nk = vec![0.0f32; n * k];
+    for (dst, chunk) in nk.iter_mut().zip(bf16_bytes.chunks_exact(2)) {
+        *dst = half::bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32();
+    }
+
+    let mut amax = 0.0f32;
+    for &value in &nk {
+        amax = amax.max(value.abs());
+    }
+    assert!(
+        amax.is_finite(),
+        "quantize_nvfp4_from_nk_bf16: weight contains non-finite values (NaN/Inf)"
+    );
+
+    let gscale = (amax / (E2M1_MAX * E4M3_MAX)).max(f32::MIN_POSITIVE);
+    let blocks_per_col = k / 16;
+    let packed_per_col = k / 2;
+    let mut packed_qw = vec![0u8; n * packed_per_col];
+    let mut block_scales_e4m3 = vec![0u8; n * blocks_per_col];
+
+    for nn in 0..n {
+        let row = &nk[nn * k..(nn + 1) * k];
+        for block in 0..blocks_per_col {
+            let k0 = block * 16;
+            let vals = &row[k0..k0 + 16];
+
+            let mut bamax = 0.0f32;
+            for &v in vals {
+                bamax = bamax.max(v.abs());
+            }
+
+            let scale_idx = nn * blocks_per_col + block;
+            let packed_block = nn * packed_per_col + block * 8;
+            if bamax == 0.0 {
+                block_scales_e4m3[scale_idx] = f32_to_e4m3(E4M3_MIN_NORMAL);
+                for pair in 0..8 {
+                    packed_qw[packed_block + pair] = 0;
+                }
+                continue;
+            }
+
+            let sb_ideal = bamax / (E2M1_MAX * gscale);
+            let sb_byte = f32_to_e4m3(sb_ideal.max(E4M3_MIN_NORMAL));
+            block_scales_e4m3[scale_idx] = sb_byte;
+
+            let block_scale = e4m3_to_f32(sb_byte) * gscale;
+            debug_assert!(block_scale > 0.0);
+
+            // Values here are finite (asserted via `amax` above), so the branchless encoder
+            // applies and this loop vectorizes.
+            for pair in 0..8 {
+                let q0 = e2m1_bits_finite(vals[pair * 2] / block_scale);
+                let q1 = e2m1_bits_finite(vals[pair * 2 + 1] / block_scale);
                 packed_qw[packed_block + pair] = q0 | (q1 << 4);
             }
         }
@@ -818,304 +795,19 @@ pub fn dequant_nvfp4_outmajor(
     w
 }
 
-#[cfg(feature = "cuda")]
-fn alloc_f32(like: &CubeTensor<CudaRuntime>, shape: &[usize]) -> CubeTensor<CudaRuntime> {
-    let n: usize = shape.iter().product();
-    let buffer = like.client.empty(n * DType::F32.size());
-    CubeTensor::new_contiguous(
-        like.client.clone(),
-        like.device.clone(),
-        shape.to_vec().into(),
-        buffer,
-        DType::F32,
-    )
-}
-
-#[cfg(feature = "cuda")]
-fn assert_nvfp4_gemv_shapes(
-    m: usize,
-    k: usize,
-    n: usize,
-    packed_len: usize,
-    scale_len: usize,
-    m_max: usize,
-) {
-    assert!(m > 0, "nvfp4_gemv: M must be non-zero");
-    assert!(n > 0, "nvfp4_gemv: N must be non-zero");
-    assert_eq!(
-        k % 16,
-        0,
-        "nvfp4_gemv requires K to be a multiple of 16, got {k}"
-    );
-    assert!(
-        (1..=8).contains(&m_max),
-        "nvfp4_gemv: m_max must be in 1..=8 for decode, got {m_max}"
-    );
-    assert!(
-        m <= m_max,
-        "nvfp4_gemv: runtime M ({m}) exceeds fixed decode m_max ({m_max})"
-    );
-    assert_eq!(
-        packed_len,
-        n * (k / 2),
-        "packed_qw length {packed_len} != N*(K/2) = {}",
-        n * (k / 2)
-    );
-    assert_eq!(
-        scale_len,
-        n * (k / 16),
-        "block_scales length {scale_len} != N*(K/16) = {}",
-        n * (k / 16)
-    );
-}
-
-#[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
-fn launch_nvfp4_gemv_handles(
-    x: &CubeTensor<CudaRuntime>,
-    qw_handle: &cubecl::server::Handle,
-    bs_handle: &cubecl::server::Handle,
-    gscale_handle: &cubecl::server::Handle,
-    k: usize,
-    n: usize,
-    m: usize,
-    m_max: usize,
-) -> CubeTensor<CudaRuntime> {
-    let blocks = k / 16;
-    let out = alloc_f32(x, &[m, n]);
-
-    unsafe {
-        gpu::nvfp4_decode_gemv::launch::<CudaRuntime>(
-            &x.client,
-            CubeCount::Static((n as u32).div_ceil(NVFP4_COLS_PER_CTA), 1, 1),
-            CubeDim {
-                x: 32,
-                y: NVFP4_COLS_PER_CTA,
-                z: 1,
-            },
-            x.as_tensor_arg(1),
-            // packed weight as RAW u8 bytes [N, K/2] (line_size 1) — the kernel manually unpacks the
-            // nibbles, avoiding the e2m1x2->f32 Line cast that mis-codegens on this cubecl rev.
-            TensorArg::from_raw_parts::<u8>(qw_handle, &[k / 2, 1], &[n, k / 2], 1),
-            TensorArg::from_raw_parts::<e4m3>(bs_handle, &[blocks, 1], &[n, blocks], 1),
-            TensorArg::from_raw_parts::<f32>(gscale_handle, &[1], &[1], 1),
-            out.as_tensor_arg(1),
-            ScalarArg::new(m as u32),
-            k,
-            blocks,
-            m_max,
-        )
-        .expect("nvfp4_decode_gemv launch failed");
-    }
-
-    out
-}
-
-#[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
-fn run_nvfp4_gemv_tensors(
-    x: CubeTensor<CudaRuntime>,
-    qw: CubeTensor<CudaRuntime>,
-    bs: CubeTensor<CudaRuntime>,
-    gscale: CubeTensor<CudaRuntime>,
-    k: usize,
-    n: usize,
-    m_max: usize,
-) -> CubeTensor<CudaRuntime> {
-    let [m, xk] = x.meta.shape().dims::<2>();
-    assert_eq!(xk, k, "nvfp4_gemv: x K ({xk}) != requested K ({k})");
-    assert_eq!(
-        x.dtype,
-        DType::F32,
-        "nvfp4_gemv: x must be f32, got {:?}",
-        x.dtype
-    );
-    assert_eq!(
-        qw.dtype,
-        DType::I8,
-        "nvfp4_gemv: qw must be I8 bytes, got {:?}",
-        qw.dtype
-    );
-    assert_eq!(
-        bs.dtype,
-        DType::I8,
-        "nvfp4_gemv: bs must be I8 bytes, got {:?}",
-        bs.dtype
-    );
-    assert_eq!(
-        gscale.dtype,
-        DType::F32,
-        "nvfp4_gemv: gscale must be f32, got {:?}",
-        gscale.dtype
-    );
-    assert_nvfp4_gemv_shapes(
-        m,
-        k,
-        n,
-        qw.meta.shape().num_elements(),
-        bs.meta.shape().num_elements(),
-        m_max,
-    );
-    assert_eq!(
-        qw.meta.shape().dims::<2>(),
-        [n, k / 2],
-        "nvfp4_gemv: qw must be [N,K/2]"
-    );
-    assert_eq!(
-        bs.meta.shape().dims::<2>(),
-        [n, k / 16],
-        "nvfp4_gemv: bs must be [N,K/16]"
-    );
-    assert_eq!(
-        gscale.meta.shape().dims::<1>(),
-        [1],
-        "nvfp4_gemv: gscale must be [1]"
-    );
-
-    launch_nvfp4_gemv_handles(&x, &qw.handle, &bs.handle, &gscale.handle, k, n, m, m_max)
-}
-
-/// Decode-packed NVFP4 GEMV on the raw CUDA `CubeBackend` below Fusion.
+/// `2^e`, built straight from the IEEE-754 exponent field. Valid for `-126 <= e <= 127`, which
+/// covers every exponent the E4M3 codec can produce.
 ///
-/// `x` is `[M,K]` f32, `packed_qw` is `[N,K/2]` raw E2M1x2 bytes, `block_scales` is `[N,K/16]`
-/// raw E4M3 bytes, and the returned tensor is `[M,N]` f32. `n_splits_or_m_max` is the fixed decode
-/// batch bound used as the kernel's comptime `m_max`; use `1` for greedy single-stream decode.
-#[cfg(feature = "cuda")]
-#[allow(clippy::too_many_arguments)]
-pub fn nvfp4_gemv_raw(
-    x: Tensor<CaptureBackend, 2>,
-    packed_qw: &[u8],
-    block_scales: &[u8],
-    gscale: f32,
-    k: usize,
-    n: usize,
-    n_splits_or_m_max: usize,
-) -> Tensor<CaptureBackend, 2> {
-    assert!(
-        gscale.is_finite() && gscale > 0.0,
-        "nvfp4_gemv_raw: gscale must be finite and positive"
-    );
-    let [m, xk] = x.dims();
-    assert_eq!(xk, k, "nvfp4_gemv_raw: x K ({xk}) != requested K ({k})");
-    assert_eq!(x.dtype(), DType::F32, "nvfp4_gemv_raw: x must be f32");
-    assert_nvfp4_gemv_shapes(
-        m,
-        k,
-        n,
-        packed_qw.len(),
-        block_scales.len(),
-        n_splits_or_m_max,
-    );
-
-    let x_ct = into_contiguous(x.into_primitive().tensor());
-    let client = x_ct.client.clone();
-    let qw_handle = client.create_from_slice(packed_qw);
-    let bs_handle = client.create_from_slice(block_scales);
-    let gscale_words = [gscale];
-    let gscale_handle = client.create_from_slice(f32::as_bytes(&gscale_words));
-
-    let out = launch_nvfp4_gemv_handles(
-        &x_ct,
-        &qw_handle,
-        &bs_handle,
-        &gscale_handle,
-        k,
-        n,
-        m,
-        n_splits_or_m_max,
-    );
-    Tensor::from_primitive(TensorPrimitive::Float(out))
-}
-
-#[cfg(feature = "cuda")]
-pub trait Nvfp4GemvBackend: Backend {
-    /// Eager/Fusion path for persistent packed NVFP4 tensors.
-    ///
-    /// `qw:[N,K/2]` and `bs:[N,K/16]` must be `DType::I8` tensors carrying the raw byte encodings.
-    fn nvfp4_gemv(
-        x: Tensor<Self, 2>,
-        qw: Tensor<Self, 2, Int>,
-        bs: Tensor<Self, 2, Int>,
-        gscale: Tensor<Self, 1>,
-        k: usize,
-        n: usize,
-        m_max: usize,
-    ) -> Tensor<Self, 2>;
-}
-
-#[cfg(feature = "cuda")]
-impl Nvfp4GemvBackend for Cuda {
-    fn nvfp4_gemv(
-        x: Tensor<Cuda, 2>,
-        qw: Tensor<Cuda, 2, Int>,
-        bs: Tensor<Cuda, 2, Int>,
-        gscale: Tensor<Cuda, 1>,
-        k: usize,
-        n: usize,
-        m_max: usize,
-    ) -> Tensor<Cuda, 2> {
-        let [m, xk] = x.dims();
-        assert_eq!(xk, k, "nvfp4_gemv: x K ({xk}) != requested K ({k})");
-        assert_eq!(x.dtype(), DType::F32, "nvfp4_gemv: x must be f32");
-        assert_eq!(qw.dtype(), DType::I8, "nvfp4_gemv: qw must be I8");
-        assert_eq!(bs.dtype(), DType::I8, "nvfp4_gemv: bs must be I8");
-        assert_eq!(gscale.dtype(), DType::F32, "nvfp4_gemv: gscale must be f32");
-        assert_eq!(qw.dims(), [n, k / 2], "nvfp4_gemv: qw must be [N,K/2]");
-        assert_eq!(bs.dims(), [n, k / 16], "nvfp4_gemv: bs must be [N,K/16]");
-        assert_eq!(gscale.dims(), [1], "nvfp4_gemv: gscale must be [1]");
-        assert_nvfp4_gemv_shapes(m, k, n, n * (k / 2), n * (k / 16), m_max);
-
-        let x_prim = x.into_primitive().tensor();
-        let qw_prim = qw.into_primitive();
-        let bs_prim = bs.into_primitive();
-        let gscale_prim = gscale.into_primitive().tensor();
-
-        let outputs = CubeCustomOp::<CudaRuntime>::new("nvfp4_gemv")
-            .float_input(x_prim)
-            .int_input(qw_prim)
-            .int_input(bs_prim)
-            .float_input(gscale_prim)
-            .float_output([m, n], DType::F32)
-            .launch(move |inputs| {
-                // The nvfp4 kernel FLAT-indexes every input as a dense row-major buffer
-                // (`gscale[0]`, `bs[col*blocks+blk]`, `qw[col*bytes_per_col+..]`) and
-                // `launch_nvfp4_gemv_handles` hardcodes contiguous strides in `from_raw_parts`. The
-                // fusion HandleContainer can hand back a non-contiguous / view-offset pool handle, so
-                // every input must be made contiguous first — else the flat indexing reads wrong
-                // memory (NaN, shape-dependent on the pool offset). qw/bs are plain row-major [N,K/2]/
-                // [N,K/16] byte tensors (NOT swizzled), so into_contiguous is layout-preserving here.
-                // Mirrors w8a16_gemm, which into_contiguous's its scale input.
-                let x = into_contiguous(inputs[0].clone());
-                let qw = into_contiguous(inputs[1].clone());
-                let bs = into_contiguous(inputs[2].clone());
-                let gscale = into_contiguous(inputs[3].clone());
-                vec![run_nvfp4_gemv_tensors(x, qw, bs, gscale, k, n, m_max)]
-            });
-
-        Tensor::from_primitive(TensorPrimitive::Float(
-            outputs.into_iter().next().expect("one output"),
-        ))
-    }
-}
-
-#[cfg(feature = "cuda")]
-impl Nvfp4GemvBackend for CubeBackend<CudaRuntime, f32, i32, u8> {
-    fn nvfp4_gemv(
-        x: Tensor<Self, 2>,
-        qw: Tensor<Self, 2, Int>,
-        bs: Tensor<Self, 2, Int>,
-        gscale: Tensor<Self, 1>,
-        k: usize,
-        n: usize,
-        m_max: usize,
-    ) -> Tensor<Self, 2> {
-        let x = into_contiguous(x.into_primitive().tensor());
-        let qw = qw.into_primitive();
-        let bs = bs.into_primitive();
-        let gscale = gscale.into_primitive().tensor();
-        let out = run_nvfp4_gemv_tensors(x, qw, bs, gscale, k, n, m_max);
-        Tensor::from_primitive(TensorPrimitive::Float(out))
-    }
+/// This replaces `2.0f32.powi(e)`, which is a libm call. That matters because the NVFP4 quantizer
+/// invokes the E4M3 codec once per 16-element block -- 131,072 times per gate_up expert matrix,
+/// ~320 experts per decode step -- so the libm call, not the per-element math, was the dominant
+/// cost of the whole repack (`examples/nvfp4_repack_bench.rs` phase breakdown: the per-element
+/// work totalled ~0.5 ns/elem against ~12 ns/elem for the full quantizer). Powers of two are
+/// exactly representable, so this is bit-identical, not an approximation.
+#[inline(always)]
+fn exp2i(e: i32) -> f32 {
+    debug_assert!((-126..=127).contains(&e), "exp2i out of range: {e}");
+    f32::from_bits(((e + 127) as u32) << 23)
 }
 
 /// Decode one OCP E4M3 byte to f32.
@@ -1129,7 +821,7 @@ pub fn e4m3_to_f32(byte: u8) -> f32 {
         if mant == 0 {
             return sign * 0.0;
         }
-        return sign * (mant as f32) * 2.0f32.powi(-9);
+        return sign * (mant as f32) * exp2i(-9);
     }
 
     if exp == 0x0f && mant == 0x07 {
@@ -1137,7 +829,7 @@ pub fn e4m3_to_f32(byte: u8) -> f32 {
     }
 
     let exponent = exp as i32 - 7;
-    sign * (1.0 + (mant as f32) / 8.0) * 2.0f32.powi(exponent)
+    sign * (1.0 + (mant as f32) / 8.0) * exp2i(exponent)
 }
 
 /// Encode an f32 to an OCP E4M3 byte with round-to-nearest-even and finite saturation.
@@ -1157,15 +849,18 @@ pub fn f32_to_e4m3(value: f32) -> u8 {
     }
 
     if abs < E4M3_MIN_NORMAL {
-        let q = round_ties_to_even(abs / 2.0f32.powi(-9));
+        // `/ 2^-9` == `* 2^9`; exact either way, but without the libm call.
+        let q = round_ties_to_even(abs * exp2i(9));
         if q >= 8 {
             return sign_bit | 0x08;
         }
         return sign_bit | q.clamp(0, 7) as u8;
     }
 
-    let mut exponent = abs.log2().floor() as i32;
-    let mut q = round_ties_to_even(abs / 2.0f32.powi(exponent - 3));
+    // `abs` is >= E4M3_MIN_NORMAL (2^-6) and finite here, so it is a normal f32 and
+    // `floor(log2(abs))` is exactly its unbiased IEEE-754 exponent -- no `log2()` libm call needed.
+    let mut exponent = ((abs.to_bits() >> 23) & 0xff) as i32 - 127;
+    let mut q = round_ties_to_even(abs * exp2i(3 - exponent));
 
     if q >= 16 {
         exponent += 1;
@@ -1197,17 +892,61 @@ pub fn f32_to_e2m1_bits(value: f32) -> u8 {
         return sign_bit | 0x7;
     }
 
-    let mut best_idx = 0usize;
-    let mut best_err = f32::INFINITY;
-    for (idx, &candidate) in E2M1_VALUES.iter().enumerate() {
-        let err = (abs - candidate).abs();
-        if err < best_err || (err == best_err && idx % 2 == 0 && best_idx % 2 != 0) {
-            best_idx = idx;
-            best_err = err;
-        }
-    }
+    // Direct comparison chain over the 8 E2M1 magnitudes [0, .5, 1, 1.5, 2, 3, 4, 6], replacing a
+    // linear search that computed `(abs - candidate).abs()` for all 8 candidates on EVERY element.
+    // That search was the single hottest instruction stream in the streamed-expert decode path
+    // (~2M calls per expert weight matrix, ~320 experts per token).
+    //
+    // Tie-breaking is preserved exactly. The old loop kept the first (lowest-index) candidate on a
+    // tie, EXCEPT when the incoming index was even and the incumbent odd -- i.e. at an exact
+    // midpoint the EVEN index always won. Midpoints and their winners:
+    //   0.25 -> 0 | 0.75 -> 2 | 1.25 -> 2 | 1.75 -> 4 | 2.5 -> 4 | 3.5 -> 6 | 5.0 -> 6
+    // so the boundary test is `<=` where the even index is the lower one and `<` where it is the
+    // upper one. `nvfp4::tests::e2m1_chain_matches_linear_search_reference` pins this exhaustively.
+    let idx: u8 = if abs <= 0.25 {
+        0
+    } else if abs < 0.75 {
+        1
+    } else if abs <= 1.25 {
+        2
+    } else if abs < 1.75 {
+        3
+    } else if abs <= 2.5 {
+        4
+    } else if abs < 3.5 {
+        5
+    } else if abs <= 5.0 {
+        6
+    } else {
+        7
+    };
 
-    sign_bit | best_idx as u8
+    sign_bit | idx
+}
+
+/// Branchless E2M1 magnitude index for a **finite** input, identical to `f32_to_e2m1_bits`.
+///
+/// The public encoder's boundary chain is a ladder of up to 8 unpredictable branches. On real
+/// weight data those mispredict constantly, and because the quantizer's inner loop interleaves the
+/// encode with nibble packing, the compiler cannot vectorize it -- so the ladder runs scalar and
+/// dominates the repack. Summing the boundary predicates as integers gives the same index with no
+/// branches, which vectorizes.
+///
+/// Boundary `<=` / `<` placement encodes the same round-half-to-even tie-breaking as
+/// `f32_to_e2m1_bits`; `nvfp4::tests::branchless_e2m1_matches_public_encoder_on_finite_inputs`
+/// pins the two together.
+#[inline(always)]
+fn e2m1_bits_finite(value: f32) -> u8 {
+    let sign_bit = ((value.to_bits() >> 28) as u8) & 0x8;
+    let abs = value.abs();
+    let idx = (abs > 0.25) as u8
+        + (abs >= 0.75) as u8
+        + (abs > 1.25) as u8
+        + (abs >= 1.75) as u8
+        + (abs > 2.5) as u8
+        + (abs >= 3.5) as u8
+        + (abs > 5.0) as u8;
+    sign_bit | idx
 }
 
 #[inline]
@@ -1240,6 +979,309 @@ fn round_ties_to_even(value: f32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The original libm-based E4M3 decoder, kept verbatim as the oracle for the bit-built one.
+    fn e4m3_to_f32_libm_reference(byte: u8) -> f32 {
+        let sign = if byte & 0x80 == 0 { 1.0 } else { -1.0 };
+        let exp = (byte >> 3) & 0x0f;
+        let mant = byte & 0x07;
+        if exp == 0 {
+            if mant == 0 {
+                return sign * 0.0;
+            }
+            return sign * (mant as f32) * 2.0f32.powi(-9);
+        }
+        if exp == 0x0f && mant == 0x07 {
+            return f32::NAN;
+        }
+        let exponent = exp as i32 - 7;
+        sign * (1.0 + (mant as f32) / 8.0) * 2.0f32.powi(exponent)
+    }
+
+    /// The original libm-based E4M3 encoder, kept verbatim as the oracle.
+    fn f32_to_e4m3_libm_reference(value: f32) -> u8 {
+        if value.is_nan() {
+            return 0x7f;
+        }
+        let sign_bit = if value.is_sign_negative() { 0x80 } else { 0x00 };
+        let abs = value.abs();
+        if abs == 0.0 {
+            return sign_bit;
+        }
+        if !abs.is_finite() || abs >= E4M3_MAX {
+            return sign_bit | 0x7e;
+        }
+        if abs < E4M3_MIN_NORMAL {
+            let q = round_ties_to_even(abs / 2.0f32.powi(-9));
+            if q >= 8 {
+                return sign_bit | 0x08;
+            }
+            return sign_bit | q.clamp(0, 7) as u8;
+        }
+        let mut exponent = abs.log2().floor() as i32;
+        let mut q = round_ties_to_even(abs / 2.0f32.powi(exponent - 3));
+        if q >= 16 {
+            exponent += 1;
+            q = 8;
+        }
+        if exponent >= 8 {
+            q = q.min(14);
+            return sign_bit | 0x78 | ((q as u8 - 8) & 0x07);
+        }
+        let exp_bits = (exponent + 7).clamp(1, 14) as u8;
+        let mant_bits = (q as u8).saturating_sub(8) & 0x07;
+        sign_bit | (exp_bits << 3) | mant_bits
+    }
+
+    #[test]
+    fn e4m3_codec_matches_libm_reference() {
+        // Decoder: only 256 possible inputs, so check literally all of them.
+        for byte in 0u8..=255 {
+            let got = e4m3_to_f32(byte);
+            let want = e4m3_to_f32_libm_reference(byte);
+            if want.is_nan() {
+                assert!(got.is_nan(), "byte {byte:#04x}: expected NaN, got {got}");
+            } else {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "byte {byte:#04x}: {got} != {want}"
+                );
+            }
+        }
+
+        // Encoder: boundaries, subnormal range, saturation, both signs.
+        let critical = [
+            0.0f32,
+            E4M3_MIN_NORMAL,
+            E4M3_MIN_NORMAL * 0.5,
+            E4M3_MIN_NORMAL * 0.999,
+            2.0f32.powi(-9),
+            2.0f32.powi(-9) * 0.5,
+            2.0f32.powi(-10),
+            1.0,
+            1.5,
+            255.0,
+            256.0,
+            447.0,
+            E4M3_MAX,
+            E4M3_MAX + 1.0,
+            1e30,
+            1e-30,
+            f32::INFINITY,
+        ];
+        for &m in &critical {
+            for &v in &[m, -m] {
+                assert_eq!(
+                    f32_to_e4m3(v),
+                    f32_to_e4m3_libm_reference(v),
+                    "encoder mismatch at critical {v:e}"
+                );
+            }
+        }
+        assert_eq!(f32_to_e4m3(f32::NAN), f32_to_e4m3_libm_reference(f32::NAN));
+
+        // Round-trip every decodable magnitude back through the encoder.
+        for byte in 0u8..=255 {
+            let v = e4m3_to_f32_libm_reference(byte);
+            if v.is_finite() {
+                assert_eq!(
+                    f32_to_e4m3(v),
+                    f32_to_e4m3_libm_reference(v),
+                    "encoder mismatch on decoded byte {byte:#04x} = {v}"
+                );
+            }
+        }
+
+        // Pseudo-random sweep across a wide dynamic range.
+        let mut state = 0x1234_5678u32;
+        for _ in 0..300_000 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let unit = (state >> 8) as f32 / (1u32 << 24) as f32;
+            for &v in &[unit * 500.0 - 250.0, unit * 0.05, unit * 2.0 - 1.0] {
+                assert_eq!(
+                    f32_to_e4m3(v),
+                    f32_to_e4m3_libm_reference(v),
+                    "encoder mismatch at random {v:e}"
+                );
+            }
+        }
+    }
+
+    /// The original linear-search encoder, kept verbatim as the oracle for the comparison chain
+    /// that replaced it in `f32_to_e2m1_bits`.
+    fn e2m1_bits_linear_search_reference(value: f32) -> u8 {
+        if value.is_nan() {
+            return 0x7;
+        }
+        let sign_bit = if value.is_sign_negative() { 0x8 } else { 0x0 };
+        let abs = value.abs();
+        if abs == 0.0 {
+            return sign_bit;
+        }
+        if !abs.is_finite() || abs >= E2M1_MAX {
+            return sign_bit | 0x7;
+        }
+        let mut best_idx = 0usize;
+        let mut best_err = f32::INFINITY;
+        for (idx, &candidate) in E2M1_VALUES.iter().enumerate() {
+            let err = (abs - candidate).abs();
+            if err < best_err || (err == best_err && idx % 2 == 0 && best_idx % 2 != 0) {
+                best_idx = idx;
+                best_err = err;
+            }
+        }
+        sign_bit | best_idx as u8
+    }
+
+    #[test]
+    fn branchless_e2m1_matches_public_encoder_on_finite_inputs() {
+        let critical = [
+            0.0f32, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 5.9999995,
+            6.0, 6.0000005, 7.0, 1e-30, 1e30,
+        ];
+        for &m in &critical {
+            for &v in &[m, -m] {
+                assert_eq!(
+                    e2m1_bits_finite(v),
+                    f32_to_e2m1_bits(v),
+                    "branchless mismatch at critical {v:e}"
+                );
+            }
+        }
+
+        let mut x = -7.0f32;
+        while x <= 7.0 {
+            assert_eq!(
+                e2m1_bits_finite(x),
+                f32_to_e2m1_bits(x),
+                "branchless mismatch at swept {x}"
+            );
+            x += 0.0009765625;
+        }
+
+        let mut state = 0x5EED_1234u32;
+        for _ in 0..300_000 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let v = ((state >> 8) as f32 / (1u32 << 24) as f32) * 16.0 - 8.0;
+            assert_eq!(
+                e2m1_bits_finite(v),
+                f32_to_e2m1_bits(v),
+                "branchless mismatch at random {v:e}"
+            );
+        }
+
+        // Negative zero must keep its sign bit, like the public encoder.
+        assert_eq!(e2m1_bits_finite(-0.0), f32_to_e2m1_bits(-0.0));
+    }
+
+    #[test]
+    fn e2m1_chain_matches_linear_search_reference() {
+        // Every exact midpoint and representable magnitude, both signs -- these are the cases
+        // where tie-breaking decides the answer.
+        let critical = [
+            0.0f32,
+            0.25,
+            0.5,
+            0.75,
+            1.0,
+            1.25,
+            1.5,
+            1.75,
+            2.0,
+            2.5,
+            3.0,
+            3.5,
+            4.0,
+            5.0,
+            6.0,
+            7.0,
+            1e-30,
+            5.9999995,
+            6.0000005,
+            f32::INFINITY,
+        ];
+        for &m in &critical {
+            for &v in &[m, -m] {
+                assert_eq!(
+                    f32_to_e2m1_bits(v),
+                    e2m1_bits_linear_search_reference(v),
+                    "mismatch at critical value {v}"
+                );
+            }
+        }
+        assert_eq!(
+            f32_to_e2m1_bits(f32::NAN),
+            e2m1_bits_linear_search_reference(f32::NAN)
+        );
+
+        // Dense sweep across the whole represented range, plus a pseudo-random sweep.
+        let mut x = -7.0f32;
+        while x <= 7.0 {
+            assert_eq!(
+                f32_to_e2m1_bits(x),
+                e2m1_bits_linear_search_reference(x),
+                "mismatch at swept value {x}"
+            );
+            x += 0.0009765625; // exact binary step, so midpoints are hit exactly
+        }
+
+        let mut state = 0xDEADBEEFu32;
+        for _ in 0..200_000 {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let v = ((state >> 8) as f32 / (1u32 << 24) as f32) * 14.0 - 7.0;
+            assert_eq!(
+                f32_to_e2m1_bits(v),
+                e2m1_bits_linear_search_reference(v),
+                "mismatch at random value {v}"
+            );
+        }
+    }
+
+    /// `quantize_nvfp4_from_nk_bf16` must be BIT-IDENTICAL to the two-step
+    /// transpose-then-quantize path it replaces in `expert_stream::pack_out_in_nvfp4`, for the
+    /// real Qwen3.6-35B-A3B expert shapes (gate_up [1024,2048] and down [2048,512]) plus a
+    /// deliberately awkward small shape. Anything less than bit-identical would silently change
+    /// decode output, so this is an equality assert, not a cosine/tolerance check.
+    #[test]
+    fn fused_nk_bf16_quantize_is_bit_identical_to_transpose_then_quantize() {
+        for &(n, k) in &[(1024usize, 2048usize), (2048, 512), (48, 32)] {
+            // Deterministic pseudo-random bf16 source in [N,K] row-major, the exact layout
+            // `read_expert_slice` hands to the packer.
+            let mut state = 0x9E3779B9u32;
+            let mut bytes = vec![0u8; n * k * 2];
+            for chunk in bytes.chunks_exact_mut(2) {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let v = half::bf16::from_f32(((state >> 8) as f32 / (1u32 << 24) as f32) - 0.5);
+                chunk.copy_from_slice(&v.to_bits().to_le_bytes());
+            }
+
+            // Reference: the old path -- transpose [N,K] bf16 -> [K,N] f32, then quantize.
+            let mut kn = vec![0.0f32; k * n];
+            for nn in 0..n {
+                for kk in 0..k {
+                    let off = (nn * k + kk) * 2;
+                    let bits = u16::from_le_bytes([bytes[off], bytes[off + 1]]);
+                    kn[kk * n + nn] = half::bf16::from_bits(bits).to_f32();
+                }
+            }
+            let (ref_qw, ref_bs, ref_gscale) = quantize_nvfp4(&kn, k, n);
+
+            let (qw, bs, gscale) = quantize_nvfp4_from_nk_bf16(&bytes, k, n);
+
+            assert_eq!(gscale, ref_gscale, "gscale mismatch at n={n}, k={k}");
+            assert_eq!(bs, ref_bs, "block scales mismatch at n={n}, k={k}");
+            assert_eq!(qw, ref_qw, "packed weights mismatch at n={n}, k={k}");
+        }
+    }
 
     fn cosine(a: &[f32], b: &[f32]) -> f32 {
         let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);

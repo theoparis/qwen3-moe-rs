@@ -16,7 +16,7 @@
 //! increments). Verified vs a CPU oracle in `examples/flash_raw_smoke.rs`.
 
 use burn::backend::cuda::Cuda;
-use burn::tensor::backend::Backend;
+
 use burn::tensor::{DType, Tensor, TensorPrimitive};
 use burn_cubecl::CubeBackend;
 use burn_cubecl::kernel::into_contiguous;
@@ -169,30 +169,27 @@ mod gpu {
 /// (GQA NOT expanded). `n_splits` partitions the KV range. Correctness-first: f32, scalar strided
 /// D-partition. Verified vs a CPU oracle in `examples/flash_raw_smoke.rs`.
 pub fn flash_decode_raw(
-    q: Tensor<CaptureBackend, 4>,
-    k: Tensor<CaptureBackend, 4>,
-    v: Tensor<CaptureBackend, 4>,
+    q: Tensor<4>,
+    k: Tensor<4>,
+    v: Tensor<4>,
     scale: f32,
     n_splits: usize,
-) -> Tensor<CaptureBackend, 4> {
+) -> Tensor<4> {
     <CaptureBackend as FlashDecodeBackend>::flash_decode(q, k, v, scale, n_splits)
 }
 
-fn assert_flash_decode_shapes<B: Backend>(
+fn assert_flash_decode_shapes(
     op: &str,
-    q: &Tensor<B, 4>,
-    k: &Tensor<B, 4>,
-    v: &Tensor<B, 4>,
+    q: &Tensor<4>,
+    k: &Tensor<4>,
+    v: &Tensor<4>,
     n_splits: usize,
 ) {
     let [bsz, hq, sq, d] = q.dims();
     let [kb, hkv, sk, kd] = k.dims();
     let [vb, vhkv, vsk, vd] = v.dims();
     let kv_dtype = k.dtype();
-    assert_eq!(
-        sq, 1,
-        "{op} is decode-only (q_len=1); got sq={sq}"
-    );
+    assert_eq!(sq, 1, "{op} is decode-only (q_len=1); got sq={sq}");
     assert!(q.dtype() == DType::F32, "{op}: q must be f32");
     assert_eq!(kv_dtype, v.dtype(), "{op}: k/v dtype mismatch");
     assert_eq!(
@@ -304,23 +301,23 @@ fn run_flash_decode_tensors(
 #[cfg(feature = "cuda")]
 pub trait FlashDecodeBackend: Backend {
     fn flash_decode(
-        q: Tensor<Self, 4>,
-        k: Tensor<Self, 4>,
-        v: Tensor<Self, 4>,
+        q: Tensor<4>,
+        k: Tensor<4>,
+        v: Tensor<4>,
         scale: f32,
         n_splits: usize,
-    ) -> Tensor<Self, 4>;
+    ) -> Tensor<4>;
 }
 
 #[cfg(feature = "cuda")]
 impl FlashDecodeBackend for Cuda {
     fn flash_decode(
-        q: Tensor<Cuda, 4>,
-        k: Tensor<Cuda, 4>,
-        v: Tensor<Cuda, 4>,
+        q: Tensor<4>,
+        k: Tensor<4>,
+        v: Tensor<4>,
         scale: f32,
         n_splits: usize,
-    ) -> Tensor<Cuda, 4> {
+    ) -> Tensor<4> {
         assert_flash_decode_shapes("flash_decode", &q, &k, &v, n_splits);
         let [bsz, hq, _, d] = q.dims();
         let q = q.into_primitive().tensor();
@@ -351,12 +348,12 @@ impl FlashDecodeBackend for Cuda {
 #[cfg(feature = "cuda")]
 impl FlashDecodeBackend for CubeBackend<CudaRuntime, f32, i32, u8> {
     fn flash_decode(
-        q: Tensor<Self, 4>,
-        k: Tensor<Self, 4>,
-        v: Tensor<Self, 4>,
+        q: Tensor<4>,
+        k: Tensor<4>,
+        v: Tensor<4>,
         scale: f32,
         n_splits: usize,
-    ) -> Tensor<Self, 4> {
+    ) -> Tensor<4> {
         assert_flash_decode_shapes("flash_decode_raw", &q, &k, &v, n_splits);
         let q = q.into_primitive().tensor();
         let k = k.into_primitive().tensor();

@@ -35,8 +35,8 @@
 //! sites) is deliberately separate. See the module bottom / the return notes for which GEMMs to swap.
 
 use burn::nn::Linear;
-use burn::prelude::Backend;
-use burn::tensor::{DType, Int, Tensor, TensorData};
+use burn::prelude::Device;
+use burn::tensor::{DType, Device, Int, Tensor, TensorData};
 
 use crate::w8a16::quantize_e4m3_per_channel;
 
@@ -48,29 +48,29 @@ use crate::w8a16::quantize_e4m3_per_channel;
 /// transpose). The struct is generic over the backend `B` for the host-side `from_*` constructors;
 /// [`forward`](W8A16Linear::forward) is implemented only for the CUDA backend (where the kernel lives).
 #[derive(Clone, Debug)]
-pub struct W8A16Linear<B: Backend> {
+pub struct W8A16Linear {
     /// Packed OCP E4M3 weight bytes `[K, N]`, carried in a 1-byte `DType::I8` Int tensor (raw e4m3
     /// bits; `byte as i8` is bit-preserving). Passed to the kernel AS-IS — never `into_contiguous`d
     /// (§0b rule 5: it would trigger a layout-fixing copy).
-    q: Tensor<B, 2, Int>,
+    q: Tensor<2, Int>,
     /// Per-output-channel symmetric scale `[N]` (f32): `s[n] = max_k|W[k,n]| / 448`.
-    scale: Tensor<B, 1>,
+    scale: Tensor<1>,
     /// Optional bias `[N]` (f32), added after the GEMM. `None` for Qwen3's bias-free projections.
-    bias: Option<Tensor<B, 1>>,
+    bias: Option<Tensor<1>>,
     /// Input dim (rows of the weight) — for shape asserts.
     k: usize,
     /// Output dim (columns of the weight / length of `scale`).
     n: usize,
 }
 
-impl<B: Backend> W8A16Linear<B> {
+impl W8A16Linear {
     /// Quantize-on-load from a row-major f32 weight `W:[K,N]` (Burn `Linear` layout `[d_in,d_out]`)
     /// and an optional bias `[N]`. Runs the existing per-output-channel OCP-E4M3 quantizer on the
     /// HOST, then uploads the packed bytes (`I8`) + scale (f32) to the weight's device.
     ///
     /// The weight is cast to f32 on the host before quantizing, so a bf16/f16-typed checkpoint loads
     /// correctly (the master weights here are f32, so this is usually a no-op).
-    pub fn from_weight(weight: Tensor<B, 2>, bias: Option<Tensor<B, 1>>) -> Self {
+    pub fn from_weight(weight: Tensor<2>, bias: Option<Tensor<1>>) -> Self {
         let [k, n] = weight.dims();
         let device = weight.device();
 
@@ -88,9 +88,8 @@ impl<B: Backend> W8A16Linear<B> {
         // Pack the raw e4m3 bits into a 1-byte I8 Int tensor (`b as i8` is bit-preserving; the kernel
         // reinterprets the bits as e4m3). See `w8a16.rs` for why I8 carries the byte.
         let q_i8: Vec<i8> = q_bytes.iter().map(|&b| b as i8).collect();
-        let q =
-            Tensor::<B, 2, Int>::from_data_dtype(TensorData::new(q_i8, [k, n]), &device, DType::I8);
-        let scale = Tensor::<B, 1>::from_data(TensorData::new(scale, [n]), &device);
+        let q = Tensor::<2, Int>::from_data(TensorData::new(q_i8, ([k, n])), &device, DType::I8);
+        let scale = Tensor::<1>::from_data(TensorData::new(scale, [n]), &device);
 
         Self {
             q,
@@ -112,7 +111,7 @@ impl<B: Backend> W8A16Linear<B> {
         scale_n: Vec<f32>,
         k: usize,
         n: usize,
-        device: &B::Device,
+        device: &Device,
     ) -> Self {
         assert_eq!(
             q_bytes_kn.len(),
@@ -133,9 +132,8 @@ impl<B: Backend> W8A16Linear<B> {
         );
 
         let q_i8: Vec<i8> = q_bytes_kn.iter().map(|&b| b as i8).collect();
-        let q =
-            Tensor::<B, 2, Int>::from_data_dtype(TensorData::new(q_i8, [k, n]), device, DType::I8);
-        let scale = Tensor::<B, 1>::from_data(TensorData::new(scale_n, [n]), device);
+        let q = Tensor::<2, Int>::from_data(TensorData::new(q_i8, ([k, n])), device, DType::I8);
+        let scale = Tensor::<1>::from_data(TensorData::new(scale_n, [n]), device);
 
         Self {
             q,
@@ -149,7 +147,7 @@ impl<B: Backend> W8A16Linear<B> {
     /// Quantize-on-load from an existing [`burn::nn::Linear`] — the drop-in entry point. Preserves the
     /// Linear's bias if present. Layout-preserving: `Linear` stores `[d_in, d_out] = [K, N]`, which is
     /// exactly the kernel's `W:[K,N]`, so no transpose is needed.
-    pub fn from_linear(lin: &Linear<B>) -> Self {
+    pub fn from_linear(lin: &Linear) -> Self {
         let weight = lin.weight.val();
         let bias = lin.bias.as_ref().map(|b| b.val());
         Self::from_weight(weight, bias)
@@ -180,7 +178,7 @@ mod cuda_forward {
     use super::W8A16Linear;
     use burn::tensor::Tensor;
 
-    impl<B: crate::w8a16::W8A16GemvBackend> W8A16Linear<B> {
+    impl W8A16Linear {
         /// Forward at `[M, K] -> [M, N]` through the FUSED dequant-in-GEMM kernel (no bf16 dequant
         /// round-trip). `M=1` is the single-stream decode regime this layer targets; `M>1` also works
         /// (the kernel re-reads the weight column per row — correct, just bandwidth-suboptimal above
@@ -189,7 +187,7 @@ mod cuda_forward {
         ///
         /// Activations are f32 (the kernel is W8A32 against today's f32-typed model); the bias, if
         /// any, is added in f32 after the GEMM.
-        pub fn forward(&self, x: Tensor<B, 2>) -> Tensor<B, 2> {
+        pub fn forward(&self, x: Tensor<2>) -> Tensor<2> {
             assert_eq!(
                 x.dims()[1],
                 self.k,
@@ -198,7 +196,7 @@ mod cuda_forward {
                 self.k
             );
             // The fused kernel: reads packed e4m3 bytes from HBM, dequants in-register, f32 MAC.
-            let y = B::w8a16_gemv(x, self.q.clone(), self.scale.clone()); // [M, N]
+            let y = crate::w8a16::w8a16_gemv(x, self.q.clone(), self.scale.clone()); // [M, N]
             match &self.bias {
                 // `[N]` bias -> `[1, N]` broadcast-add over `[M, N]`.
                 Some(b) => y + b.clone().unsqueeze(),
@@ -209,7 +207,7 @@ mod cuda_forward {
         /// 3-D convenience mirroring [`crate::linear2d::linear3`]: `[B, S, K] -> [B, S, N]` by
         /// flattening the leading dims to a single `M = B*S`, running [`forward`](Self::forward), and
         /// reshaping back. This is the shape the Wave-2 attn/expert/head call sites pass.
-        pub fn forward3(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        pub fn forward3(&self, x: Tensor<3>) -> Tensor<3> {
             let [b, s, k] = x.dims();
             let y = self.forward(x.reshape([b * s, k])); // [B*S, N]
             let n = y.dims()[1];
@@ -225,8 +223,8 @@ mod cuda_forward {
 mod tests {
     use super::*;
     use crate::capture::CaptureBackend;
-    use burn::backend::cuda::{Cuda, CudaDevice};
     use burn::nn::LinearConfig;
+    use burn::prelude::Device;
     use burn::tensor::{Distribution, Tensor};
 
     /// Cosine similarity over flattened outputs (f64 accum), the spike's metric.
@@ -260,7 +258,7 @@ mod tests {
 
     /// bf16 reference matmul: cast both operands to bf16, matmul (f32 accum on the CUDA backend),
     /// widen back to f32 — exactly what `linear2d::matmul_bf16` does for the bf16 Linear path.
-    fn bf16_ref(x: Tensor<Cuda, 2>, w: Tensor<Cuda, 2>) -> Vec<f32> {
+    fn bf16_ref(x: Tensor<2>, w: Tensor<2>) -> Vec<f32> {
         x.cast(DType::BF16)
             .matmul(w.cast(DType::BF16))
             .cast(DType::F32)
@@ -274,7 +272,7 @@ mod tests {
     /// small relative error). Real Qwen3 Linear shapes.
     #[test]
     fn w8a16_linear_matches_bf16_linear_m1_and_mgt1() {
-        let dev = CudaDevice::default();
+        let dev = Device::cuda(0);
         // (label, K, N) at real Qwen3 projection shapes; each run at M=1 and M=8.
         let shapes = [
             ("qkv/gate", 2048usize, 768usize),
@@ -290,11 +288,11 @@ mod tests {
         for (label, k, n) in shapes {
             // One weight tensor, reused for the fp8 layer AND every reference (so the only difference
             // is the quantization, not the data). Weights small-ish, activations ~N(0,1) (spike scale).
-            let weight = Tensor::<Cuda, 2>::random([k, n], Distribution::Normal(0.0, 0.05), &dev);
+            let weight = Tensor::<2>::random([k, n], Distribution::Normal(0.0, 0.05), &dev);
             let w8 = W8A16Linear::from_weight(weight.clone(), None);
 
             for m in ms {
-                let x = Tensor::<Cuda, 2>::random([m, k], Distribution::Normal(0.0, 1.0), &dev);
+                let x = Tensor::<2>::random([m, k], Distribution::Normal(0.0, 1.0), &dev);
 
                 let got = w8.forward(x.clone()).into_data().to_vec::<f32>().unwrap();
                 let ref_bf16 = bf16_ref(x.clone(), weight.clone());
@@ -343,11 +341,11 @@ mod tests {
         );
     }
 
-    /// Exercises the `from_linear` drop-in path AND the bias add: build a real `Linear<Cuda>` WITH
+    /// Exercises the `from_linear` drop-in path AND the bias add: build a real `Linear` WITH
     /// bias, quantize it, and check the fp8 forward (incl. bias) tracks the f32 Linear forward.
     #[test]
     fn from_linear_with_bias_tracks_linear() {
-        let dev = CudaDevice::default();
+        let dev = Device::cuda(0);
         let (k, n, m) = (1024usize, 512usize, 4usize);
 
         let lin = LinearConfig::new(k, n).with_bias(true).init::<Cuda>(&dev);
@@ -355,7 +353,7 @@ mod tests {
         assert!(w8.has_bias(), "from_linear must carry the bias");
         assert_eq!((w8.k(), w8.n()), (k, n));
 
-        let x = Tensor::<Cuda, 2>::random([m, k], Distribution::Normal(0.0, 1.0), &dev);
+        let x = Tensor::<2>::random([m, k], Distribution::Normal(0.0, 1.0), &dev);
 
         let got = w8.forward(x.clone()).into_data().to_vec::<f32>().unwrap();
         // f32 Linear forward (weight + bias), via the 2-D path.
@@ -368,20 +366,19 @@ mod tests {
 
     #[test]
     fn from_packed_parts_forward_matches_from_weight_bit_exact() {
-        let dev = CudaDevice::default();
+        let dev = Device::cuda(0);
         let (k, n, m) = (512usize, 128usize, 4usize);
         let weight_data: Vec<f32> = (0..k * n)
             .map(|idx| ((idx % 251) as f32 - 125.0) * 0.0009)
             .collect();
-        let weight =
-            Tensor::<Cuda, 2>::from_data(TensorData::new(weight_data.clone(), [k, n]), &dev);
+        let weight = Tensor::<2>::from_data(TensorData::new(weight_data.clone(), [k, n]), &dev);
         let (q_bytes, scale) = quantize_e4m3_per_channel(&weight_data, k, n);
         let from_weight = W8A16Linear::from_weight(weight, None);
         let from_parts = W8A16Linear::from_packed_parts(q_bytes, scale, k, n, &dev);
         let x_data: Vec<f32> = (0..m * k)
             .map(|idx| ((idx % 127) as f32 - 63.0) * 0.006)
             .collect();
-        let x = Tensor::<Cuda, 2>::from_data(TensorData::new(x_data, [m, k]), &dev);
+        let x = Tensor::<2>::from_data(TensorData::new(x_data, [m, k]), &dev);
 
         let got_weight = from_weight
             .forward(x.clone())
@@ -400,7 +397,7 @@ mod tests {
 
     #[test]
     fn real_qwen_shapes_m1_match_bf16_and_raw_capture_parity() {
-        let dev = CudaDevice::default();
+        let dev = Device::cuda(0);
         let shapes = [
             ("gdn_qkv", 2048usize, 8192usize),
             ("gdn_out", 4096usize, 2048usize),
@@ -414,10 +411,8 @@ mod tests {
                 .collect();
             let x_data: Vec<f32> = (0..k).map(|i| ((i % 127) as f32 - 63.0) * 0.01).collect();
 
-            let weight_cuda =
-                Tensor::<Cuda, 2>::from_data(TensorData::new(weight.clone(), [k, n]), &dev);
-            let x_cuda =
-                Tensor::<Cuda, 2>::from_data(TensorData::new(x_data.clone(), [1, k]), &dev);
+            let weight_cuda = Tensor::<2>::from_data(TensorData::new(weight.clone(), [k, n]), &dev);
+            let x_cuda = Tensor::<2>::from_data(TensorData::new(x_data.clone(), [1, k]), &dev);
             let w8_cuda = W8A16Linear::from_weight(weight_cuda.clone(), None);
             let got_cuda = w8_cuda
                 .forward(x_cuda.clone())
@@ -431,10 +426,8 @@ mod tests {
                 "{label}: W8A16 vs bf16 cosine {cos_bf16:.6} < 0.999"
             );
 
-            let weight_raw =
-                Tensor::<CaptureBackend, 2>::from_data(TensorData::new(weight, [k, n]), &dev);
-            let x_raw =
-                Tensor::<CaptureBackend, 2>::from_data(TensorData::new(x_data, [1, k]), &dev);
+            let weight_raw = Tensor::<2>::from_data(TensorData::new(weight, [k, n]), &dev);
+            let x_raw = Tensor::<2>::from_data(TensorData::new(x_data, [1, k]), &dev);
             let w8_raw = W8A16Linear::from_weight(weight_raw, None);
             let got_raw = w8_raw.forward(x_raw).into_data().to_vec::<f32>().unwrap();
             let cos_raw = cosine(&got_cuda, &got_raw);

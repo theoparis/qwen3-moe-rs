@@ -149,12 +149,7 @@ mod gpu {
 ///
 /// Returns `[batch, num_q_heads, q_len, head_dim]`. Decode is `q_len = 1`; prefill is `q_len = kv_len`
 /// (or any `q_len <= kv_len`, with the queries occupying the last `q_len` positions of the KV).
-pub fn flash_attention(
-    q: Tensor<Cuda, 4>,
-    k: Tensor<Cuda, 4>,
-    v: Tensor<Cuda, 4>,
-    scale: f32,
-) -> Tensor<Cuda, 4> {
+pub fn flash_attention(q: Tensor<4>, k: Tensor<4>, v: Tensor<4>, scale: f32) -> Tensor<4> {
     let [bsz, hq, sq, d] = q.dims();
     let [kb, hkv, sk, kd] = k.dims();
     let [vb, vhkv, vsk, vd] = v.dims();
@@ -166,11 +161,16 @@ pub fn flash_attention(
         q.dtype() == DType::F32 && k.dtype() == DType::F32 && v.dtype() == DType::F32,
         "flash_attention is f32-only; got q={:?} k={:?} v={:?}. The bf16 rollout path needs a \
          bf16-input/f32-accumulate kernel variant (docs/VLLM_KERNELS.md §1).",
-        q.dtype(), k.dtype(), v.dtype(),
+        q.dtype(),
+        k.dtype(),
+        v.dtype(),
     );
     // * shapes: sq <= sk (else `q_offset = sk - sq` underflows the usize → OOB key scan), and k/v must
     //   share batch / kv-heads / kv-len / head_dim.
-    assert!(sq <= sk, "flash_attention: q_len ({sq}) must be <= kv_len ({sk})");
+    assert!(
+        sq <= sk,
+        "flash_attention: q_len ({sq}) must be <= kv_len ({sk})"
+    );
     assert!(
         kb == bsz && vb == bsz && vhkv == hkv && vsk == sk && kd == d && vd == d,
         "flash_attention: q/k/v shape mismatch (q=[{bsz},{hq},{sq},{d}] k=[{kb},{hkv},{sk},{kd}] v=[{vb},{vhkv},{vsk},{vd}])"
@@ -226,7 +226,9 @@ pub fn flash_attention(
             vec![out]
         });
 
-    Tensor::from_primitive(TensorPrimitive::Float(outputs.into_iter().next().expect("one output")))
+    Tensor::from_primitive(TensorPrimitive::Float(
+        outputs.into_iter().next().expect("one output"),
+    ))
 }
 
 /// L2A.1 (plan §5 A3): the SAME proven FA-2 kernel launched on the RAW `CubeBackend` (below Fusion),
@@ -249,9 +251,14 @@ pub fn flash_attention_raw(
     assert!(
         q.dtype() == DType::F32 && k.dtype() == DType::F32 && v.dtype() == DType::F32,
         "flash_attention_raw is f32-only; got q={:?} k={:?} v={:?}",
-        q.dtype(), k.dtype(), v.dtype(),
+        q.dtype(),
+        k.dtype(),
+        v.dtype(),
     );
-    assert!(sq <= sk, "flash_attention_raw: q_len ({sq}) must be <= kv_len ({sk})");
+    assert!(
+        sq <= sk,
+        "flash_attention_raw: q_len ({sq}) must be <= kv_len ({sk})"
+    );
     assert!(
         kb == bsz && vb == bsz && vhkv == hkv && vsk == sk && kd == d && vd == d,
         "flash_attention_raw: q/k/v shape mismatch"

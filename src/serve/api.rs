@@ -578,7 +578,10 @@ mod tests {
         // limitation — so `null` reads back as `None`, not `Some(None)`. That is
         // fine here: nothing consumes a chunk we produced back into this struct.
         let back: ChatCompletionChunk = serde_json::from_value(mid).unwrap();
-        assert_eq!(back.usage, None, "serde collapses null → outer None on read");
+        assert_eq!(
+            back.usage, None,
+            "serde collapses null → outer None on read"
+        );
 
         // (3) final usage-only chunk ⇒ "usage": {...}.
         let fin = serde_json::to_value(base(Some(Some(Usage {

@@ -344,7 +344,10 @@ mod tests {
         // First token: only the incomplete-codepoint half — nothing emitted.
         let r0 = d.push(ids[0]);
         assert_eq!(r0.text, "", "partial codepoint must be held back");
-        assert!(!r0.text.contains('\u{FFFD}'), "no replacement char may leak");
+        assert!(
+            !r0.text.contains('\u{FFFD}'),
+            "no replacement char may leak"
+        );
         // Feed the remaining tokens: the whole emoji arrives exactly once.
         let mut rest = String::new();
         for &id in &ids[1..] {
@@ -477,7 +480,11 @@ mod tests {
     /// single token that round-trips to the replacement char.
     fn replacement_token(tk: &Tokenizer) -> u32 {
         let ids = enc(tk, "\u{FFFD}");
-        assert_eq!(ids.len(), 1, "expected a single U+FFFD vocab token, got {ids:?}");
+        assert_eq!(
+            ids.len(),
+            1,
+            "expected a single U+FFFD vocab token, got {ids:?}"
+        );
         let id = ids[0];
         assert_eq!(
             tk.decode(&[id], false).unwrap(),
@@ -555,7 +562,10 @@ mod tests {
         // Every intermediate push holds back (no U+FFFD leaks, force NOT fired).
         for &id in &ids[..ids.len() - 1] {
             let r = d.push(id);
-            assert_eq!(r.text, "", "partial codepoint must be held, not force-committed");
+            assert_eq!(
+                r.text, "",
+                "partial codepoint must be held, not force-committed"
+            );
             assert!(!r.text.contains('\u{FFFD}'));
         }
         // The final byte completes the codepoint — emitted exactly once, clean.

@@ -1,6 +1,6 @@
 #![cfg(feature = "cuda")]
 
-use burn::{prelude::Backend, tensor::Tensor};
+use burn::tensor::Tensor;
 use qwen3_burn::{
     GdnStateCache, Precision, Qwen3_5LayerType, Qwen3_5MoeConfig,
     capture::{CaptureBackend, float_va},
@@ -14,7 +14,7 @@ type B = CaptureBackend;
 #[test]
 #[ignore = "GPU VA-stability probe; run explicitly on the CUDA orchestrator"]
 fn gdn_static_state_va_stays_stable() {
-    let device = <B as Backend>::Device::default();
+    let device = Device::default();
     let mut cache = GdnStateCache::<B>::new(1, 2, 2, 6, 4);
     cache.init_static(1, &device);
 
@@ -64,14 +64,14 @@ fn gdn_static_state_va_stays_stable() {
         linear_conv_kernel_dim: 4,
         mtp_num_hidden_layers: 0,
     };
-    let model = cfg.init_causal_lm::<B>(&device);
+    let model = cfg.init_causal_lm(&device);
     let layer = match &model.model.layers[0] {
         Qwen3_5DecoderLayer::Linear(layer) => layer,
         Qwen3_5DecoderLayer::Full(_) => unreachable!("test config has one linear layer"),
     };
 
     for i in 0..8 {
-        let hidden = Tensor::<B, 3>::zeros([1, 1, cfg.hidden_size], &device);
+        let hidden = Tensor::<3>::zeros([1, 1, cfg.hidden_size], &device);
         let _out = layer
             .linear_attn
             .step_recurrent_static(hidden, &mut cache, Precision::F32);
@@ -99,7 +99,7 @@ fn gdn_static_state_va_stays_stable() {
         "GDN static conv VA moved after reset_for_replay"
     );
 
-    let hidden = Tensor::<B, 3>::zeros([1, 1, cfg.hidden_size], &device);
+    let hidden = Tensor::<3>::zeros([1, 1, cfg.hidden_size], &device);
     let _out = layer
         .linear_attn
         .step_recurrent_static(hidden, &mut cache, Precision::F32);
@@ -114,7 +114,7 @@ fn gdn_static_state_va_stays_stable() {
         "GDN static conv VA moved after post-reset step_recurrent_static"
     );
 
-    let hidden = Tensor::<B, 3>::zeros([1, 6, cfg.hidden_size], &device);
+    let hidden = Tensor::<3>::zeros([1, 6, cfg.hidden_size], &device);
     let _out =
         layer
             .linear_attn

@@ -9,7 +9,7 @@
 use std::{path::PathBuf, time::Instant};
 
 use burn::{
-    backend::cuda::{Cuda, CudaDevice},
+    prelude::Device,
     tensor::{DType, Int, Tensor},
 };
 use qwen3_burn::{
@@ -36,15 +36,15 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn positions(start: usize, len: usize, device: &CudaDevice) -> Tensor<B, 2, Int> {
+fn positions(start: usize, len: usize, device: &CudaDevice) -> Tensor<2, Int> {
     if len == 1 {
-        Tensor::<B, 2, Int>::from_data([[start as i64]], device)
+        Tensor::<2, Int>::from_data([[start as i64]], device)
     } else {
-        Tensor::<B, 1, Int>::arange(start as i64..(start + len) as i64, device).unsqueeze()
+        Tensor::<1, Int>::arange(start as i64..(start + len) as i64, device).unsqueeze()
     }
 }
 
-fn assert_logits_all_finite(logits: &Tensor<B, 3>, what: &str) -> Result<(), String> {
+fn assert_logits_all_finite(logits: &Tensor<3>, what: &str) -> Result<(), String> {
     let [batch, seq, vocab] = logits.dims();
     let values = logits
         .clone()
@@ -64,10 +64,10 @@ fn assert_logits_all_finite(logits: &Tensor<B, 3>, what: &str) -> Result<(), Str
     Ok(())
 }
 
-fn argmax_last(logits: &Tensor<B, 3>) -> Result<i64, String> {
+fn argmax_last(logits: &Tensor<3>) -> Result<i64, String> {
     assert_logits_all_finite(logits, "decode")?;
     let [batch, seq, vocab] = logits.dims();
-    let next: Tensor<B, 2, Int> = logits
+    let next: Tensor<2, Int> = logits
         .clone()
         .slice([0..batch, (seq - 1)..seq, 0..vocab])
         .reshape([batch, vocab])
@@ -82,7 +82,7 @@ fn argmax_last(logits: &Tensor<B, 3>) -> Result<i64, String> {
         .ok_or_else(|| "argmax returned no token".to_string())
 }
 
-fn argmax_each_position(logits: &Tensor<B, 3>) -> Result<Vec<i64>, String> {
+fn argmax_each_position(logits: &Tensor<3>) -> Result<Vec<i64>, String> {
     assert_logits_all_finite(logits, "verify")?;
     let [batch, seq, vocab] = logits.dims();
     if batch != 1 {
@@ -98,7 +98,7 @@ fn argmax_each_position(logits: &Tensor<B, 3>) -> Result<Vec<i64>, String> {
         .map_err(|e| format!("read verify argmax tokens: {e:?}"))
 }
 
-fn full_attn_filled(cache: &Qwen3_5HybridCache<B>) -> Result<usize, String> {
+fn full_attn_filled(cache: &Qwen3_5HybridCache) -> Result<usize, String> {
     let mut filled = None;
     for (idx, layer) in cache.layers.iter().enumerate() {
         if let Qwen3_5HybridLayerCache::Full(kv) = layer {
@@ -157,7 +157,7 @@ fn compare_tokens(reference: &[i64], candidate: &[i64]) -> Option<usize> {
 }
 
 fn greedy_decode(
-    model: &qwen3_burn::Qwen3_5MoeForCausalLM<B>,
+    model: &qwen3_burn::Qwen3_5MoeForCausalLM,
     tokenizer: &Qwen3Tokenizer,
     prompt_ids: &[i64],
     max_new_tokens: usize,
@@ -165,7 +165,7 @@ fn greedy_decode(
 ) -> Result<(Vec<i64>, String, String), String> {
     let prompt_len = prompt_ids.len();
     let total = prompt_len + max_new_tokens;
-    let input = Tensor::<B, 1, Int>::from_data(prompt_ids, device).unsqueeze();
+    let input = Tensor::<1, Int>::from_data(prompt_ids, device).unsqueeze();
     let mut cache = model.model.new_cache_with_capacity(total);
 
     let pos0 = positions(0, prompt_len, device);
@@ -180,7 +180,7 @@ fn greedy_decode(
         new_ids.push(id);
 
         if step + 1 < max_new_tokens {
-            let tok = Tensor::<B, 2, Int>::from_data([[id]], device);
+            let tok = Tensor::<2, Int>::from_data([[id]], device);
             let pos = positions(prompt_len + step, 1, device);
             logits = model.forward_prec(tok, pos, &mut cache, Precision::Bf16);
         }
@@ -202,7 +202,7 @@ struct SpecStats {
 }
 
 fn spec_decode_ngram(
-    model: &qwen3_burn::Qwen3_5MoeForCausalLM<B>,
+    model: &qwen3_burn::Qwen3_5MoeForCausalLM,
     tokenizer: &Qwen3Tokenizer,
     prompt_ids: &[i64],
     max_new_tokens: usize,
@@ -212,7 +212,7 @@ fn spec_decode_ngram(
     let prompt_len = prompt_ids.len();
     let draft_limit = k.saturating_sub(1);
     let capacity = prompt_len + max_new_tokens + k.max(1);
-    let input = Tensor::<B, 1, Int>::from_data(prompt_ids, device).unsqueeze();
+    let input = Tensor::<1, Int>::from_data(prompt_ids, device).unsqueeze();
     let mut cache = model.model.new_cache_with_capacity(capacity);
 
     let pos0 = positions(0, prompt_len, device);
@@ -243,8 +243,7 @@ fn spec_decode_ngram(
         if !drafts.is_empty() {
             stats.verify_batches += 1;
             stats.verify_tokens += drafts.len();
-            let verify_input =
-                Tensor::<B, 1, Int>::from_data(drafts.as_slice(), device).unsqueeze();
+            let verify_input = Tensor::<1, Int>::from_data(drafts.as_slice(), device).unsqueeze();
             let verify_pos = positions(generated.len(), drafts.len(), device);
             let verify_logits =
                 model.forward_prec(verify_input, verify_pos, &mut cache, Precision::Bf16);
@@ -268,7 +267,7 @@ fn spec_decode_ngram(
 
         for id in committed {
             let pos = positions(generated.len(), 1, device);
-            let tok = Tensor::<B, 2, Int>::from_data([[id]], device);
+            let tok = Tensor::<2, Int>::from_data([[id]], device);
             last_logits = model.forward_prec(tok, pos, &mut cache, Precision::Bf16);
             generated.push(id);
             new_ids.push(id);
@@ -297,7 +296,7 @@ fn run() -> Result<(), String> {
     let max_new_tokens = env_usize("MAX_NEW_TOKENS", MAX_NEW_TOKENS);
     let k = env_usize("K", K).max(1);
 
-    let device = CudaDevice::default();
+    let device = Device::cuda(0);
     println!("device: {device:?}");
     println!(
         "ngram spec config: dir={dir:?} prompt={prompt:?} max_new_tokens={max_new_tokens} k={k}"
@@ -325,7 +324,7 @@ fn run() -> Result<(), String> {
     );
 
     let tokenizer = Qwen3Tokenizer::from_file(dir.join("tokenizer.json"))?;
-    let mut model = cfg.init_causal_lm::<B>(&device);
+    let mut model = cfg.init_causal_lm(&device);
 
     println!("loading sharded BF16 weights from {dir:?} ...");
     let load_start = Instant::now();

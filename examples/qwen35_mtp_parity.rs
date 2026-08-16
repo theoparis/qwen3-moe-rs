@@ -8,7 +8,7 @@
 use std::{path::PathBuf, time::Instant};
 
 use burn::{
-    backend::cuda::{Cuda, CudaDevice},
+    prelude::Device,
     tensor::{DType, Int, Tensor},
 };
 use qwen3_burn::{Precision, Qwen3_5LayerType, Qwen3_5MoeConfig, Qwen3Tokenizer};
@@ -30,22 +30,22 @@ fn env_usize(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-fn positions(start: usize, len: usize, device: &CudaDevice) -> Tensor<B, 2, Int> {
+fn positions(start: usize, len: usize, device: &CudaDevice) -> Tensor<2, Int> {
     if len == 1 {
-        Tensor::<B, 2, Int>::from_data([[start as i64]], device)
+        Tensor::<2, Int>::from_data([[start as i64]], device)
     } else {
-        Tensor::<B, 1, Int>::arange(start as i64..(start + len) as i64, device).unsqueeze()
+        Tensor::<1, Int>::arange(start as i64..(start + len) as i64, device).unsqueeze()
     }
 }
 
-fn last_hidden(hidden: &Tensor<B, 3>) -> Tensor<B, 3> {
+fn last_hidden(hidden: &Tensor<3>) -> Tensor<3> {
     let [batch, seq, hidden_size] = hidden.dims();
     hidden
         .clone()
         .slice([0..batch, (seq - 1)..seq, 0..hidden_size])
 }
 
-fn assert_logits3_all_finite(logits: &Tensor<B, 3>, what: &str) -> Result<(), String> {
+fn assert_logits3_all_finite(logits: &Tensor<3>, what: &str) -> Result<(), String> {
     let [batch, seq, vocab] = logits.dims();
     let values = logits
         .clone()
@@ -65,10 +65,10 @@ fn assert_logits3_all_finite(logits: &Tensor<B, 3>, what: &str) -> Result<(), St
     Ok(())
 }
 
-fn argmax_last(logits: &Tensor<B, 3>) -> Result<i64, String> {
+fn argmax_last(logits: &Tensor<3>) -> Result<i64, String> {
     assert_logits3_all_finite(logits, "target")?;
     let [batch, seq, vocab] = logits.dims();
-    let next: Tensor<B, 2, Int> = logits
+    let next: Tensor<2, Int> = logits
         .clone()
         .slice([0..batch, (seq - 1)..seq, 0..vocab])
         .reshape([batch, vocab])
@@ -83,7 +83,7 @@ fn argmax_last(logits: &Tensor<B, 3>) -> Result<i64, String> {
         .ok_or_else(|| "target argmax returned no token".to_string())
 }
 
-fn argmax_and_margin(logits: &Tensor<B, 2>) -> Result<(i64, f32), String> {
+fn argmax_and_margin(logits: &Tensor<2>) -> Result<(i64, f32), String> {
     let [batch, vocab] = logits.dims();
     if batch != 1 {
         return Err(format!("MTP parity expects batch 1, got {batch}"));
@@ -135,7 +135,7 @@ fn run() -> Result<(), String> {
         ));
     }
 
-    let device = CudaDevice::default();
+    let device = Device::cuda(0);
     println!(
         "MTP parity config: device={device:?} dir={dir:?} prompt={prompt:?} max_new_tokens={max_new_tokens} quant=bf16"
     );
@@ -163,7 +163,7 @@ fn run() -> Result<(), String> {
     );
 
     let tokenizer = Qwen3Tokenizer::from_file(dir.join("tokenizer.json"))?;
-    let mut model = cfg.init_causal_lm::<B>(&device);
+    let mut model = cfg.init_causal_lm(&device);
 
     println!("loading sharded BF16 weights from {dir:?} ...");
     let load_start = Instant::now();
@@ -193,7 +193,7 @@ fn run() -> Result<(), String> {
     let mut target_cache = model.model.new_cache_with_capacity(capacity);
     let mut mtp_cache = model.mtp_new_cache(capacity);
 
-    let input = Tensor::<B, 1, Int>::from_data(prompt_ids.as_slice(), &device).unsqueeze();
+    let input = Tensor::<1, Int>::from_data(prompt_ids.as_slice(), &device).unsqueeze();
     let pos0 = positions(0, prompt_len, &device);
     let (hidden, mut logits) =
         model.forward_hidden_prec(input, pos0, &mut target_cache, Precision::Bf16);
@@ -225,7 +225,7 @@ fn run() -> Result<(), String> {
         generated.push(target_tok);
         new_ids.push(target_tok);
 
-        let tok_next = Tensor::<B, 2, Int>::from_data([[target_tok]], &device);
+        let tok_next = Tensor::<2, Int>::from_data([[target_tok]], &device);
         let draft_pos = positions(current_pos, 1, &device);
         let (draft_logits, _mtp_hidden_out) = model.mtp.forward_draft(
             tok_next,
@@ -240,7 +240,7 @@ fn run() -> Result<(), String> {
         pending = Some((current_pos + 2, draft_tok, margin));
 
         if step + 1 < max_new_tokens {
-            let tok = Tensor::<B, 2, Int>::from_data([[target_tok]], &device);
+            let tok = Tensor::<2, Int>::from_data([[target_tok]], &device);
             let pos = positions(committed_pos, 1, &device);
             let (hidden, next_logits) =
                 model.forward_hidden_prec(tok, pos, &mut target_cache, Precision::Bf16);

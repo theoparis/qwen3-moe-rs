@@ -5,9 +5,9 @@
 //!   ./target/release/examples/qwen35_moe_check
 
 use burn::{
-    backend::cuda::{Cuda, CudaDevice},
     module::{Ignored, Param, ParamId},
     nn::Linear,
+    prelude::Device,
     tensor::{Tensor, TensorData},
 };
 use qwen3_burn::{
@@ -62,11 +62,11 @@ fn tensor_data(seed: u64, len: usize, scale: f32) -> Vec<f32> {
     out
 }
 
-fn linear_from(device: &CudaDevice, seed: u64, din: usize, dout: usize, scale: f32) -> Linear<B> {
+fn linear_from(device: &CudaDevice, seed: u64, din: usize, dout: usize, scale: f32) -> Linear {
     Linear {
         weight: Param::initialized(
             ParamId::new(),
-            Tensor::<B, 2>::from_data(
+            Tensor::<2>::from_data(
                 TensorData::new(tensor_data(seed, din * dout, scale), [din, dout]),
                 device,
             ),
@@ -75,7 +75,7 @@ fn linear_from(device: &CudaDevice, seed: u64, din: usize, dout: usize, scale: f
     }
 }
 
-fn block(device: &CudaDevice) -> Qwen3_5SharedMoeBlock<B> {
+fn block(device: &CudaDevice) -> Qwen3_5SharedMoeBlock {
     let gate_up = tensor_data(SEED_GATE_UP, E * 2 * I * H, EXPERT_SCALE);
     let down = tensor_data(SEED_DOWN, E * H * I, EXPERT_SCALE);
     Qwen3_5SharedMoeBlock {
@@ -83,11 +83,11 @@ fn block(device: &CudaDevice) -> Qwen3_5SharedMoeBlock<B> {
         experts: Qwen3_5FusedExperts {
             gate_up_proj: Param::initialized(
                 ParamId::new(),
-                Tensor::<B, 3>::from_data(TensorData::new(gate_up, [E, 2 * I, H]), device),
+                Tensor::<3>::from_data(TensorData::new(gate_up, [E, 2 * I, H]), device),
             ),
             down_proj: Param::initialized(
                 ParamId::new(),
-                Tensor::<B, 3>::from_data(TensorData::new(down, [E, H, I]), device),
+                Tensor::<3>::from_data(TensorData::new(down, [E, H, I]), device),
             ),
             fp8: ExpertQuantSidecar(None),
             nvfp4: ExpertNvfp4Sidecar(None),
@@ -101,8 +101,8 @@ fn block(device: &CudaDevice) -> Qwen3_5SharedMoeBlock<B> {
             down_proj_fp8: QuantSidecar(None),
         },
         shared_expert_gate: linear_from(device, SEED_SHARED_GATE_OUT, H, 1, SHARED_GATE_SCALE),
-        num_experts_per_tok: Ignored(K),
-        norm_topk_prob: Ignored(true),
+        num_experts_per_tok: (K),
+        norm_topk_prob: (true),
     }
 }
 
@@ -260,10 +260,10 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn main() {
-    let device = CudaDevice::default();
+    let device = Device::cuda(0);
     let input = tensor_data(SEED_INPUT, BATCH * SEQ * H, INPUT_SCALE);
     let moe = block(&device);
-    let x = Tensor::<B, 3>::from_data(TensorData::new(input.clone(), [BATCH, SEQ, H]), &device);
+    let x = Tensor::<3>::from_data(TensorData::new(input.clone(), [BATCH, SEQ, H]), &device);
 
     let burn_out = moe
         .forward(x, Precision::F32)

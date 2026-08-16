@@ -27,9 +27,9 @@
 
 use std::path::PathBuf;
 
-use burn::backend::cuda::{Cuda, CudaDevice};
-use burn::tensor::backend::Backend;
-use burn::tensor::{DType, Int, Tensor};
+use burn::prelude::Device;
+
+use burn::tensor::{DType, Device, Int, Tensor};
 use qwen3_burn::capture::{
     CaptureBackend, CapturedDecoder, DecodeState, scatter_emit_to_tok, write_last_in_place,
 };
@@ -110,7 +110,7 @@ fn softmax_temp(row: &[f32], temp: f32) -> Vec<f32> {
 // Llm — load the model ONCE, then `generate` per prompt (vLLM's `LLM`).
 // ============================================================================================
 struct Llm {
-    model: Qwen3MoeForCausalLM<B>,
+    model: Qwen3MoeForCausalLM,
     tokenizer: Qwen3Tokenizer,
     device: CudaDevice,
     vocab: usize,
@@ -120,7 +120,7 @@ struct Llm {
 impl Llm {
     /// Load config + tokenizer + sharded bf16 weights ONCE (the expensive step vLLM amortizes).
     fn from_dir(dir: &PathBuf) -> Result<Self, String> {
-        let device = CudaDevice::default();
+        let device = Device::cuda(0);
         let cfg = config_from_hf(dir)?;
         println!(
             "config: {} layers, hidden {}, {} experts top-{}, moe_inter {}, head_dim {}, vocab {}",
@@ -133,7 +133,7 @@ impl Llm {
             cfg.vocab_size
         );
         let tokenizer = Qwen3Tokenizer::from_file(dir.join("tokenizer.json"))?;
-        let mut model = cfg.init_causal_lm::<B>(&device);
+        let mut model = cfg.init_causal_lm(&device);
         println!("loading sharded weights from {dir:?} ...");
         let t0 = std::time::Instant::now();
         model
@@ -156,7 +156,7 @@ impl Llm {
     /// Sample one next-token id from the last-token logits `[1, vocab]`.
     /// Greedy (`temperature <= 0`) stays on-device (argmax → read 1 int). Otherwise pull the row to
     /// host, softmax at temperature, and draw via top-k/top-p inverse-CDF.
-    fn sample_token(&self, last: &Tensor<B, 2>, p: &SamplingParams, rng: &mut Rng) -> i64 {
+    fn sample_token(&self, last: &Tensor<2>, p: &SamplingParams, rng: &mut Rng) -> i64 {
         if p.temperature <= 0.0 {
             last.clone()
                 .argmax(1)
@@ -197,8 +197,8 @@ impl Llm {
         let (ids_u32, _) = self.tokenizer.encode_no_pad(prompt)?;
         let prompt_ids: Vec<i64> = ids_u32.iter().map(|&x| x as i64).collect();
         let lp = prompt_ids.len();
-        let input: Tensor<B, 2, Int> =
-            Tensor::<B, 1, Int>::from_data(prompt_ids.as_slice(), device).unsqueeze();
+        let input: Tensor<2, Int> =
+            Tensor::<1, Int>::from_data(prompt_ids.as_slice(), device).unsqueeze();
 
         // ---- build the FUSED static-decode path (lever c) + a STATIC KV cache sized to the run ----
         let total = lp + p.max_tokens;
@@ -206,7 +206,7 @@ impl Llm {
         let mut cache = self.model.model.new_cache_with_capacity(total);
 
         // ---- PREFILL (eager, the whole prompt) → last-token logits [1, v] ----
-        let pos0 = Tensor::<B, 1, Int>::arange(0..lp as i64, device).unsqueeze_dim::<2>(0); // [1, lp]
+        let pos0 = Tensor::<1, Int>::arange(0..lp as i64, device).unsqueeze_dim::<2>(0); // [1, lp]
         let t_prefill = std::time::Instant::now();
         let logits = self
             .model
@@ -228,9 +228,9 @@ impl Llm {
                 break; // last token wanted — no need to forward once more
             }
             // feed `id` at device `pos` through the FUSED static decode → logits for the next token.
-            let emit: Tensor<B, 2, Int> =
-                Tensor::<B, 1, Int>::from_data([id].as_slice(), device).reshape([1, 1]);
-            let pos = Tensor::<B, 1, Int>::full([1], pos_val, device);
+            let emit: Tensor<2, Int> =
+                Tensor::<1, Int>::from_data([id].as_slice(), device).reshape([1, 1]);
+            let pos = Tensor::<1, Int>::full([1], pos_val, device);
             let lg = self
                 .model
                 .forward_with_cache_static_pre(emit, pos, &mut cache, &sd); // [1,1,v]
@@ -342,9 +342,12 @@ impl CapturedLlm {
             let pos0 = Tensor::<CapB, 1, Int>::arange(0..lp as i64, device)
                 .unsqueeze_dim::<2>(0)
                 .repeat(&[batch, 1]);
-            let logits =
-                self.model
-                    .forward_with_cache(state.input_ids.clone(), None, pos0, &mut state.cache);
+            let logits = self.model.forward_with_cache(
+                state.input_ids.clone(),
+                None,
+                pos0,
+                &mut state.cache,
+            );
             // The real model's lm_head emits bf16 logits, while DecodeState::last is f32. Widen before
             // slice_assign or captured argmax can read corrupted f32 storage.
             let prefill_last = logits
@@ -544,7 +547,7 @@ fn run() -> Result<(), String> {
         let device: <CapB as Backend>::Device = Default::default();
         println!("device: {device:?} | RAW CaptureBackend (below Fusion)");
     } else {
-        println!("device: {:?}", CudaDevice::default());
+        println!("device: {:?}", Device::cuda(0));
     }
     let mode = if params.temperature <= 0.0 {
         "GREEDY (argmax)".to_string()
@@ -557,11 +560,7 @@ fn run() -> Result<(), String> {
     println!(
         "sampling: {mode} | max_tokens={} | seed={seed} | decode={}FUSED static (lever c)\n",
         params.max_tokens,
-        if use_capture {
-            "CAPTURED "
-        } else {
-            ""
-        }
+        if use_capture { "CAPTURED " } else { "" }
     );
 
     // ---- load ONCE, then generate for every prompt ----

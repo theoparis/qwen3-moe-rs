@@ -2,7 +2,6 @@
 //!
 //! See `docs/GRPO_PLAN.md` §2. Verified against `tests/ref/grpo_expected.json`.
 
-use burn::prelude::Backend;
 use burn::tensor::{ElementConversion, Tensor};
 
 use super::{AdvantageEstimator, GrpoConfig, Reduction};
@@ -25,12 +24,7 @@ pub struct GrpoMetrics {
 ///
 /// `group_norm`: `A_i = (r_i − mean_G) / (std_G + eps)`, std = sample std (ddof = 1) within the
 /// prompt's `G` responses. `dr_grpo`: `A_i = r_i − mean_G`. Returns `[P*G]`. No global whitening.
-pub fn group_norm_advantage<B: Backend>(
-    rewards: Tensor<B, 1>,
-    p: usize,
-    g: usize,
-    cfg: &GrpoConfig,
-) -> Tensor<B, 1> {
+pub fn group_norm_advantage(rewards: Tensor<1>, p: usize, g: usize, cfg: &GrpoConfig) -> Tensor<1> {
     let r = rewards.reshape([p, g]);
     let mean = r.clone().mean_dim(1); // [p, 1]
     let centered = r - mean; // broadcast
@@ -69,14 +63,14 @@ pub fn group_norm_advantage<B: Backend>(
 /// KL     = clamp(exp(−δ) − 1 + δ, −10, 10)                # k3, ≥ 0
 /// loss   = reduce(L_pol) + β · reduce(KL)                 # token-global mean by default
 /// ```
-pub fn grpo_loss<B: Backend>(
-    logp_pi: Tensor<B, 2>,
-    logp_old: Tensor<B, 2>,
-    logp_ref: Tensor<B, 2>,
-    adv_seq: Tensor<B, 1>,
-    mask: Tensor<B, 2>,
+pub fn grpo_loss(
+    logp_pi: Tensor<2>,
+    logp_old: Tensor<2>,
+    logp_ref: Tensor<2>,
+    adv_seq: Tensor<1>,
+    mask: Tensor<2>,
     cfg: &GrpoConfig,
-) -> (Tensor<B, 1>, GrpoMetrics) {
+) -> (Tensor<1>, GrpoMetrics) {
     let [n, _t] = logp_pi.dims();
     let adv = adv_seq.reshape([n, 1]); // [N,1], broadcasts over T
 
@@ -116,16 +110,25 @@ pub fn grpo_loss<B: Backend>(
     let loss = pol_loss_t.clone() + kl_loss_t.clone().mul_scalar(cfg.beta);
 
     // detached metrics
-    let denom_s: f32 = mask.clone().sum().into_scalar().elem::<f32>().max(1.0);
-    let mean_ratio = (ratio * mask.clone()).sum().into_scalar().elem::<f32>() / denom_s;
+    let denom_s: f32 = mask
+        .clone()
+        .sum()
+        .into_scalar::<f32>()
+        .elem::<f32>()
+        .max(1.0);
+    let mean_ratio = (ratio * mask.clone())
+        .sum()
+        .into_scalar::<f32>()
+        .elem::<f32>()
+        / denom_s;
     // clip_frac: fraction of (masked) tokens where the clipped branch was active (surr2 < surr1)
     let clipped = surr2.lower(surr1).float() * mask; // [N,T]
-    let clip_frac = clipped.sum().into_scalar().elem::<f32>() / denom_s;
+    let clip_frac = clipped.sum().into_scalar::<f32>().elem::<f32>() / denom_s;
 
     let metrics = GrpoMetrics {
-        pol_loss: pol_loss_t.into_scalar().elem(),
-        kl_loss: kl_loss_t.into_scalar().elem(),
-        total_loss: loss.clone().into_scalar().elem(),
+        pol_loss: pol_loss_t.into_scalar::<f32>().elem(),
+        kl_loss: kl_loss_t.into_scalar::<f32>().elem(),
+        total_loss: loss.clone().into_scalar::<f32>().elem(),
         mean_ratio,
         clip_frac,
     };

@@ -22,8 +22,8 @@
 
 use std::panic::{self, AssertUnwindSafe};
 
-use burn::backend::cuda::{Cuda, CudaDevice};
-use burn::tensor::{DType, Int, Tensor, TensorPrimitive};
+use burn::prelude::Device;
+use burn::tensor::{DType, Device, Int, Tensor, TensorPrimitive};
 
 use cubecl::cuda::CudaRuntime;
 use cubecl::{CubeCount, CubeDim};
@@ -78,7 +78,13 @@ fn alloc_like_f32(like: &CubeTensor<CudaRuntime>, shape: [usize; 2]) -> CubeTens
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(a.len(), b.len(), "length mismatch: {} vs {}", a.len(), b.len());
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "length mismatch: {} vs {}",
+        a.len(),
+        b.len()
+    );
     a.iter()
         .zip(b.iter())
         .map(|(x, y)| (x - y).abs())
@@ -95,8 +101,8 @@ fn case_outer_product(device: &CudaDevice) -> bool {
     let b_vals: [f32; 4] = [10.0, 20.0, 30.0, 40.0];
     let c: f32 = 0.5;
 
-    let a = Tensor::<Cuda, 1>::from_floats(a_vals, device);
-    let b = Tensor::<Cuda, 1>::from_floats(b_vals, device);
+    let a = Tensor::<1>::from_floats(a_vals, device);
+    let b = Tensor::<1>::from_floats(b_vals, device);
 
     // Reference: broadcast [M,1] * [1,N] + c via pure Burn ops.
     let reference = (a.clone().reshape([m, 1]) * b.clone().reshape([1, n]) + c)
@@ -123,7 +129,11 @@ fn case_outer_product(device: &CudaDevice) -> bool {
             gpu_kernels::outer_product::launch::<CudaRuntime>(
                 &a.client,
                 CubeCount::Static(blocks, 1, 1),
-                CubeDim { x: threads, y: 1, z: 1 },
+                CubeDim {
+                    x: threads,
+                    y: 1,
+                    z: 1,
+                },
                 a.as_tensor_arg(1),
                 b.as_tensor_arg(1),
                 out.as_tensor_arg(1),
@@ -134,7 +144,7 @@ fn case_outer_product(device: &CudaDevice) -> bool {
         });
 
     let out_fusion = outputs.into_iter().next().expect("one output");
-    let got = Tensor::<Cuda, 2>::from_primitive(TensorPrimitive::Float(out_fusion))
+    let got = Tensor::<2>::from_primitive(TensorPrimitive::Float(out_fusion))
         .into_data()
         .to_vec::<f32>()
         .unwrap();
@@ -154,8 +164,8 @@ fn case_dequant_scale(device: &CudaDevice) -> bool {
     let q_vals: [i32; 5] = [2, -3, 4, 0, 7];
     let s_vals: [f32; 5] = [0.5, 1.0, 2.0, -1.0, 0.25];
 
-    let q = Tensor::<Cuda, 1, Int>::from_ints(q_vals, device);
-    let s = Tensor::<Cuda, 1>::from_floats(s_vals, device);
+    let q = Tensor::<1, Int>::from_ints(q_vals, device);
+    let s = Tensor::<1>::from_floats(s_vals, device);
 
     // Reference: q.float() * s via pure Burn ops.
     let reference = (q.clone().float() * s.clone())
@@ -181,7 +191,11 @@ fn case_dequant_scale(device: &CudaDevice) -> bool {
             gpu_kernels::dequant_scale::launch::<i32, f32, CudaRuntime>(
                 &s.client,
                 CubeCount::Static(blocks, 1, 1),
-                CubeDim { x: threads, y: 1, z: 1 },
+                CubeDim {
+                    x: threads,
+                    y: 1,
+                    z: 1,
+                },
                 q.as_tensor_arg(1),
                 s.as_tensor_arg(1),
                 out.as_tensor_arg(1),
@@ -191,7 +205,7 @@ fn case_dequant_scale(device: &CudaDevice) -> bool {
         });
 
     let out_fusion = outputs.into_iter().next().expect("one output");
-    let got = Tensor::<Cuda, 2>::from_primitive(TensorPrimitive::Float(out_fusion))
+    let got = Tensor::<2>::from_primitive(TensorPrimitive::Float(out_fusion))
         .into_data()
         .to_vec::<f32>()
         .unwrap();
@@ -209,8 +223,8 @@ fn case_dequant_scale(device: &CudaDevice) -> bool {
 fn case_negative_wrong_output_shape(device: &CudaDevice) -> bool {
     let m = 3usize;
     let n = 4usize;
-    let a = Tensor::<Cuda, 1>::from_floats([1.0f32, 2.0, 3.0], device);
-    let b = Tensor::<Cuda, 1>::from_floats([10.0f32, 20.0, 30.0, 40.0], device);
+    let a = Tensor::<1>::from_floats([1.0f32, 2.0, 3.0], device);
+    let b = Tensor::<1>::from_floats([10.0f32, 20.0, 30.0, 40.0], device);
 
     // Silence the default panic hook so the EXPECTED panic doesn't print a scary backtrace.
     let prev_hook = panic::take_hook();
@@ -235,7 +249,11 @@ fn case_negative_wrong_output_shape(device: &CudaDevice) -> bool {
                 gpu_kernels::outer_product::launch::<CudaRuntime>(
                     &a.client,
                     CubeCount::Static(blocks, 1, 1),
-                    CubeDim { x: threads, y: 1, z: 1 },
+                    CubeDim {
+                        x: threads,
+                        y: 1,
+                        z: 1,
+                    },
                     a.as_tensor_arg(1),
                     b.as_tensor_arg(1),
                     out.as_tensor_arg(1),
@@ -247,7 +265,7 @@ fn case_negative_wrong_output_shape(device: &CudaDevice) -> bool {
 
         // Force the stream to drain → execute() runs → cross-validation should panic here.
         let out_fusion = outputs.into_iter().next().expect("one output");
-        let _ = Tensor::<Cuda, 2>::from_primitive(TensorPrimitive::Float(out_fusion))
+        let _ = Tensor::<2>::from_primitive(TensorPrimitive::Float(out_fusion))
             .into_data()
             .to_vec::<f32>()
             .unwrap();
@@ -285,7 +303,7 @@ fn case_negative_wrong_output_shape(device: &CudaDevice) -> bool {
 }
 
 fn main() {
-    let device = CudaDevice::default();
+    let device = Device::cuda(0);
     println!("device: {device:?} | backend: Cuda = Fusion<CubeBackend<CudaRuntime>>");
     println!("--- typed custom-op wrapper validation (cube_custom_op) ---");
 
@@ -306,8 +324,14 @@ fn main() {
     );
 
     assert!(a_ok, "Case A (outer product) mismatch vs Burn reference");
-    assert!(b_ok, "Case B (int dequant-scale) mismatch vs Burn reference");
-    assert!(c_ok, "Case C (negative path) — wrong declared output shape was not caught (rule 2)");
+    assert!(
+        b_ok,
+        "Case B (int dequant-scale) mismatch vs Burn reference"
+    );
+    assert!(
+        c_ok,
+        "Case C (negative path) — wrong declared output shape was not caught (rule 2)"
+    );
 
     println!(
         "CUSTOM-OP WRAPPER: GO — N-input/different-shaped-output + mixed Float/Int handles validated \

@@ -27,7 +27,7 @@ mod gpu {
 
 fn run(w: f32) -> Vec<f32> {
     let dev = Default::default();
-    let seed = Tensor::<B, 1>::zeros([32], &dev);
+    let seed = Tensor::<1>::zeros([32], &dev);
     let seed_ct = seed.into_primitive().tensor();
     let buffer = seed_ct.client.empty(32 * core::mem::size_of::<f32>());
     let out = CubeTensor::new_contiguous(
@@ -45,7 +45,10 @@ fn run(w: f32) -> Vec<f32> {
         cubecl::prelude::ScalarArg::new(w),
     )
     .expect("plane_sum_probe launch failed");
-    Tensor::<B, 1>::from_primitive(TensorPrimitive::Float(out)).into_data().to_vec::<f32>().unwrap()
+    Tensor::<1>::from_primitive(TensorPrimitive::Float(out))
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap()
 }
 
 fn main() {
@@ -53,19 +56,31 @@ fn main() {
     let r1 = run(1.0);
     let expect1 = 496.0f32; // 0+1+..+31
     let all_ok1 = r1.iter().all(|&x| (x - expect1).abs() < 1e-3);
-    println!("  plane_sum(lane*1.0): out[0]={} out[31]={} (expect {expect1} on all lanes) -> {}",
-        r1[0], r1[31], if all_ok1 { "PASS" } else { "FAIL" });
+    println!(
+        "  plane_sum(lane*1.0): out[0]={} out[31]={} (expect {expect1} on all lanes) -> {}",
+        r1[0],
+        r1[31],
+        if all_ok1 { "PASS" } else { "FAIL" }
+    );
 
     let r2 = run(1.5);
     let expect2 = 744.0f32; // 1.5 * 496
     let all_ok2 = r2.iter().all(|&x| (x - expect2).abs() < 1e-2);
-    println!("  plane_sum(lane*1.5): out[0]={} out[17]={} (expect {expect2} on all lanes) -> {}",
-        r2[0], r2[17], if all_ok2 { "PASS" } else { "FAIL" });
+    println!(
+        "  plane_sum(lane*1.5): out[0]={} out[17]={} (expect {expect2} on all lanes) -> {}",
+        r2[0],
+        r2[17],
+        if all_ok2 { "PASS" } else { "FAIL" }
+    );
 
     if all_ok1 && all_ok2 {
-        println!("PLANE_SUM WORKS on sm_121 — the split-K QK-dot reduction primitive is validated.");
+        println!(
+            "PLANE_SUM WORKS on sm_121 — the split-K QK-dot reduction primitive is validated."
+        );
     } else {
-        println!("PLANE_SUM BROKEN/mis-lowered — use the plane_shuffle_xor butterfly fallback (offsets 1,2,4,8,16).");
+        println!(
+            "PLANE_SUM BROKEN/mis-lowered — use the plane_shuffle_xor butterfly fallback (offsets 1,2,4,8,16)."
+        );
         std::process::exit(1);
     }
 }

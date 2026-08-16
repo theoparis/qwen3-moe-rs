@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use qwen3_burn::serve::engine::{self, EngineConfig, Quant, WhichModel};
-use qwen3_burn::serve::handlers::{build_router, load_sampling_defaults, ServeState, ServedModel};
+use qwen3_burn::serve::handlers::{ServeState, ServedModel, build_router, load_sampling_defaults};
 use qwen3_burn::serve::template::ChatTemplate;
 use tokenizers::Tokenizer;
 
@@ -46,25 +46,24 @@ async fn main() {
         .parse()
         .unwrap_or_else(|e| die(format!("invalid PORT: {e}")));
 
-    let (which, served, default_dir_bf16, default_dir_nvfp4) = match env_or("MODEL", "qwen3.6-35b")
-        .as_str()
-    {
-        "qwen3-30b" => (
-            WhichModel::Qwen3Moe30b,
-            ServedModel::Qwen30b,
-            "models/qwen3-30b-a3b-instruct-2507",
-            "models/qwen3-30b-a3b-instruct-2507",
-        ),
-        "qwen3.6-35b" => (
-            WhichModel::Qwen35Moe,
-            ServedModel::Qwen35b,
-            "models/qwen3.6-35b-a3b",
-            "models/qwen3.6-35b-a3b-nvfp4",
-        ),
-        other => die(format!(
-            "unknown MODEL '{other}' (expected 'qwen3-30b' or 'qwen3.6-35b')"
-        )),
-    };
+    let (which, served, default_dir_bf16, default_dir_nvfp4) =
+        match env_or("MODEL", "qwen3.6-35b").as_str() {
+            "qwen3-30b" => (
+                WhichModel::Qwen3Moe30b,
+                ServedModel::Qwen30b,
+                "models/qwen3-30b-a3b-instruct-2507",
+                "models/qwen3-30b-a3b-instruct-2507",
+            ),
+            "qwen3.6-35b" => (
+                WhichModel::Qwen35Moe,
+                ServedModel::Qwen35b,
+                "models/qwen3.6-35b-a3b",
+                "models/qwen3.6-35b-a3b-nvfp4",
+            ),
+            other => die(format!(
+                "unknown MODEL '{other}' (expected 'qwen3-30b' or 'qwen3.6-35b')"
+            )),
+        };
 
     let quant = match env_or("QUANT", "bf16").as_str() {
         "bf16" => Quant::Bf16,
@@ -133,7 +132,10 @@ async fn main() {
     eprintln!("  model dir   : {}", model_dir.display());
     eprintln!("  t_max       : {t_max}");
     eprintln!("  queue depth : {queue_depth}");
-    eprintln!("  sampling def: temp {} / top_p {} / top_k {}", defaults.temperature, defaults.top_p, defaults.top_k);
+    eprintln!(
+        "  sampling def: temp {} / top_p {} / top_k {}",
+        defaults.temperature, defaults.top_p, defaults.top_k
+    );
     eprintln!("  decode path : eager-static (CUDA-graph capture = first follow-up milestone)");
     eprintln!("  {}", handle.report());
 

@@ -6,13 +6,15 @@
 
 use std::path::PathBuf;
 
-use burn::backend::cuda::{Cuda, CudaDevice};
+use burn::prelude::Device;
 use qwen3_burn::{Qwen3_5MoeConfig, Qwen3_5MoeForCausalLM};
 
 type B = Cuda;
 
 fn arg<'a>(args: &'a [String], flag: &str) -> Option<&'a String> {
-    args.iter().position(|x| x == flag).and_then(|i| args.get(i + 1))
+    args.iter()
+        .position(|x| x == flag)
+        .and_then(|i| args.get(i + 1))
 }
 
 fn has_flag(args: &[String], flag: &str) -> bool {
@@ -65,8 +67,8 @@ fn run() -> Result<(), String> {
         cfg.mrope_section
     );
 
-    let device = CudaDevice::default();
-    let mut model = cfg.init_causal_lm::<B>(&device);
+    let device = Device::cuda(0);
+    let mut model = cfg.init_causal_lm(&device);
     println!(
         "module tree: embed_tokens + {} dispatched layers + final norm + untied lm_head + MTP block",
         model.model.layers.len()
@@ -119,7 +121,9 @@ fn run() -> Result<(), String> {
     }
     let params_b = report.param_count as f64 / 1e9;
     if !(35.0..=36.0).contains(&params_b) {
-        return Err(format!("unexpected non-visual parameter count: {params_b:.6}B"));
+        return Err(format!(
+            "unexpected non-visual parameter count: {params_b:.6}B"
+        ));
     }
 
     println!("L1.1 LOAD-VERIFY: PASS");

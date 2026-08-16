@@ -34,18 +34,17 @@
 //!   RUSTFLAGS="-C target-feature=+fp16" \
 //!     cargo run --release --features cuda --example cudagraph_pfinal_bench 2>&1 | tail -40
 
-use burn::tensor::backend::Backend;
-use burn::tensor::{DType, IndexingUpdateOp, Int, Shape, Tensor, TensorPrimitive};
-use burn_cubecl::tensor::CubeTensor;
+use burn::tensor::{DType, Device, IndexingUpdateOp, Int, Shape, Tensor, TensorPrimitive};
 use burn_cubecl::CubeBackend;
+use burn_cubecl::tensor::CubeTensor;
+use cubecl::Runtime;
 use cubecl::cuda::CudaRuntime;
 use cubecl::prelude::*;
-use cubecl::Runtime;
-use cubek_random::{random_uniform_with_seeds, N_SEEDS};
-use qwen3_burn::grpo::{group_sample_cached_device_static, RolloutConfig, Rollouts};
+use cubek_random::{N_SEEDS, random_uniform_with_seeds};
+use qwen3_burn::grpo::{RolloutConfig, Rollouts, group_sample_cached_device_static};
 use qwen3_burn::sampling_device::{device_select_tokens, device_token_logp, logsumexp_dim1};
-use qwen3_burn::{rope_freqs, Qwen3Config, Qwen3ForCausalLM};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use qwen3_burn::{Qwen3Config, Qwen3ForCausalLM, rope_freqs};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use std::time::Instant;
 
 type B = CubeBackend<CudaRuntime, f32, i32, u8>;
@@ -69,18 +68,26 @@ fn block_sync(client: &Client) {
 // footgun, complementing greedy bit-parity. A transient `.clone()` here shares the SAME storage (same
 // VA) and is dropped before the closure runs, so inspection performs no in-place op and never trips
 // the `can_mut` heuristic itself.
-fn float_va<const D: usize>(t: &Tensor<B, D>) -> u64 {
+fn float_va<const D: usize>(t: &Tensor<D>) -> u64 {
     match t.clone().into_primitive() {
-        TensorPrimitive::Float(ct) => ct.client.get_resource(ct.handle.clone().binding()).resource().ptr,
+        TensorPrimitive::Float(ct) => {
+            ct.client
+                .get_resource(ct.handle.clone().binding())
+                .resource()
+                .ptr
+        }
         TensorPrimitive::QFloat(_) => unreachable!("persistent buffers are never quantized"),
     }
 }
-fn int_va<const D: usize>(t: &Tensor<B, D, Int>) -> u64 {
+fn int_va<const D: usize>(t: &Tensor<D, Int>) -> u64 {
     let ct = t.clone().into_primitive();
-    ct.client.get_resource(ct.handle.clone().binding()).resource().ptr
+    ct.client
+        .get_resource(ct.handle.clone().binding())
+        .resource()
+        .ptr
 }
 
-fn build_model(device: &<B as Backend>::Device, vocab: usize, layers: usize) -> Qwen3ForCausalLM<B> {
+fn build_model(device: &Device, vocab: usize, layers: usize) -> Qwen3ForCausalLM {
     Qwen3Config::new()
         .with_vocab_size(vocab)
         .with_hidden_size(1024)
@@ -89,20 +96,23 @@ fn build_model(device: &<B as Backend>::Device, vocab: usize, layers: usize) -> 
         .with_num_attention_heads(16)
         .with_num_key_value_heads(8)
         .with_head_dim(Some(HEAD_DIM))
-        .init_causal_lm::<B>(device)
+        .init_causal_lm(device)
 }
 
 /// CAPTURED greedy decode: assemble C1+C2+C3+P2 into a capture-once / replay-per-token loop.
 /// Returns the rollout buffers (device tensors) plus the captured arena high-water (bytes).
 fn captured_greedy_decode(
-    model: &Qwen3ForCausalLM<B>,
-    prompt_ids: Tensor<B, 2, Int>,
+    model: &Qwen3ForCausalLM,
+    prompt_ids: Tensor<2, Int>,
     cfg: &RolloutConfig,
     eos: &[i64],
     v: usize,
     warmup: usize,
-) -> (Rollouts<B>, u64, f64) {
-    assert_eq!(cfg.temperature, 0.0, "captured_greedy_decode is greedy-only");
+) -> (Rollouts, u64, f64) {
+    assert_eq!(
+        cfg.temperature, 0.0,
+        "captured_greedy_decode is greedy-only"
+    );
     let device = prompt_ids.device();
     let client = CudaRuntime::client(&device);
     let g = cfg.group_size;
@@ -125,25 +135,29 @@ fn captured_greedy_decode(
 
     // ---- hoisted, position-INDEPENDENT constants (precomputed ONCE, outside the captured region) ----
     let freqs = rope_freqs::<B>(HEAD_DIM, THETA, &device); // [head_dim/2]
-    let arange_tmax = Tensor::<B, 1, Int>::arange(0..total as i64, &device); // [T_max]
+    let arange_tmax = Tensor::<1, Int>::arange(0..total as i64, &device); // [T_max]
 
-    let prompt_rep = prompt_ids.unsqueeze_dim::<3>(1).repeat(&[1, g, 1]).reshape([n, lp]);
+    let prompt_rep = prompt_ids
+        .unsqueeze_dim::<3>(1)
+        .repeat(&[1, g, 1])
+        .reshape([n, lp]);
     let mut cache = model.new_cache_with_capacity(total);
 
     // ---- PERSISTENT buffers (allocated ONCE; their device addresses are baked into the graph) ----
     let mut tok_buf = Some(
-        Tensor::<B, 2, Int>::zeros([n, total], &device).slice_assign([0..n, 0..lp], prompt_rep.clone()),
+        Tensor::<2, Int>::zeros([n, total], &device)
+            .slice_assign([0..n, 0..lp], prompt_rep.clone()),
     );
-    let mut logp_buf = Some(Tensor::<B, 2>::zeros([n, max_new], &device));
-    let mut mask_buf = Some(Tensor::<B, 2>::zeros([n, max_new], &device));
-    let mut pos = Some(Tensor::<B, 1, Int>::full([1], lp as i64, &device)); // device counter, starts at lp
-    let mut finished = Some(Tensor::<B, 2, Int>::zeros([n, 1], &device)); // 0/1 (Int -> resets in place)
-    let pad = Tensor::<B, 2, Int>::full([n, 1], eos0, &device); // constant
-    let mut last_buf = Some(Tensor::<B, 2>::zeros([n, v], &device)); // persistent logits
+    let mut logp_buf = Some(Tensor::<2>::zeros([n, max_new], &device));
+    let mut mask_buf = Some(Tensor::<2>::zeros([n, max_new], &device));
+    let mut pos = Some(Tensor::<1, Int>::full([1], lp as i64, &device)); // device counter, starts at lp
+    let mut finished = Some(Tensor::<2, Int>::zeros([n, 1], &device)); // 0/1 (Int -> resets in place)
+    let pad = Tensor::<2, Int>::full([n, 1], eos0, &device); // constant
+    let mut last_buf = Some(Tensor::<2>::zeros([n, v], &device)); // persistent logits
 
     // ---- prefill (eager, variable-shape — NOT captured): KV cols 0..lp + initial logits -> last_buf ----
-    let prefill = |cache: &mut _, last_buf: &mut Option<Tensor<B, 2>>| {
-        let pos0 = Tensor::<B, 1, Int>::arange(0..lp as i64, &device)
+    let prefill = |cache: &mut _, last_buf: &mut Option<Tensor<2>>| {
+        let pos0 = Tensor::<1, Int>::arange(0..lp as i64, &device)
             .unsqueeze_dim::<2>(0)
             .repeat(&[n, 1]);
         let logits = model.forward_with_cache(prompt_rep.clone(), None, pos0, cache); // [n, lp, v]
@@ -196,15 +210,36 @@ fn captured_greedy_decode(
         // device-`pos` scatters into the fixed buffers (Add over zero == assign; one write per column).
         let pos_idx = pos.as_ref().unwrap().clone();
         let rel = pos.as_ref().unwrap().clone().sub_scalar(lp as i64); // [1] = t
-        tok_buf = Some(tok_buf.take().unwrap().select_assign(1, pos_idx, emit.clone(), IndexingUpdateOp::Add));
-        logp_buf = Some(logp_buf.take().unwrap().select_assign(1, rel.clone(), logp, IndexingUpdateOp::Add));
-        mask_buf = Some(mask_buf.take().unwrap().select_assign(1, rel, active, IndexingUpdateOp::Add));
+        tok_buf = Some(tok_buf.take().unwrap().select_assign(
+            1,
+            pos_idx,
+            emit.clone(),
+            IndexingUpdateOp::Add,
+        ));
+        logp_buf = Some(logp_buf.take().unwrap().select_assign(
+            1,
+            rel.clone(),
+            logp,
+            IndexingUpdateOp::Add,
+        ));
+        mask_buf = Some(mask_buf.take().unwrap().select_assign(
+            1,
+            rel,
+            active,
+            IndexingUpdateOp::Add,
+        ));
 
         // update finished (Int OR, clamped to {0,1}) — in place at storage F.
         finished = Some(fin.add(is_eos.int()).clamp(0i64, 1i64));
 
         // decode the NEXT logits from `emit` at device `pos`; write into last_buf IN PLACE (storage L).
-        let lg = model.forward_with_cache_static_pre(emit, pos.as_ref().unwrap().clone(), &mut cache, &freqs, &arange_tmax);
+        let lg = model.forward_with_cache_static_pre(
+            emit,
+            pos.as_ref().unwrap().clone(),
+            &mut cache,
+            &freqs,
+            &arange_tmax,
+        );
         let new_last = lg.slice([0..n, 0..1, 0..v]).reshape([n, v]);
         last_buf = Some(last.slice_assign([0..n, 0..v], new_last)); // `last` unique -> in place at L
 
@@ -243,7 +278,12 @@ fn captured_greedy_decode(
     cache.reset_for_replay(); // zero KV in place, filled = 0
     prefill(&mut cache, &mut last_buf); // re-write KV cols 0..lp + restore last_buf (in place)
     tok_buf = Some(tok_buf.take().unwrap().mul_scalar(0));
-    tok_buf = Some(tok_buf.take().unwrap().slice_assign([0..n, 0..lp], prompt_rep.clone()));
+    tok_buf = Some(
+        tok_buf
+            .take()
+            .unwrap()
+            .slice_assign([0..n, 0..lp], prompt_rep.clone()),
+    );
     logp_buf = Some(logp_buf.take().unwrap().mul_scalar(0.0));
     mask_buf = Some(mask_buf.take().unwrap().mul_scalar(0.0));
     finished = Some(finished.take().unwrap().mul_scalar(0));
@@ -289,20 +329,28 @@ fn draw_seeds(rng: &mut StdRng) -> [u32; N_SEEDS] {
 /// filled handle back into a Burn tensor for the gumbel/argmax (all metadata-interned, so capturable).
 fn seeded_gumbel_select(
     client: &Client,
-    device: &<B as Backend>::Device,
-    logits: &Tensor<B, 2>,
+    device: &Device,
+    logits: &Tensor<2>,
     temp: f32,
     u_handle: &Handle,
     seed_handle: &Handle,
     n: usize,
     v: usize,
-) -> Tensor<B, 2, Int> {
+) -> Tensor<2, Int> {
     // u ~ Uniform[0,1) into the persistent u_handle (captured kernel; reads seed_handle's stable VA).
     let shape = [n * v];
     let strides = [1usize];
-    let out_ref = unsafe { TensorHandleRef::<CudaRuntime>::from_raw_parts(u_handle, &strides, &shape, 4) };
-    random_uniform_with_seeds::<CudaRuntime>(client, 0.0, 1.0, out_ref, f32::cube_type(), seed_handle)
-        .expect("random_uniform_with_seeds launch failed");
+    let out_ref =
+        unsafe { TensorHandleRef::<CudaRuntime>::from_raw_parts(u_handle, &strides, &shape, 4) };
+    random_uniform_with_seeds::<CudaRuntime>(
+        client,
+        0.0,
+        1.0,
+        out_ref,
+        f32::cube_type(),
+        seed_handle,
+    )
+    .expect("random_uniform_with_seeds launch failed");
     // bridge the filled handle into a Burn [n,v] f32 tensor (stable VA; refcount bump is fine).
     let ct = CubeTensor::<CudaRuntime>::new_contiguous(
         client.clone(),
@@ -311,7 +359,7 @@ fn seeded_gumbel_select(
         u_handle.clone(),
         DType::F32,
     );
-    let u = Tensor::<B, 2>::from_primitive(TensorPrimitive::Float(ct)).clamp(1e-9, 1.0 - 1e-7);
+    let u = Tensor::<2>::from_primitive(TensorPrimitive::Float(ct)).clamp(1e-9, 1.0 - 1e-7);
     let gumbel = u.log().neg().log().neg(); // g = -ln(-ln u)
     (logits.clone() / temp + gumbel).argmax(1) // [n,1] categorical sample from softmax(logits/temp)
 }
@@ -325,16 +373,19 @@ fn seeded_gumbel_select(
 ///     modes draw the same noise on a bit-identical forward, so captured == eager token-for-token IFF
 ///     the captured autoregressive chain is correct. `seed_base` seeds the per-step seed STREAM.
 fn temperature_decode(
-    model: &Qwen3ForCausalLM<B>,
-    prompt_ids: Tensor<B, 2, Int>,
+    model: &Qwen3ForCausalLM,
+    prompt_ids: Tensor<2, Int>,
     cfg: &RolloutConfig,
     eos: &[i64],
     v: usize,
     warmup: usize,
     seed_base: u64,
     captured: bool,
-) -> Rollouts<B> {
-    assert!(cfg.temperature > 0.0, "temperature_decode needs temperature > 0");
+) -> Rollouts {
+    assert!(
+        cfg.temperature > 0.0,
+        "temperature_decode needs temperature > 0"
+    );
     let device = prompt_ids.device();
     let client = CudaRuntime::client(&device);
     let g = cfg.group_size;
@@ -355,17 +406,23 @@ fn temperature_decode(
     }
 
     let freqs = rope_freqs::<B>(HEAD_DIM, THETA, &device);
-    let arange_tmax = Tensor::<B, 1, Int>::arange(0..total as i64, &device);
-    let prompt_rep = prompt_ids.unsqueeze_dim::<3>(1).repeat(&[1, g, 1]).reshape([n, lp]);
+    let arange_tmax = Tensor::<1, Int>::arange(0..total as i64, &device);
+    let prompt_rep = prompt_ids
+        .unsqueeze_dim::<3>(1)
+        .repeat(&[1, g, 1])
+        .reshape([n, lp]);
     let mut cache = model.new_cache_with_capacity(total);
 
-    let mut tok_buf = Some(Tensor::<B, 2, Int>::zeros([n, total], &device).slice_assign([0..n, 0..lp], prompt_rep.clone()));
-    let mut logp_buf = Some(Tensor::<B, 2>::zeros([n, max_new], &device));
-    let mut mask_buf = Some(Tensor::<B, 2>::zeros([n, max_new], &device));
-    let mut pos = Some(Tensor::<B, 1, Int>::full([1], lp as i64, &device));
-    let mut finished = Some(Tensor::<B, 2, Int>::zeros([n, 1], &device));
-    let pad = Tensor::<B, 2, Int>::full([n, 1], eos0, &device);
-    let mut last_buf = Some(Tensor::<B, 2>::zeros([n, v], &device));
+    let mut tok_buf = Some(
+        Tensor::<2, Int>::zeros([n, total], &device)
+            .slice_assign([0..n, 0..lp], prompt_rep.clone()),
+    );
+    let mut logp_buf = Some(Tensor::<2>::zeros([n, max_new], &device));
+    let mut mask_buf = Some(Tensor::<2>::zeros([n, max_new], &device));
+    let mut pos = Some(Tensor::<1, Int>::full([1], lp as i64, &device));
+    let mut finished = Some(Tensor::<2, Int>::zeros([n, 1], &device));
+    let pad = Tensor::<2, Int>::full([n, 1], eos0, &device);
+    let mut last_buf = Some(Tensor::<2>::zeros([n, v], &device));
 
     // PERSISTENT C3 buffers (allocated OUTSIDE capture): u (the gumbel uniform) + the 4 seeds.
     let u_handle = client.empty(n * v * 4);
@@ -373,8 +430,10 @@ fn temperature_decode(
     let mut seed_rng = StdRng::seed_from_u64(seed_base);
     client.write_to_handle(&seed_handle, &seed_bytes(&draw_seeds(&mut seed_rng))); // seeds for warmup/capture
 
-    let prefill = |cache: &mut _, last_buf: &mut Option<Tensor<B, 2>>| {
-        let pos0 = Tensor::<B, 1, Int>::arange(0..lp as i64, &device).unsqueeze_dim::<2>(0).repeat(&[n, 1]);
+    let prefill = |cache: &mut _, last_buf: &mut Option<Tensor<2>>| {
+        let pos0 = Tensor::<1, Int>::arange(0..lp as i64, &device)
+            .unsqueeze_dim::<2>(0)
+            .repeat(&[n, 1]);
         let logits = model.forward_with_cache(prompt_rep.clone(), None, pos0, cache);
         let prefill_last = logits.slice([0..n, (lp - 1)..lp, 0..v]).reshape([n, v]);
         let lb = last_buf.take().unwrap();
@@ -401,7 +460,8 @@ fn temperature_decode(
     let mut step = || {
         let last = last_buf.take().unwrap();
         let lse = logsumexp_dim1(last.clone());
-        let sampled = seeded_gumbel_select(&client, &device, &last, temp, &u_handle, &seed_handle, n, v);
+        let sampled =
+            seeded_gumbel_select(&client, &device, &last, temp, &u_handle, &seed_handle, n, v);
         let fin = finished.take().unwrap();
         let fin_mask = fin.clone().equal_elem(1i64);
         let active = fin.clone().equal_elem(0i64).float();
@@ -413,11 +473,32 @@ fn temperature_decode(
         let logp = device_token_logp(&last, &emit, &lse).reshape([n, 1]);
         let pos_idx = pos.as_ref().unwrap().clone();
         let rel = pos.as_ref().unwrap().clone().sub_scalar(lp as i64);
-        tok_buf = Some(tok_buf.take().unwrap().select_assign(1, pos_idx, emit.clone(), IndexingUpdateOp::Add));
-        logp_buf = Some(logp_buf.take().unwrap().select_assign(1, rel.clone(), logp, IndexingUpdateOp::Add));
-        mask_buf = Some(mask_buf.take().unwrap().select_assign(1, rel, active, IndexingUpdateOp::Add));
+        tok_buf = Some(tok_buf.take().unwrap().select_assign(
+            1,
+            pos_idx,
+            emit.clone(),
+            IndexingUpdateOp::Add,
+        ));
+        logp_buf = Some(logp_buf.take().unwrap().select_assign(
+            1,
+            rel.clone(),
+            logp,
+            IndexingUpdateOp::Add,
+        ));
+        mask_buf = Some(mask_buf.take().unwrap().select_assign(
+            1,
+            rel,
+            active,
+            IndexingUpdateOp::Add,
+        ));
         finished = Some(fin.add(is_eos.int()).clamp(0i64, 1i64));
-        let lg = model.forward_with_cache_static_pre(emit, pos.as_ref().unwrap().clone(), &mut cache, &freqs, &arange_tmax);
+        let lg = model.forward_with_cache_static_pre(
+            emit,
+            pos.as_ref().unwrap().clone(),
+            &mut cache,
+            &freqs,
+            &arange_tmax,
+        );
         let new_last = lg.slice([0..n, 0..1, 0..v]).reshape([n, v]);
         last_buf = Some(last.slice_assign([0..n, 0..v], new_last));
         pos = Some(pos.take().unwrap().add_scalar(1i64));
@@ -446,7 +527,12 @@ fn temperature_decode(
         cache.reset_for_replay();
         prefill(&mut cache, &mut last_buf);
         tok_buf = Some(tok_buf.take().unwrap().mul_scalar(0));
-        tok_buf = Some(tok_buf.take().unwrap().slice_assign([0..n, 0..lp], prompt_rep.clone()));
+        tok_buf = Some(
+            tok_buf
+                .take()
+                .unwrap()
+                .slice_assign([0..n, 0..lp], prompt_rep.clone()),
+        );
         logp_buf = Some(logp_buf.take().unwrap().mul_scalar(0.0));
         mask_buf = Some(mask_buf.take().unwrap().mul_scalar(0.0));
         finished = Some(finished.take().unwrap().mul_scalar(0));
@@ -487,10 +573,12 @@ fn temperature_decode(
 }
 
 fn main() {
-    let device: <B as Backend>::Device = Default::default();
+    let device: Device = Default::default();
     let client = CudaRuntime::client(&device);
     println!("device: {device:?} | RAW CubeBackend<CudaRuntime> (below Fusion)\n");
-    println!("=== P-FINAL: actually-CAPTURED GRPO greedy decode (capture 1 step, replay max_new) ===\n");
+    println!(
+        "=== P-FINAL: actually-CAPTURED GRPO greedy decode (capture 1 step, replay max_new) ===\n"
+    );
 
     // ---------------------------------------------------------------------------------------------
     // (1) GREEDY BIT-IDENTITY: captured (capture+replay) == eager static (device-`pos` loop).
@@ -500,36 +588,70 @@ fn main() {
         let (p, g, lp, max_new) = (4usize, 2usize, 8usize, 24usize);
         let n = p * g;
         let eos: Vec<i64> = vec![vocab as i64 - 1]; // unlikely -> both run the full length
-        <B as Backend>::seed(&device, 7);
+        device.seed(7);
         let model = build_model(&device, vocab, layers);
-        let prompt_ids: Vec<i64> = (0..(p * lp) as i64).map(|i| (i * 131 + 17) % vocab as i64).collect();
-        let prompt = Tensor::<B, 1, Int>::from_data(prompt_ids.as_slice(), &device).reshape([p, lp]);
-        let rc = RolloutConfig { group_size: g, max_new_tokens: max_new, temperature: 0.0, top_p: 1.0, top_k: 0 };
+        let prompt_ids: Vec<i64> = (0..(p * lp) as i64)
+            .map(|i| (i * 131 + 17) % vocab as i64)
+            .collect();
+        let prompt = Tensor::<1, Int>::from_data(prompt_ids.as_slice(), &device).reshape([p, lp]);
+        let rc = RolloutConfig {
+            group_size: g,
+            max_new_tokens: max_new,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+        };
 
         let eager = group_sample_cached_device_static(&model, prompt.clone(), &rc, &eos);
-        let (captured, arena, _) = captured_greedy_decode(&model, prompt.clone(), &rc, &eos, vocab, 3);
+        let (captured, arena, _) =
+            captured_greedy_decode(&model, prompt.clone(), &rc, &eos, vocab, 3);
 
         let ei = eager.seq_ids.into_data().to_vec::<i32>().unwrap();
         let ci = captured.seq_ids.into_data().to_vec::<i32>().unwrap();
         let em = eager.completion_mask.into_data().to_vec::<f32>().unwrap();
-        let cm = captured.completion_mask.into_data().to_vec::<f32>().unwrap();
+        let cm = captured
+            .completion_mask
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
         let el = eager.old_logprobs.into_data().to_vec::<f32>().unwrap();
         let cl = captured.old_logprobs.into_data().to_vec::<f32>().unwrap();
         let ids_eq = ei == ci;
         let mask_eq = em == cm;
-        let logp_max_err = el.iter().zip(cl.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let logp_max_err = el
+            .iter()
+            .zip(cl.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
         let logp_eq = logp_max_err == 0.0;
 
-        println!("  vocab={vocab} layers={layers} N={n} lp={lp} max_new={max_new} | arena high-water = {} KB", arena / 1024);
-        println!("  [guard] FIX-1 OOB: warmup(3) < max_new({max_new}) asserted | FIX-2b VA-stability: all 6 persistent buffers (tok/logp/mask/pos/finished/last) UNCHANGED across capture (asserted in-harness)");
+        println!(
+            "  vocab={vocab} layers={layers} N={n} lp={lp} max_new={max_new} | arena high-water = {} KB",
+            arena / 1024
+        );
+        println!(
+            "  [guard] FIX-1 OOB: warmup(3) < max_new({max_new}) asserted | FIX-2b VA-stability: all 6 persistent buffers (tok/logp/mask/pos/finished/last) UNCHANGED across capture (asserted in-harness)"
+        );
         println!("  seq_ids  bit-identical (captured == eager static): {ids_eq}");
         println!("  comp_mask bit-identical:                            {mask_eq}");
-        println!("  logp     bit-identical:                            {logp_eq}  (max_abs_err = {logp_max_err:.2e})");
+        println!(
+            "  logp     bit-identical:                            {logp_eq}  (max_abs_err = {logp_max_err:.2e})"
+        );
         let pass = ids_eq && mask_eq && logp_eq;
-        println!("  => {}\n", if pass { "PASS: the assembled C1+C2+C3(none)+P2 capture path is CORRECT" } else { "FAIL" });
+        println!(
+            "  => {}\n",
+            if pass {
+                "PASS: the assembled C1+C2+C3(none)+P2 capture path is CORRECT"
+            } else {
+                "FAIL"
+            }
+        );
         assert!(ids_eq, "captured seq_ids differ from eager static");
         assert!(mask_eq, "captured completion_mask differ from eager static");
-        assert!(logp_eq, "captured logp differ from eager static (max_err {logp_max_err:.2e})");
+        assert!(
+            logp_eq,
+            "captured logp differ from eager static (max_err {logp_max_err:.2e})"
+        );
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -539,15 +661,24 @@ fn main() {
         let (vocab, layers) = (64usize, 4usize);
         let (p, g, lp, max_new) = (3usize, 2usize, 6usize, 20usize);
         let n = p * g;
-        <B as Backend>::seed(&device, 123);
+        device.seed(123);
         let model = build_model(&device, vocab, layers);
-        let prompt_ids: Vec<i64> = (0..(p * lp) as i64).map(|i| (i * 17 + 3) % vocab as i64).collect();
-        let prompt = Tensor::<B, 1, Int>::from_data(prompt_ids.as_slice(), &device).reshape([p, lp]);
-        let rc = RolloutConfig { group_size: g, max_new_tokens: max_new, temperature: 0.0, top_p: 1.0, top_k: 0 };
+        let prompt_ids: Vec<i64> = (0..(p * lp) as i64)
+            .map(|i| (i * 17 + 3) % vocab as i64)
+            .collect();
+        let prompt = Tensor::<1, Int>::from_data(prompt_ids.as_slice(), &device).reshape([p, lp]);
+        let rc = RolloutConfig {
+            group_size: g,
+            max_new_tokens: max_new,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+        };
 
         // PROBE: decode once with an unreachable eos, then pick a REAL generated token (mid-completion)
         // as the eos so the finished/pad transition is actually exercised in BOTH paths.
-        let probe = group_sample_cached_device_static(&model, prompt.clone(), &rc, &[vocab as i64 - 1]);
+        let probe =
+            group_sample_cached_device_static(&model, prompt.clone(), &rc, &[vocab as i64 - 1]);
         let pi = probe.seq_ids.into_data().to_vec::<i32>().unwrap();
         let mid = pi[(lp + max_new / 2) as usize] as i64; // row 0's token at completion step max_new/2
         let other = pi[(lp + max_new / 2 + 3) as usize] as i64;
@@ -558,14 +689,33 @@ fn main() {
         let ei = eager.seq_ids.into_data().to_vec::<i32>().unwrap();
         let ci = captured.seq_ids.into_data().to_vec::<i32>().unwrap();
         let em = eager.completion_mask.into_data().to_vec::<f32>().unwrap();
-        let cm = captured.completion_mask.into_data().to_vec::<f32>().unwrap();
-        let finished_rows = em.chunks(max_new).filter(|r| r.iter().any(|&x| x == 0.0)).count();
+        let cm = captured
+            .completion_mask
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let finished_rows = em
+            .chunks(max_new)
+            .filter(|r| r.iter().any(|&x| x == 0.0))
+            .count();
         let ids_eq = ei == ci;
         let mask_eq = em == cm;
-        println!("  [EOS] vocab={vocab} N={n} eos={eos:?}: rows that hit EOS = {finished_rows}/{n}");
+        println!(
+            "  [EOS] vocab={vocab} N={n} eos={eos:?}: rows that hit EOS = {finished_rows}/{n}"
+        );
         println!("  [EOS] seq_ids bit-identical: {ids_eq} | comp_mask bit-identical: {mask_eq}");
-        println!("  => {}\n", if ids_eq && mask_eq { "PASS: device-pos EOS/pad path captures correctly" } else { "FAIL" });
-        assert!(ids_eq && mask_eq, "captured EOS/pad path differs from eager static");
+        println!(
+            "  => {}\n",
+            if ids_eq && mask_eq {
+                "PASS: device-pos EOS/pad path captures correctly"
+            } else {
+                "FAIL"
+            }
+        );
+        assert!(
+            ids_eq && mask_eq,
+            "captured EOS/pad path differs from eager static"
+        );
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -576,15 +726,29 @@ fn main() {
         let (p, g, lp, max_new) = (16usize, 4usize, 16usize, 64usize); // the real GRPO shape: N=64
         let n = p * g;
         let eos: Vec<i64> = vec![vocab as i64 - 1];
-        <B as Backend>::seed(&device, 7);
+        device.seed(7);
         let model = build_model(&device, vocab, layers);
-        let prompt_ids: Vec<i64> = (0..(p * lp) as i64).map(|i| (i * 131 + 17) % vocab as i64).collect();
-        let prompt = Tensor::<B, 1, Int>::from_data(prompt_ids.as_slice(), &device).reshape([p, lp]);
-        let rc = RolloutConfig { group_size: g, max_new_tokens: max_new, temperature: 0.0, top_p: 1.0, top_k: 0 };
+        let prompt_ids: Vec<i64> = (0..(p * lp) as i64)
+            .map(|i| (i * 131 + 17) % vocab as i64)
+            .collect();
+        let prompt = Tensor::<1, Int>::from_data(prompt_ids.as_slice(), &device).reshape([p, lp]);
+        let rc = RolloutConfig {
+            group_size: g,
+            max_new_tokens: max_new,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+        };
 
         let reps = 5usize;
-        let prompt_rep = prompt.clone().unsqueeze_dim::<3>(1).repeat(&[1, g, 1]).reshape([n, lp]);
-        let pos0 = Tensor::<B, 1, Int>::arange(0..lp as i64, &device).unsqueeze_dim::<2>(0).repeat(&[n, 1]);
+        let prompt_rep = prompt
+            .clone()
+            .unsqueeze_dim::<3>(1)
+            .repeat(&[1, g, 1])
+            .reshape([n, lp]);
+        let pos0 = Tensor::<1, Int>::arange(0..lp as i64, &device)
+            .unsqueeze_dim::<2>(0)
+            .repeat(&[n, 1]);
 
         // PREFILL-ONLY timing — BOTH paths pay this once per rollout; subtract it to isolate the decode
         // loop (the part capture actually replaces). Reuse ONE cache (zero in place between reps, NOT
@@ -628,14 +792,32 @@ fn main() {
         }
         replay_ms /= reps as f64;
 
-        println!("  shape: vocab={vocab} layers={layers} N={n} lp={lp} max_new={max_new}  | arena = {} KB", arena / 1024);
+        println!(
+            "  shape: vocab={vocab} layers={layers} N={n} lp={lp} max_new={max_new}  | arena = {} KB",
+            arena / 1024
+        );
         println!("  prefill only (shared by both):                     {prefill_ms:8.2} ms");
-        println!("  eager static decode e2e (prefill + {max_new} steps + finalize): {eager_ms:8.2} ms");
-        println!("  eager DECODE LOOP (e2e - prefill):                 {eager_decode:8.2} ms ({:.2} ms/step)", eager_decode / max_new as f64);
-        println!("  captured {max_new} replays (decode hot-loop):                 {replay_ms:8.2} ms ({:.2} ms/replay)", replay_ms / max_new as f64);
+        println!(
+            "  eager static decode e2e (prefill + {max_new} steps + finalize): {eager_ms:8.2} ms"
+        );
+        println!(
+            "  eager DECODE LOOP (e2e - prefill):                 {eager_decode:8.2} ms ({:.2} ms/step)",
+            eager_decode / max_new as f64
+        );
+        println!(
+            "  captured {max_new} replays (decode hot-loop):                 {replay_ms:8.2} ms ({:.2} ms/replay)",
+            replay_ms / max_new as f64
+        );
         let speedup = eager_decode / replay_ms;
-        println!("  net decode-loop (replays / eager-decode-loop):     {:.3}x  ({:.2}x speedup)", replay_ms / eager_decode, speedup);
-        println!("  net end-to-end  (replays / eager-e2e):             {:.3}x", replay_ms / eager_ms);
+        println!(
+            "  net decode-loop (replays / eager-decode-loop):     {:.3}x  ({:.2}x speedup)",
+            replay_ms / eager_decode,
+            speedup
+        );
+        println!(
+            "  net end-to-end  (replays / eager-e2e):             {:.3}x",
+            replay_ms / eager_ms
+        );
         println!(
             "\n  HONEST READ: capture removes the per-step host LAUNCH LATENCY (~{:.1} ms/step here, the cost\n  \
              of issuing the ~70 kernels of a decode step), giving a measured {:.2}x decode-loop speedup. But\n  \
@@ -644,7 +826,8 @@ fn main() {
              grow (more GEMM bandwidth per launch). This sits in the design's predicted ~1.1-1.4x@small ->\n  \
              ~1.0x@large band. The DELIVERABLE is a CORRECT, working captured decode + the framework capability\n  \
              (metadata interning + in-graph chaining), not a large speedup for this workload.",
-            (eager_decode - replay_ms) / max_new as f64, speedup
+            (eager_decode - replay_ms) / max_new as f64,
+            speedup
         );
     }
 
@@ -657,23 +840,31 @@ fn main() {
         let (p, g, lp, max_new) = (4usize, 2usize, 8usize, 24usize);
         let n = p * g;
         let eos: Vec<i64> = vec![vocab as i64 - 1];
-        <B as Backend>::seed(&device, 7);
+        device.seed(7);
         let model = build_model(&device, vocab, layers);
-        let prompt_ids: Vec<i64> = (0..(p * lp) as i64).map(|i| (i * 131 + 17) % vocab as i64).collect();
-        let prompt = Tensor::<B, 1, Int>::from_data(prompt_ids.as_slice(), &device).reshape([p, lp]);
+        let prompt_ids: Vec<i64> = (0..(p * lp) as i64)
+            .map(|i| (i * 131 + 17) % vocab as i64)
+            .collect();
+        let prompt = Tensor::<1, Int>::from_data(prompt_ids.as_slice(), &device).reshape([p, lp]);
         // temp high enough that the Gumbel noise dominates the (uncalibrated random-weight) logits, so
         // the per-replay SEED visibly controls the draw — the sharpest probe of "does the seed write
         // reach the captured kernel". (At temp=1.0 these random-init logits dominate, hiding the noise;
         // a trained model is calibrated so temp=1.0 noise matters — that's a weights property, not the
         // mechanism's.)
-        let rc = RolloutConfig { group_size: g, max_new_tokens: max_new, temperature: 64.0, top_p: 1.0, top_k: 0 };
+        let rc = RolloutConfig {
+            group_size: g,
+            max_new_tokens: max_new,
+            temperature: 64.0,
+            top_p: 1.0,
+            top_k: 0,
+        };
 
         // DIAGNOSTIC (eager, NOT captured): does the seeded Gumbel sampler itself decorrelate when the
         // seed handle changes? Isolates "sampler broken" from "capture froze the seed".
         {
             let u_h = client.empty(n * vocab * 4);
             let s_h = client.empty(N_SEEDS * 4);
-            let logits = Tensor::<B, 2>::zeros([n, vocab], &device); // flat logits -> pure-noise argmax
+            let logits = Tensor::<2>::zeros([n, vocab], &device); // flat logits -> pure-noise argmax
             client.write_to_handle(&s_h, &seed_bytes(&[1, 2, 3, 4]));
             let t1 = seeded_gumbel_select(&client, &device, &logits, 8.0, &u_h, &s_h, n, vocab);
             let v1 = t1.into_data().to_vec::<i32>().unwrap();
@@ -681,18 +872,21 @@ fn main() {
             let t2 = seeded_gumbel_select(&client, &device, &logits, 8.0, &u_h, &s_h, n, vocab);
             let v2 = t2.into_data().to_vec::<i32>().unwrap();
             let eager_differ = v1.iter().zip(v2.iter()).filter(|(a, b)| a != b).count();
-            println!("  [TEMP-diag] eager seeded sampler, 2 seeds: argmax differs in {eager_differ}/{n} rows (expect >0)");
+            println!(
+                "  [TEMP-diag] eager seeded sampler, 2 seeds: argmax differs in {eager_differ}/{n} rows (expect >0)"
+            );
         }
         // DIAGNOSTIC 2: capture JUST the seeded sampler, replay with 2 seeds. Isolates seeded-sampler-
         // under-capture from the full-decode integration.
         {
             let u_h = client.empty(n * vocab * 4);
             let s_h = client.empty(N_SEEDS * 4);
-            let logits = Tensor::<B, 2>::zeros([n, vocab], &device);
-            let mut out = Some(Tensor::<B, 2, Int>::zeros([n, 1], &device));
+            let logits = Tensor::<2>::zeros([n, vocab], &device);
+            let mut out = Some(Tensor::<2, Int>::zeros([n, 1], &device));
             client.write_to_handle(&s_h, &seed_bytes(&[1, 2, 3, 4]));
             let mut sstep = || {
-                let sel = seeded_gumbel_select(&client, &device, &logits, 8.0, &u_h, &s_h, n, vocab);
+                let sel =
+                    seeded_gumbel_select(&client, &device, &logits, 8.0, &u_h, &s_h, n, vocab);
                 out = Some(out.take().unwrap().mul_scalar(0).add(sel));
             };
             let cg = unsafe { client.capture_arena(2, &mut sstep) };
@@ -700,13 +894,21 @@ fn main() {
             client.write_to_handle(&s_h, &seed_bytes(&[1, 2, 3, 4]));
             cg.replay();
             block_sync(&client);
-            let vp = out.as_ref().unwrap().clone().into_data().to_vec::<i32>().unwrap();
+            let vp = out
+                .as_ref()
+                .unwrap()
+                .clone()
+                .into_data()
+                .to_vec::<i32>()
+                .unwrap();
             client.write_to_handle(&s_h, &seed_bytes(&[99, 98, 97, 96]));
             cg.replay();
             block_sync(&client);
             let vq = out.take().unwrap().into_data().to_vec::<i32>().unwrap();
             let cap_differ = vp.iter().zip(vq.iter()).filter(|(a, b)| a != b).count();
-            println!("  [TEMP-diag] CAPTURED seeded sampler, 2 replay-seeds: argmax differs in {cap_differ}/{n} rows (expect >0)");
+            println!(
+                "  [TEMP-diag] CAPTURED seeded sampler, 2 replay-seeds: argmax differs in {cap_differ}/{n} rows (expect >0)"
+            );
             drop(cg);
         }
 
@@ -719,7 +921,9 @@ fn main() {
         let b1i = b1.seq_ids.into_data().to_vec::<i32>().unwrap();
         // completion region only (cols lp..lp+max_new).
         let comp = |all: &[i32]| -> Vec<i32> {
-            (0..n).flat_map(|r| (lp..lp + max_new).map(move |c| all[r * (lp + max_new) + c])).collect()
+            (0..n)
+                .flat_map(|r| (lp..lp + max_new).map(move |c| all[r * (lp + max_new) + c]))
+                .collect()
         };
         let (ca1, ca2, cb1) = (comp(&a1i), comp(&a2i), comp(&b1i));
         let valid = ca1.iter().all(|&t| t >= 0 && (t as usize) < vocab);
@@ -752,32 +956,83 @@ fn main() {
         // token t demonstrably fed a different token at t+1 somewhere in the row).
         let chained_rows = (0..n)
             .filter(|&r| {
-                let row: std::collections::HashSet<i32> =
-                    (lp..lp + max_new).map(|c| a1i[r * (lp + max_new) + c]).collect();
+                let row: std::collections::HashSet<i32> = (lp..lp + max_new)
+                    .map(|c| a1i[r * (lp + max_new) + c])
+                    .collect();
                 row.len() > 1
             })
             .count();
 
-        println!("  [TEMP] vocab={vocab} N={n} max_new={max_new} temp={} (captured Gumbel-max, fresh seed per replay)", rc.temperature);
-        println!("  [TEMP] (high temp so the Gumbel noise dominates the UNCALIBRATED random-weight logits and the");
-        println!("  [TEMP]  seed visibly controls the captured decode — the diagnostics above prove the captured");
-        println!("  [TEMP]  seeded sampler decorrelates even at flat logits; a trained model needs no such boost.)");
-        println!("  [TEMP] valid token ids: {valid} | distinct completion ids: {} (varied={varied})", distinct.len());
-        println!("  [TEMP] stream-A vs stream-B differing fraction: {frac_ab:.3} (decorrelated={decorrelated})");
+        println!(
+            "  [TEMP] vocab={vocab} N={n} max_new={max_new} temp={} (captured Gumbel-max, fresh seed per replay)",
+            rc.temperature
+        );
+        println!(
+            "  [TEMP] (high temp so the Gumbel noise dominates the UNCALIBRATED random-weight logits and the"
+        );
+        println!(
+            "  [TEMP]  seed visibly controls the captured decode — the diagnostics above prove the captured"
+        );
+        println!(
+            "  [TEMP]  seeded sampler decorrelates even at flat logits; a trained model needs no such boost.)"
+        );
+        println!(
+            "  [TEMP] valid token ids: {valid} | distinct completion ids: {} (varied={varied})",
+            distinct.len()
+        );
+        println!(
+            "  [TEMP] stream-A vs stream-B differing fraction: {frac_ab:.3} (decorrelated={decorrelated})"
+        );
         println!("  [TEMP] stream-A reproducible (A==A): {same_aa}");
-        println!("  [TEMP-parity] captured(0xA) vs EAGER(0xA), identical per-step seed stream: {parity_match}/{} tokens match (frac={parity_frac:.3}, bit_identical={parity_bit_identical})", ca1.len());
-        println!("  [TEMP-parity] autoregressive chain: {chained_rows}/{n} completion rows have >1 distinct token (token t feeds t+1)");
-        let pass = valid && varied && decorrelated && same_aa && parity_bit_identical && chained_rows > 0;
-        println!("  => {}\n", if pass { "PASS: captured temperature decode DECORRELATES + is AUTOREGRESSIVELY CORRECT (== eager under a fixed seed)" } else { "FAIL" });
-        assert!(valid, "captured temperature produced out-of-range token ids");
-        assert!(varied, "captured temperature froze to a single token (noise not applied)");
-        assert!(decorrelated, "captured temperature did NOT decorrelate across seed streams (frozen noise)");
-        assert!(same_aa, "captured temperature non-reproducible for a fixed seed stream");
-        assert!(chained_rows > 0, "captured temperature is not autoregressive (no row varies across steps — a single token stamped at advancing columns)");
-        assert!(parity_bit_identical, "captured temperature decode DIVERGES from the eager temperature decode under an identical seed stream ({parity_match}/{} match) — the captured autoregressive chain is wrong", ca1.len());
+        println!(
+            "  [TEMP-parity] captured(0xA) vs EAGER(0xA), identical per-step seed stream: {parity_match}/{} tokens match (frac={parity_frac:.3}, bit_identical={parity_bit_identical})",
+            ca1.len()
+        );
+        println!(
+            "  [TEMP-parity] autoregressive chain: {chained_rows}/{n} completion rows have >1 distinct token (token t feeds t+1)"
+        );
+        let pass =
+            valid && varied && decorrelated && same_aa && parity_bit_identical && chained_rows > 0;
+        println!(
+            "  => {}\n",
+            if pass {
+                "PASS: captured temperature decode DECORRELATES + is AUTOREGRESSIVELY CORRECT (== eager under a fixed seed)"
+            } else {
+                "FAIL"
+            }
+        );
+        assert!(
+            valid,
+            "captured temperature produced out-of-range token ids"
+        );
+        assert!(
+            varied,
+            "captured temperature froze to a single token (noise not applied)"
+        );
+        assert!(
+            decorrelated,
+            "captured temperature did NOT decorrelate across seed streams (frozen noise)"
+        );
+        assert!(
+            same_aa,
+            "captured temperature non-reproducible for a fixed seed stream"
+        );
+        assert!(
+            chained_rows > 0,
+            "captured temperature is not autoregressive (no row varies across steps — a single token stamped at advancing columns)"
+        );
+        assert!(
+            parity_bit_identical,
+            "captured temperature decode DIVERGES from the eager temperature decode under an identical seed stream ({parity_match}/{} match) — the captured autoregressive chain is wrong",
+            ca1.len()
+        );
     }
 
     println!("\n=== P-FINAL SUMMARY: CAPTURED greedy decode BIT-IDENTICAL to eager static; ===");
-    println!("=== captured TEMPERATURE decode DECORRELATES + matches eager token-for-token under a fixed seed (C3); ===");
-    println!("=== guards: FIX-1 OOB-warmup assert + FIX-2b in-place-VA stability assert active in both harnesses. ===");
+    println!(
+        "=== captured TEMPERATURE decode DECORRELATES + matches eager token-for-token under a fixed seed (C3); ==="
+    );
+    println!(
+        "=== guards: FIX-1 OOB-warmup assert + FIX-2b in-place-VA stability assert active in both harnesses. ==="
+    );
 }

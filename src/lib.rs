@@ -97,7 +97,10 @@ pub mod capture;
 /// custom CubeCL kernels (fp8 GEMM, MoE grouped-GEMM); enforces the §0b production rules.
 #[cfg(feature = "cuda")]
 pub mod cube_custom_op;
+#[cfg(feature = "cubecl-gpu")]
+pub(crate) mod cubecl_rt;
 mod decoder;
+pub mod expert_stream;
 /// Custom CubeCL FlashAttention-style attention kernel (online softmax, f32 accum; CUDA only).
 /// Validated on the GB10 vs an NdArray CPU oracle (see `examples/attn_kernel_spike.rs`).
 #[cfg(feature = "cuda")]
@@ -121,9 +124,10 @@ pub mod moe_decode;
 /// NdArray CPU oracle (see `examples/moe_grouped_spike.rs`).
 #[cfg(feature = "cuda")]
 pub mod moe_grouped;
-/// L2C NVFP4 host codec (f32 <-> E2M1 4-bit + E4M3 per-16 block scale + FP32 global scale). Pure CPU;
-/// the SIMT decode-GEMV kernel that consumes it is the next increment. Design: docs/specs/L2C-*.md.
+/// L2C NVFP4 host codec plus CubeCL decode-GEMV / fused MoE kernels (CUDA and wgpu/Metal/Vulkan).
 pub mod nvfp4;
+#[cfg(feature = "cubecl-gpu")]
+mod nvfp4_kernels;
 pub mod nvfp4_linear;
 pub mod nvidia_ckpt;
 pub mod quant_gate;

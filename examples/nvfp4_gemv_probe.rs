@@ -54,7 +54,7 @@ fn check(k: usize, n: usize, m: usize) {
     let w_deq = dequant_nvfp4(&packed_qw, &block_scales, gscale, k, n);
     let want = cpu_matmul(&x_host, &w_deq, m, k, n);
 
-    let x = Tensor::<B, 2>::from_data(TensorData::new(x_host, [m, k]), &dev);
+    let x = Tensor::<2>::from_data(TensorData::new(x_host, [m, k]), &dev);
     let got = nvfp4_gemv_raw(x, &packed_qw, &block_scales, gscale, k, n, m)
         .into_data()
         .to_vec::<f32>()

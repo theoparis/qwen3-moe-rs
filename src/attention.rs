@@ -3,20 +3,20 @@
 use burn::{
     Tensor,
     config::Config,
-    module::{Ignored, Module},
+    module::Module,
     nn::{Linear, LinearConfig, RmsNorm, RmsNormConfig},
-    prelude::Backend,
+    prelude::Device,
     // We use `attention_fallback` (the reference scaled-dot-product implementation) rather
     // than the fused `attention` kernel: on the CubeCL CUDA backend (sm_121 / NVIDIA GB10)
     // the fused kernel mishandles the broadcast causal mask of shape [1, 1, seq, seq]
     // (not expanded over batch/num_heads), producing wrong logits (argmax 15738 vs the
     // correct 279). The fallback honours the broadcast mask correctly and matches the HF
     // reference (cosine 0.99996). It is also correct on the CPU backends used elsewhere.
-    tensor::{Bool, module::attention_fallback as attention, ops::AttentionModuleOptions},
+    tensor::{Bool, Int, module::attention_fallback as attention, ops::AttentionModuleOptions},
 };
 
 use super::cache::KVCache;
-use super::linear2d::{linear3, Precision};
+use super::linear2d::{Precision, linear3};
 use super::rope::{apply_rope, compute_rope_embeddings, compute_rope_embeddings_pre};
 
 /// Configuration for Qwen3 attention.
@@ -40,14 +40,16 @@ pub struct Qwen3AttentionConfig {
 
 impl Qwen3AttentionConfig {
     /// Initialize the attention module.
-    pub fn init<B: Backend>(&self, device: &B::Device) -> Qwen3Attention<B> {
-        let head_dim = self.head_dim.unwrap_or(self.hidden_size / self.num_attention_heads);
+    pub fn init(&self, device: &Device) -> Qwen3Attention {
+        let head_dim = self
+            .head_dim
+            .unwrap_or(self.hidden_size / self.num_attention_heads);
 
         Qwen3Attention {
-            num_heads: Ignored(self.num_attention_heads),
-            num_kv_heads: Ignored(self.num_key_value_heads),
-            head_dim: Ignored(head_dim),
-            rope_theta: Ignored(self.rope_theta),
+            num_heads: (self.num_attention_heads),
+            num_kv_heads: (self.num_key_value_heads),
+            head_dim: (head_dim),
+            rope_theta: (self.rope_theta),
             q_proj: LinearConfig::new(self.hidden_size, self.num_attention_heads * head_dim)
                 .with_bias(false)
                 .init(device),
@@ -72,31 +74,31 @@ impl Qwen3AttentionConfig {
 
 /// Grouped Query Attention module for Qwen3.
 #[derive(Module, Debug)]
-pub struct Qwen3Attention<B: Backend> {
-    num_heads: Ignored<usize>,
-    num_kv_heads: Ignored<usize>,
-    head_dim: Ignored<usize>,
-    rope_theta: Ignored<f64>,
+pub struct Qwen3Attention {
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    rope_theta: f64,
 
-    q_proj: Linear<B>,
-    k_proj: Linear<B>,
-    v_proj: Linear<B>,
-    o_proj: Linear<B>,
-    q_norm: RmsNorm<B>,
-    k_norm: RmsNorm<B>,
+    q_proj: Linear,
+    k_proj: Linear,
+    v_proj: Linear,
+    o_proj: Linear,
+    q_norm: RmsNorm,
+    k_norm: RmsNorm,
 }
 
-impl<B: Backend> Qwen3Attention<B> {
+impl Qwen3Attention {
     /// Per-head dimension `head_dim` (also the QK-RMSNorm dimension — `q_norm`/`k_norm` normalize each
     /// head of `head_dim`). Exposed so a reused decode path can assert its precomputed RoPE table and
     /// QK-norm assumptions match this attention (see `Qwen3MoeForCausalLM::build_static_decode`).
     pub fn head_dim(&self) -> usize {
-        *self.head_dim
+        self.head_dim
     }
 
     /// RoPE theta. Exposed for the same precomputed-RoPE config-equality check.
     pub fn rope_theta(&self) -> f64 {
-        *self.rope_theta
+        self.rope_theta
     }
 
     /// The QK-RMSNorm normalized dimension (`q_norm` gamma length). Equals `head_dim` for Qwen3 (the
@@ -113,11 +115,11 @@ impl<B: Backend> Qwen3Attention<B> {
     /// * `position_ids` - Position indices [batch, seq]
     pub fn forward(
         &self,
-        hidden_states: Tensor<B, 3>,
-        attention_mask: Option<Tensor<B, 2, Bool>>,
-        position_ids: Tensor<B, 2, burn::tensor::Int>,
+        hidden_states: Tensor<3>,
+        attention_mask: Option<Tensor<2, Bool>>,
+        position_ids: Tensor<2, Int>,
         prec: Precision,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         let [batch_size, seq_len, _] = hidden_states.dims();
         let device = hidden_states.device();
 
@@ -128,20 +130,21 @@ impl<B: Backend> Qwen3Attention<B> {
         let value = linear3(&self.v_proj, hidden_states, prec);
 
         // Reshape to [batch, seq, n_heads, head_dim]
-        let query = query.reshape([batch_size, seq_len, *self.num_heads, *self.head_dim]);
-        let key = key.reshape([batch_size, seq_len, *self.num_kv_heads, *self.head_dim]);
-        let value = value.reshape([batch_size, seq_len, *self.num_kv_heads, *self.head_dim]);
+        let query = query.reshape([batch_size, seq_len, self.num_heads, self.head_dim]);
+        let key = key.reshape([batch_size, seq_len, self.num_kv_heads, self.head_dim]);
+        let value = value.reshape([batch_size, seq_len, self.num_kv_heads, self.head_dim]);
 
         // Apply QK normalization
         let query = self.q_norm.forward(query);
         let key = self.k_norm.forward(key);
 
         // Compute and apply RoPE
-        let (cos, sin) = compute_rope_embeddings(position_ids, *self.head_dim, *self.rope_theta, &device);
+        let (cos, sin) =
+            compute_rope_embeddings(position_ids, self.head_dim, self.rope_theta, &device);
         let (query, key) = apply_rope(query, key, cos, sin);
 
         // Expand KV heads for GQA
-        let n_rep = *self.num_heads / *self.num_kv_heads;
+        let n_rep = self.num_heads / self.num_kv_heads;
         let (key, value) = if n_rep > 1 {
             (
                 key.unsqueeze_dim::<5>(3)
@@ -162,32 +165,33 @@ impl<B: Backend> Qwen3Attention<B> {
         let row_idx: Vec<f32> = (0..seq_len).map(|i| i as f32).collect();
         let col_idx: Vec<f32> = (0..seq_len).map(|i| i as f32).collect();
 
-        let rows = Tensor::<B, 1>::from_floats(row_idx.as_slice(), &device)
+        let rows = Tensor::<1>::from_floats(row_idx.as_slice(), &device)
             .unsqueeze_dim::<2>(1)
-            .repeat(&[1, seq_len]);  // [seq, seq]
-        let cols = Tensor::<B, 1>::from_floats(col_idx.as_slice(), &device)
+            .repeat(&[1, seq_len]); // [seq, seq]
+        let cols = Tensor::<1>::from_floats(col_idx.as_slice(), &device)
             .unsqueeze_dim::<2>(0)
-            .repeat(&[seq_len, 1]);  // [seq, seq]
+            .repeat(&[seq_len, 1]); // [seq, seq]
 
         // Causal mask: rows < cols (upper triangular excluding diagonal) = positions to MASK OUT
         // Burn attention uses true = mask out (fill with -inf)
-        let causal_mask = rows.clone().lower(cols.clone());  // [seq, seq] Bool, true = future positions to mask
+        let causal_mask = rows.clone().lower(cols.clone()); // [seq, seq] Bool, true = future positions to mask
 
         // Combine with optional attention mask (padding mask)
         let combined_mask = match attention_mask {
             Some(pad_mask) => {
                 // pad_mask: [batch, seq] where true = valid token, false = padding
                 // We need to mask where pad_mask is false, so invert: true = masked position
-                let pad_mask_inverted = pad_mask.bool_not();  // true = padding (mask out)
+                let pad_mask_inverted = pad_mask.bool_not(); // true = padding (mask out)
                 // Expand to [batch, 1, seq_q, seq_k] for attention scores
                 // For self-attention, seq_q = seq_k = seq
-                let pad_expanded = pad_mask_inverted.unsqueeze_dims::<4>(&[1, 2])  // [batch, 1, 1, seq_k]
-                    .repeat(&[1, 1, seq_len, 1]);  // [batch, 1, seq_q, seq_k]
-                let causal_expanded = causal_mask.unsqueeze_dims::<4>(&[0, 1]);  // [1, 1, seq_q, seq_k]
+                let pad_expanded = pad_mask_inverted
+                    .unsqueeze_dims::<4>(&[1, 2]) // [batch, 1, 1, seq_k]
+                    .repeat(&[1, 1, seq_len, 1]); // [batch, 1, seq_q, seq_k]
+                let causal_expanded = causal_mask.unsqueeze_dims::<4>(&[0, 1]); // [1, 1, seq_q, seq_k]
                 // Combined: mask where either is true (padding OR future)
                 pad_expanded.bool_or(causal_expanded)
             }
-            None => causal_mask.unsqueeze_dims::<4>(&[0, 1]),  // [1, 1, seq, seq]
+            None => causal_mask.unsqueeze_dims::<4>(&[0, 1]), // [1, 1, seq, seq]
         };
 
         // No query row may be fully masked. A left-padded query whose only causally-visible keys
@@ -213,7 +217,7 @@ impl<B: Backend> Qwen3Attention<B> {
         let attn_output = attn_output.movedim(1, 2).reshape([
             batch_size as i64,
             seq_len as i64,
-            (*self.num_heads * *self.head_dim) as i64,
+            (self.num_heads * self.head_dim) as i64,
         ]);
 
         linear3(&self.o_proj, attn_output, prec)
@@ -231,12 +235,12 @@ impl<B: Backend> Qwen3Attention<B> {
     /// Output tensor [batch, seq, hidden_size]
     pub fn forward_with_cache(
         &self,
-        hidden_states: Tensor<B, 3>,
-        attention_mask: Option<Tensor<B, 2, Bool>>,
-        position_ids: Tensor<B, 2, burn::tensor::Int>,
-        cache: &mut KVCache<B>,
+        hidden_states: Tensor<3>,
+        attention_mask: Option<Tensor<2, Bool>>,
+        position_ids: Tensor<2, Int>,
+        cache: &mut KVCache,
         prec: Precision,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         let [batch_size, seq_len, _] = hidden_states.dims();
         let device = hidden_states.device();
 
@@ -246,23 +250,24 @@ impl<B: Backend> Qwen3Attention<B> {
         let value = linear3(&self.v_proj, hidden_states, prec);
 
         // Reshape to [batch, seq, n_heads, head_dim]
-        let query = query.reshape([batch_size, seq_len, *self.num_heads, *self.head_dim]);
-        let key = key.reshape([batch_size, seq_len, *self.num_kv_heads, *self.head_dim]);
-        let value = value.reshape([batch_size, seq_len, *self.num_kv_heads, *self.head_dim]);
+        let query = query.reshape([batch_size, seq_len, self.num_heads, self.head_dim]);
+        let key = key.reshape([batch_size, seq_len, self.num_kv_heads, self.head_dim]);
+        let value = value.reshape([batch_size, seq_len, self.num_kv_heads, self.head_dim]);
 
         // Apply QK normalization
         let query = self.q_norm.forward(query);
         let key = self.k_norm.forward(key);
 
         // Compute and apply RoPE (only for new positions)
-        let (cos, sin) = compute_rope_embeddings(position_ids, *self.head_dim, *self.rope_theta, &device);
+        let (cos, sin) =
+            compute_rope_embeddings(position_ids, self.head_dim, self.rope_theta, &device);
         let (query, key) = apply_rope(query, key, cos, sin);
 
         // Update cache and get full K, V (including past)
         let (key, value) = cache.update(key, value);
 
         // Expand KV heads for GQA
-        let n_rep = *self.num_heads / *self.num_kv_heads;
+        let n_rep = self.num_heads / self.num_kv_heads;
         let (key, value) = if n_rep > 1 {
             (
                 key.unsqueeze_dim::<5>(3)
@@ -296,21 +301,22 @@ impl<B: Backend> Qwen3Attention<B> {
             let row_idx: Vec<f32> = (0..seq_len).map(|i| (q_offset + i) as f32).collect();
             let col_idx: Vec<f32> = (0..total_seq).map(|i| i as f32).collect();
 
-            let rows = Tensor::<B, 1>::from_floats(row_idx.as_slice(), &device)
+            let rows = Tensor::<1>::from_floats(row_idx.as_slice(), &device)
                 .unsqueeze_dim::<2>(1)
-                .repeat(&[1, total_seq]);  // [seq_len, total_seq]
-            let cols = Tensor::<B, 1>::from_floats(col_idx.as_slice(), &device)
+                .repeat(&[1, total_seq]); // [seq_len, total_seq]
+            let cols = Tensor::<1>::from_floats(col_idx.as_slice(), &device)
                 .unsqueeze_dim::<2>(0)
-                .repeat(&[seq_len, 1]);  // [seq_len, total_seq]
+                .repeat(&[seq_len, 1]); // [seq_len, total_seq]
 
             // Causal mask: rows < cols = future positions to mask
-            let causal_mask = rows.clone().lower(cols.clone());  // [seq_len, total_seq] Bool
+            let causal_mask = rows.clone().lower(cols.clone()); // [seq_len, total_seq] Bool
 
             // Combine with optional attention mask (padding mask)
             let prefill_mask = match attention_mask {
                 Some(pad_mask) => {
                     let pad_mask_inverted = pad_mask.bool_not();
-                    let pad_expanded = pad_mask_inverted.unsqueeze_dims::<4>(&[1, 2])
+                    let pad_expanded = pad_mask_inverted
+                        .unsqueeze_dims::<4>(&[1, 2])
                         .repeat(&[1, 1, seq_len, 1]);
                     let causal_expanded = causal_mask.unsqueeze_dims::<4>(&[0, 1]);
                     pad_expanded.bool_or(causal_expanded)
@@ -344,7 +350,7 @@ impl<B: Backend> Qwen3Attention<B> {
         let attn_output = attn_output.movedim(1, 2).reshape([
             batch_size as i64,
             seq_len as i64,
-            (*self.num_heads * *self.head_dim) as i64,
+            (self.num_heads * self.head_dim) as i64,
         ]);
 
         linear3(&self.o_proj, attn_output, prec)
@@ -366,11 +372,11 @@ impl<B: Backend> Qwen3Attention<B> {
     /// * `pos` — `[1]` Int DEVICE counter: the KV write column, the RoPE position, and the mask boundary.
     pub fn forward_with_cache_static(
         &self,
-        hidden_states: Tensor<B, 3>,
-        pos: Tensor<B, 1, burn::tensor::Int>,
-        cache: &mut KVCache<B>,
+        hidden_states: Tensor<3>,
+        pos: Tensor<1, Int>,
+        cache: &mut KVCache,
         prec: Precision,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         let [batch_size, seq_len, _] = hidden_states.dims(); // seq_len == 1 (decode)
         let device = hidden_states.device();
 
@@ -379,16 +385,17 @@ impl<B: Backend> Qwen3Attention<B> {
         let key = linear3(&self.k_proj, hidden_states.clone(), prec);
         let value = linear3(&self.v_proj, hidden_states, prec);
 
-        let query = query.reshape([batch_size, seq_len, *self.num_heads, *self.head_dim]);
-        let key = key.reshape([batch_size, seq_len, *self.num_kv_heads, *self.head_dim]);
-        let value = value.reshape([batch_size, seq_len, *self.num_kv_heads, *self.head_dim]);
+        let query = query.reshape([batch_size, seq_len, self.num_heads, self.head_dim]);
+        let key = key.reshape([batch_size, seq_len, self.num_kv_heads, self.head_dim]);
+        let value = value.reshape([batch_size, seq_len, self.num_kv_heads, self.head_dim]);
 
         let query = self.q_norm.forward(query);
         let key = self.k_norm.forward(key);
 
         // RoPE position of the new token = `pos` (DEVICE), broadcast to [B, 1]. No host index.
         let position_ids = pos.clone().reshape([1, 1]).repeat(&[batch_size, 1]); // [B, 1] Int
-        let (cos, sin) = compute_rope_embeddings(position_ids, *self.head_dim, *self.rope_theta, &device);
+        let (cos, sin) =
+            compute_rope_embeddings(position_ids, self.head_dim, self.rope_theta, &device);
         let (query, key) = apply_rope(query, key, cos, sin);
 
         // Device-pos KV write into the static buffer; read back the FULL [B, T_max, kv_heads, head_dim].
@@ -396,11 +403,16 @@ impl<B: Backend> Qwen3Attention<B> {
         let t_max = key.dims()[1];
 
         // Expand KV heads for GQA (over the full T_max buffer — constant shape).
-        let n_rep = *self.num_heads / *self.num_kv_heads;
+        let n_rep = self.num_heads / self.num_kv_heads;
         let (key, value) = if n_rep > 1 {
             (
-                key.unsqueeze_dim::<5>(3).repeat(&[1, 1, 1, n_rep, 1]).flatten(2, 3),
-                value.unsqueeze_dim::<5>(3).repeat(&[1, 1, 1, n_rep, 1]).flatten(2, 3),
+                key.unsqueeze_dim::<5>(3)
+                    .repeat(&[1, 1, 1, n_rep, 1])
+                    .flatten(2, 3),
+                value
+                    .unsqueeze_dim::<5>(3)
+                    .repeat(&[1, 1, 1, n_rep, 1])
+                    .flatten(2, 3),
             )
         } else {
             (key, value)
@@ -412,7 +424,7 @@ impl<B: Backend> Qwen3Attention<B> {
         // against the scores [B, n_heads, 1, T_max]. The new token's own column (idx == pos) stays
         // visible; the unwritten / future columns become -inf ⇒ exp == 0 ⇒ identical to reading only the
         // `0..=pos` prefix.
-        let idx = Tensor::<B, 1, burn::tensor::Int>::arange(0..t_max as i64, &device).reshape([1, 1, 1, t_max]);
+        let idx = Tensor::<1, Int>::arange(0..t_max as i64, &device).reshape([1, 1, 1, t_max]);
         let pos_mask = idx.greater(pos.reshape([1, 1, 1, 1])); // [1,1,1,T_max] Bool, true above pos
 
         let attn_output = attention(
@@ -427,7 +439,7 @@ impl<B: Backend> Qwen3Attention<B> {
         let attn_output = attn_output.movedim(1, 2).reshape([
             batch_size as i64,
             seq_len as i64,
-            (*self.num_heads * *self.head_dim) as i64,
+            (self.num_heads * self.head_dim) as i64,
         ]);
 
         linear3(&self.o_proj, attn_output, prec)
@@ -444,14 +456,22 @@ impl<B: Backend> Qwen3Attention<B> {
     /// * `arange_tmax` — `[T_max]` Int `0..T_max` (the cache capacity), the position-mask index.
     pub fn forward_with_cache_static_pre(
         &self,
-        hidden_states: Tensor<B, 3>,
-        pos: Tensor<B, 1, burn::tensor::Int>,
-        cache: &mut KVCache<B>,
+        hidden_states: Tensor<3>,
+        pos: Tensor<1, Int>,
+        cache: &mut KVCache,
         prec: Precision,
-        freqs: &Tensor<B, 1>,
-        arange_tmax: &Tensor<B, 1, burn::tensor::Int>,
-    ) -> Tensor<B, 3> {
-        self.forward_with_cache_static_pre_lp(hidden_states, pos, cache, prec, freqs, arange_tmax, None)
+        freqs: &Tensor<1>,
+        arange_tmax: &Tensor<1, Int>,
+    ) -> Tensor<3> {
+        self.forward_with_cache_static_pre_lp(
+            hidden_states,
+            pos,
+            cache,
+            prec,
+            freqs,
+            arange_tmax,
+            None,
+        )
     }
 
     /// LEFT-PAD-aware variant of [`Self::forward_with_cache_static_pre`] (P4 — prompt-length buckets).
@@ -464,23 +484,23 @@ impl<B: Backend> Qwen3Attention<B> {
     #[allow(clippy::too_many_arguments)]
     pub fn forward_with_cache_static_pre_lp(
         &self,
-        hidden_states: Tensor<B, 3>,
-        pos: Tensor<B, 1, burn::tensor::Int>,
-        cache: &mut KVCache<B>,
+        hidden_states: Tensor<3>,
+        pos: Tensor<1, Int>,
+        cache: &mut KVCache,
         prec: Precision,
-        freqs: &Tensor<B, 1>,
-        arange_tmax: &Tensor<B, 1, burn::tensor::Int>,
-        lo: Option<&Tensor<B, 1, burn::tensor::Int>>,
-    ) -> Tensor<B, 3> {
+        freqs: &Tensor<1>,
+        arange_tmax: &Tensor<1, Int>,
+        lo: Option<&Tensor<1, Int>>,
+    ) -> Tensor<3> {
         let [batch_size, seq_len, _] = hidden_states.dims(); // seq_len == 1 (decode)
 
         let query = linear3(&self.q_proj, hidden_states.clone(), prec);
         let key = linear3(&self.k_proj, hidden_states.clone(), prec);
         let value = linear3(&self.v_proj, hidden_states, prec);
 
-        let query = query.reshape([batch_size, seq_len, *self.num_heads, *self.head_dim]);
-        let key = key.reshape([batch_size, seq_len, *self.num_kv_heads, *self.head_dim]);
-        let value = value.reshape([batch_size, seq_len, *self.num_kv_heads, *self.head_dim]);
+        let query = query.reshape([batch_size, seq_len, self.num_heads, self.head_dim]);
+        let key = key.reshape([batch_size, seq_len, self.num_kv_heads, self.head_dim]);
+        let value = value.reshape([batch_size, seq_len, self.num_kv_heads, self.head_dim]);
 
         let query = self.q_norm.forward(query);
         let key = self.k_norm.forward(key);
@@ -493,11 +513,16 @@ impl<B: Backend> Qwen3Attention<B> {
         let (key, value) = cache.update_static(&pos, key, value);
         let t_max = key.dims()[1];
 
-        let n_rep = *self.num_heads / *self.num_kv_heads;
+        let n_rep = self.num_heads / self.num_kv_heads;
         let (key, value) = if n_rep > 1 {
             (
-                key.unsqueeze_dim::<5>(3).repeat(&[1, 1, 1, n_rep, 1]).flatten(2, 3),
-                value.unsqueeze_dim::<5>(3).repeat(&[1, 1, 1, n_rep, 1]).flatten(2, 3),
+                key.unsqueeze_dim::<5>(3)
+                    .repeat(&[1, 1, 1, n_rep, 1])
+                    .flatten(2, 3),
+                value
+                    .unsqueeze_dim::<5>(3)
+                    .repeat(&[1, 1, 1, n_rep, 1])
+                    .flatten(2, 3),
             )
         } else {
             (key, value)
@@ -527,7 +552,7 @@ impl<B: Backend> Qwen3Attention<B> {
         let attn_output = attn_output.movedim(1, 2).reshape([
             batch_size as i64,
             seq_len as i64,
-            (*self.num_heads * *self.head_dim) as i64,
+            (self.num_heads * self.head_dim) as i64,
         ]);
 
         linear3(&self.o_proj, attn_output, prec)

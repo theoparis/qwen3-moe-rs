@@ -69,7 +69,11 @@ fn count(n: usize) -> CubeCount {
 }
 
 fn dim() -> CubeDim {
-    CubeDim { x: THREADS, y: 1, z: 1 }
+    CubeDim {
+        x: THREADS,
+        y: 1,
+        z: 1,
+    }
 }
 
 /// One in-place FMA step on the fixed buffer (eager launch through the normal client path).

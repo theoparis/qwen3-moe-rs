@@ -16,8 +16,8 @@
 //!   RUSTFLAGS="-C target-feature=+fp16" \
 //!     cargo run --release --features cuda --example fusion_bridge_spike 2>&1 | tail -30
 
-use burn::backend::cuda::{Cuda, CudaDevice};
-use burn::tensor::{Tensor, TensorPrimitive};
+use burn::prelude::Device;
+use burn::tensor::{Device, Tensor, TensorPrimitive};
 
 use cubecl::cuda::CudaRuntime;
 use cubecl::{CubeCount, CubeDim};
@@ -29,8 +29,8 @@ use burn_cubecl::tensor::CubeTensor;
 
 use burn_cubecl_fusion::CubeFusionHandle;
 
-use burn_fusion::stream::{Operation, OperationStreams};
 use burn_fusion::FusionTensor;
+use burn_fusion::stream::{Operation, OperationStreams};
 use burn_ir::{CustomOpIr, HandleContainer, OperationIr, TensorIr, TensorStatus};
 
 /// The RAW (non-Fusion) compute backend that `Cuda` wraps. Its `FloatTensorPrimitive` is a
@@ -80,7 +80,11 @@ fn mul2_add1_cube(input: CubeTensor<CudaRuntime>) -> CubeTensor<CudaRuntime> {
     gpu_kernel::mul2_add1::launch::<f32, CudaRuntime>(
         &input.client,
         CubeCount::Static(blocks, 1, 1),
-        CubeDim { x: threads, y: 1, z: 1 },
+        CubeDim {
+            x: threads,
+            y: 1,
+            z: 1,
+        },
         input.as_tensor_arg(1),
         output.as_tensor_arg(1),
     )
@@ -116,7 +120,7 @@ impl Operation<Fr> for Mul2Add1Op {
 }
 
 /// Apply the custom kernel to a tensor living on the default `Cuda` (Fusion) backend.
-fn mul2_add1_fusion(x: Tensor<Cuda, 1>) -> Tensor<Cuda, 1> {
+fn mul2_add1_fusion(x: Tensor<1>) -> Tensor<1> {
     // Get the Fusion float primitive (a lazy `FusionTensor`) out of the host tensor.
     let prim: FusionTensor<Fr> = x.into_primitive().tensor();
 
@@ -145,7 +149,10 @@ fn mul2_add1_fusion(x: Tensor<Cuda, 1>) -> Tensor<Cuda, 1> {
         OperationIr::Custom(desc.clone()),
         Mul2Add1Op { desc },
     );
-    let out = outputs.into_iter().next().expect("custom op should yield one output");
+    let out = outputs
+        .into_iter()
+        .next()
+        .expect("custom op should yield one output");
 
     Tensor::from_primitive(TensorPrimitive::Float(out))
 }
@@ -158,22 +165,22 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 }
 
 fn main() {
-    let device = CudaDevice::default();
+    let device = Device::cuda(0);
     println!("device: {device:?} | backend: Cuda = Fusion<CubeBackend<CudaRuntime>>");
 
     let values: [f32; 8] = [-3.0, -1.0, 0.0, 0.5, 1.0, 2.5, 7.0, 100.0];
     let n = values.len();
 
     // ---- Reference (pure Burn ops on the Fusion backend) --------------------------------------
-    let x_ref = Tensor::<Cuda, 1>::from_floats(values, &device);
+    let x_ref = Tensor::<1>::from_floats(values, &device);
     let reference = (x_ref * 2.0 + 1.0).into_data().to_vec::<f32>().unwrap();
 
     // ---- RAW CubeBackend path (no Fusion): does the kernel itself work? ------------------------
     let raw_ok = {
-        let x_raw = Tensor::<Inner, 1>::from_floats(values, &device);
+        let x_raw = Tensor::<1>::from_floats(values, &device);
         let prim: CubeTensor<CudaRuntime> = x_raw.into_primitive().tensor();
         let out = mul2_add1_cube(prim);
-        let got = Tensor::<Inner, 1>::from_primitive(TensorPrimitive::Float(out))
+        let got = Tensor::<1>::from_primitive(TensorPrimitive::Float(out))
             .into_data()
             .to_vec::<f32>()
             .unwrap();
@@ -183,7 +190,7 @@ fn main() {
     };
 
     // ---- Fusion bridge path -------------------------------------------------------------------
-    let x = Tensor::<Cuda, 1>::from_floats(values, &device);
+    let x = Tensor::<1>::from_floats(values, &device);
     let got = mul2_add1_fusion(x).into_data().to_vec::<f32>().unwrap();
     let diff = max_abs_diff(&got, &reference);
     println!("FUSION bridge    : got={got:?} max_abs_diff={diff:.3e}");

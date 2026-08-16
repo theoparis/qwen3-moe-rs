@@ -90,7 +90,10 @@ fn run_case(case_idx: usize, k: usize, n: usize) {
         "NVFP4 round-trip cosine too low: {:.8}",
         metrics.cosine
     );
-    assert!(zero_exact, "dead zero column did not dequantize to exact zero");
+    assert!(
+        zero_exact,
+        "dead zero column did not dequantize to exact zero"
+    );
 }
 
 struct Metrics {

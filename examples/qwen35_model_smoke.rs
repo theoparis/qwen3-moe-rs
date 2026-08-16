@@ -5,7 +5,7 @@
 //!   ./target/release/examples/qwen35_model_smoke
 
 use burn::{
-    backend::cuda::{Cuda, CudaDevice},
+    prelude::Device,
     tensor::{Int, Tensor},
 };
 use qwen3_burn::{Qwen3_5LayerType, Qwen3_5MoeConfig};
@@ -48,13 +48,19 @@ fn smoke_config() -> Qwen3_5MoeConfig {
     }
 }
 
-fn assert_all_finite(tensor: Tensor<B, 3>, what: &str) {
-    let values = tensor.into_data().to_vec::<f32>().expect("read smoke tensor");
-    assert!(values.iter().all(|v| v.is_finite()), "{what} produced NaN/Inf");
+fn assert_all_finite(tensor: Tensor<3>, what: &str) {
+    let values = tensor
+        .into_data()
+        .to_vec::<f32>()
+        .expect("read smoke tensor");
+    assert!(
+        values.iter().all(|v| v.is_finite()),
+        "{what} produced NaN/Inf"
+    );
 }
 
 fn main() {
-    let device = CudaDevice::default();
+    let device = Device::cuda(0);
     let cfg = smoke_config();
     cfg.validate().expect("smoke config must be valid");
 
@@ -70,21 +76,21 @@ fn main() {
         .count();
     assert_eq!((linear_layers, full_layers), (30, 10));
 
-    let model = cfg.init_causal_lm::<B>(&device);
+    let model = cfg.init_causal_lm(&device);
     let mut cache = model.model.new_cache();
 
-    let input_ids = Tensor::<B, 2, Int>::from_data(
+    let input_ids = Tensor::<2, Int>::from_data(
         [[17i64, 23_001, 491, 88_000, 7, 120_337, 3_101, 248_000]],
         &device,
     );
-    let positions = Tensor::<B, 2, Int>::from_data([[0i64, 1, 2, 3, 4, 5, 6, 7]], &device);
+    let positions = Tensor::<2, Int>::from_data([[0i64, 1, 2, 3, 4, 5, 6, 7]], &device);
     let logits = model.forward(input_ids, positions, &mut cache);
     assert_eq!(logits.dims(), [1, 8, 248_320]);
     assert_all_finite(logits, "prefill logits");
 
     for step in 0..2 {
-        let tok = Tensor::<B, 2, Int>::from_data([[42i64 + step as i64]], &device);
-        let pos = Tensor::<B, 2, Int>::from_data([[(8 + step) as i64]], &device);
+        let tok = Tensor::<2, Int>::from_data([[42i64 + step as i64]], &device);
+        let pos = Tensor::<2, Int>::from_data([[(8 + step) as i64]], &device);
         let logits = model.forward(tok, pos, &mut cache);
         assert_eq!(logits.dims(), [1, 1, 248_320]);
         assert_all_finite(logits, "decode logits");

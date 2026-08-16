@@ -48,12 +48,11 @@
 //! trainer over. Also: the host path it replaces samples in forced-f32 (`to_vec::<f32>`) while this path
 //! uses the backend's native float dtype — they would diverge if the rollout is ever run below f32.
 
-use burn::prelude::Backend;
-use burn::tensor::{Distribution, Int, Tensor};
+use burn::tensor::{DType, Distribution, Int, Tensor};
 
 /// `logsumexp` over the vocab axis of `[N, V]`, kept as `[N, 1]`. Numerically stable (subtract the
 /// per-row max before `exp`). This is the RAW-logits denominator of the pre-warp log-prob.
-pub fn logsumexp_dim1<B: Backend>(logits: Tensor<B, 2>) -> Tensor<B, 2> {
+pub fn logsumexp_dim1(logits: Tensor<2>) -> Tensor<2> {
     let m = logits.clone().max_dim(1); // [N, 1]
     let shifted = logits - m.clone(); // broadcast subtract
     shifted.exp().sum_dim(1).log() + m // [N, 1]
@@ -68,26 +67,30 @@ pub fn logsumexp_dim1<B: Backend>(logits: Tensor<B, 2>) -> Tensor<B, 2> {
 /// The `u` draw uses the backend RNG. NOTE: Burn's `B::seed` sets a PROCESS-GLOBAL generator and
 /// ignores the device, so reproducibility holds only if `B::seed` is called AND the global order of
 /// every random op in the process is fixed — it is not per-device or per-rollout.
-pub fn device_select_tokens<B: Backend>(logits: &Tensor<B, 2>, temperature: f32) -> Tensor<B, 2, Int> {
-    if temperature <= 0.0 {
-        return logits.clone().argmax(1); // [N, 1]
-    }
-    let [n, v] = logits.dims();
-    let device = logits.device();
-    // u ~ Uniform[0,1) (low inclusive, high exclusive). Clamp strictly inside (0,1) so the double log
-    // never hits ln(0)=−inf at the endpoints; the clamp window is far below sampling resolution.
-    let u = Tensor::<B, 2>::random([n, v], Distribution::Uniform(0.0, 1.0), &device).clamp(1e-9, 1.0 - 1e-7);
-    let gumbel = u.log().neg().log().neg(); // g = −ln(−ln u)
-    (logits.clone() / temperature + gumbel).argmax(1) // [N, 1]
+pub fn device_select_tokens(logits: &Tensor<2>, temperature: f32) -> Tensor<2, Int> {
+    // Flex's default int dtype is I32; the rest of this crate treats token ids as I64.
+    let tokens = if temperature <= 0.0 {
+        logits.clone().argmax(1)
+    } else {
+        let [n, v] = logits.dims();
+        let device = logits.device();
+        // u ~ Uniform[0,1) (low inclusive, high exclusive). Clamp strictly inside (0,1) so the double log
+        // never hits ln(0)=−inf at the endpoints; the clamp window is far below sampling resolution.
+        let u = Tensor::<2>::random([n, v], Distribution::Uniform(0.0, 1.0), &device)
+            .clamp(1e-9, 1.0 - 1e-7);
+        let gumbel = u.log().neg().log().neg(); // g = −ln(−ln u)
+        (logits.clone() / temperature + gumbel).argmax(1)
+    };
+    tokens.cast(DType::I64)
 }
 
 /// Raw (pre-warp) log-prob `[N]` of the chosen `tokens` `[N, 1]` under `logits` `[N, V]`, given the
 /// precomputed RAW `lse` `[N, 1]`: `logp = gather(logits, tokens) − lse`. Pure device gather.
-pub fn device_token_logp<B: Backend>(
-    logits: &Tensor<B, 2>,
-    tokens: &Tensor<B, 2, Int>,
-    lse: &Tensor<B, 2>,
-) -> Tensor<B, 1> {
+pub fn device_token_logp(
+    logits: &Tensor<2>,
+    tokens: &Tensor<2, Int>,
+    lse: &Tensor<2>,
+) -> Tensor<1> {
     let [n, _v] = logits.dims();
     (logits.clone().gather(1, tokens.clone()) - lse.clone()).reshape([n])
 }
@@ -100,10 +103,7 @@ pub fn device_token_logp<B: Backend>(
 /// `logp` is the RAW (pre-warp) log-prob of the sampled token (`logit[token] − logsumexp(RAW logits)`),
 /// so it is bit-equivalent to `grpo::rollout::raw_token_logprob` for whatever token selection picked —
 /// greedy argmax (`temperature == 0`) or Gumbel-max categorical (`temperature > 0`).
-pub fn device_sample_step<B: Backend>(
-    logits: Tensor<B, 2>,
-    temperature: f32,
-) -> (Tensor<B, 1, Int>, Tensor<B, 1>) {
+pub fn device_sample_step(logits: Tensor<2>, temperature: f32) -> (Tensor<1, Int>, Tensor<1>) {
     let [n, _v] = logits.dims();
     let lse = logsumexp_dim1(logits.clone()); // RAW lse [N, 1]
     let tokens = device_select_tokens(&logits, temperature); // [N, 1]
@@ -114,9 +114,7 @@ pub fn device_sample_step<B: Backend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
-
-    type B = NdArray;
+    use burn::tensor::Device;
 
     /// Pure-host reference: `logit[token] − logsumexp(raw row)` (mirrors `raw_token_logprob`).
     fn host_raw_logp(row: &[f32], token: usize) -> f32 {
@@ -127,10 +125,10 @@ mod tests {
 
     #[test]
     fn greedy_picks_argmax_with_raw_logp() {
-        let dev = Default::default();
+        let dev = Device::flex();
         // two rows; argmax at col 2 then col 0
         let data = [0.0f32, 1.0, 3.0, 2.0, 5.0, 1.0, -1.0, 0.5];
-        let logits = Tensor::<B, 1>::from_floats(data.as_slice(), &dev).reshape([2, 4]);
+        let logits = Tensor::<1>::from_floats(data.as_slice(), &dev).reshape([2, 4]);
         let (toks, logp) = device_sample_step(logits, 0.0);
         let tv = toks.into_data().to_vec::<i64>().unwrap();
         let lv = logp.into_data().to_vec::<f32>().unwrap();
@@ -141,11 +139,11 @@ mod tests {
 
     #[test]
     fn temperature_logp_is_raw_for_sampled_token() {
-        let dev = Default::default();
-        <B as Backend>::seed(&dev, 42);
+        let dev = Device::flex();
+        dev.seed(42);
         let n = 8usize;
         let v = 16usize;
-        let logits = Tensor::<B, 2>::random([n, v], Distribution::Normal(0.0, 1.0), &dev);
+        let logits = Tensor::<2>::random([n, v], Distribution::Normal(0.0, 1.0), &dev);
         let rows = logits.clone().into_data().to_vec::<f32>().unwrap();
         let (toks, logp) = device_sample_step(logits, 0.8);
         let tv = toks.into_data().to_vec::<i64>().unwrap();
@@ -153,7 +151,11 @@ mod tests {
         for i in 0..n {
             let row = &rows[i * v..(i + 1) * v];
             let want = host_raw_logp(row, tv[i] as usize);
-            assert!((lv[i] - want).abs() < 1e-4, "row {i}: device logp {} vs raw {want}", lv[i]);
+            assert!(
+                (lv[i] - want).abs() < 1e-4,
+                "row {i}: device logp {} vs raw {want}",
+                lv[i]
+            );
         }
     }
 }

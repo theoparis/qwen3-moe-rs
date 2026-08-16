@@ -6,11 +6,11 @@ use std::path::{Path, PathBuf};
 use burn::{
     module::{Param, ParamId},
     nn::{Embedding, Linear, RmsNorm},
-    prelude::Backend,
+    prelude::Device,
     store::{BurnpackStore, ModuleStore, PyTorchToBurnAdapter, SafetensorsStore, TensorSnapshot},
     tensor::{DType, Tensor},
 };
-use rootcause::{prelude::ResultExt, Report};
+use rootcause::{Report, prelude::ResultExt};
 use thiserror::Error;
 
 #[cfg(feature = "cuda")]
@@ -19,18 +19,18 @@ use crate::nvfp4_linear::{Nvfp4Linear, QuantLinear};
 use crate::nvidia_ckpt::quantize_dequantized_expert_to_fp8;
 #[cfg(feature = "cuda")]
 use crate::nvidia_ckpt::{
-    collect_quant_groups, dense_fp8_parts_from_reader, dense_fp8_role, expected_quantized_counts,
-    expert_projection_parts_from_reader, fuse_expert_nvfp4_parts, nvfp4_linear_parts_from_reader,
-    parse_expert_base, quant_group_keys, shard_index, shared_nvfp4_role, QuantGroupKind, RawTensor,
-    ShardReader,
-};
-use crate::qwen3_5::{
-    parse_weight_map, Qwen3_5DecoderLayer, Qwen3_5FullAttention, Qwen3_5FullAttnLayer,
-    Qwen3_5GdnAttention, Qwen3_5GdnLayer, Qwen3_5MoeConfig, Qwen3_5MoeForCausalLM,
-    Qwen3_5SharedMoeBlock,
+    QuantGroupKind, RawTensor, ShardReader, collect_quant_groups, dense_fp8_parts_from_reader,
+    dense_fp8_role, expected_quantized_counts, expert_projection_parts_from_reader,
+    fuse_expert_nvfp4_parts, nvfp4_linear_parts_from_reader, parse_expert_base, quant_group_keys,
+    shard_index, shared_nvfp4_role,
 };
 #[cfg(feature = "cuda")]
 use crate::qwen3_5::{ExpertNvfp4, ExpertNvfp4Sidecar, ExpertQuantSidecar, QuantSidecar};
+use crate::qwen3_5::{
+    Qwen3_5DecoderLayer, Qwen3_5FullAttention, Qwen3_5FullAttnLayer, Qwen3_5GdnAttention,
+    Qwen3_5GdnLayer, Qwen3_5MoeConfig, Qwen3_5MoeForCausalLM, Qwen3_5SharedMoeBlock,
+    parse_weight_map,
+};
 #[cfg(feature = "cuda")]
 use crate::w8a16_linear::W8A16Linear;
 use crate::{Qwen3ForCausalLM, Qwen3Model, Qwen3MoeForCausalLM};
@@ -101,7 +101,7 @@ fn create_safetensors_store_causal_lm(path: PathBuf) -> SafetensorsStore {
         .allow_partial(true)
 }
 
-impl<B: Backend> Qwen3Model<B> {
+impl Qwen3Model {
     /// Load weights and return self (builder pattern).
     pub fn with_weights(
         mut self,
@@ -124,9 +124,7 @@ impl<B: Backend> Qwen3Model<B> {
                 weights.apply_to(self).context(ModelLoadError::LoadError)?;
             }
             Some("bpk") | None => {
-                let mut weights = BurnpackStore::from_file(path)
-                    .auto_extension(false)
-                    .zero_copy(true);
+                let mut weights = BurnpackStore::from_file(path).auto_extension(false);
                 weights.apply_to(self).context(ModelLoadError::LoadError)?;
             }
             _ => {
@@ -138,7 +136,7 @@ impl<B: Backend> Qwen3Model<B> {
     }
 }
 
-impl<B: Backend> Qwen3ForCausalLM<B> {
+impl Qwen3ForCausalLM {
     /// Load weights and return self (builder pattern).
     pub fn with_weights(
         mut self,
@@ -219,9 +217,7 @@ impl<B: Backend> Qwen3ForCausalLM<B> {
                 weights.apply_to(self).context(ModelLoadError::LoadError)?;
             }
             Some("bpk") | None => {
-                let mut weights = BurnpackStore::from_file(path)
-                    .auto_extension(false)
-                    .zero_copy(true);
+                let mut weights = BurnpackStore::from_file(path).auto_extension(false);
                 weights.apply_to(self).context(ModelLoadError::LoadError)?;
             }
             _ => {
@@ -262,7 +258,7 @@ fn parse_expert_key(key: &str) -> Option<(usize, usize, usize)> {
     Some((layer, proj, expert))
 }
 
-impl<B: Backend> Qwen3MoeForCausalLM<B> {
+impl Qwen3MoeForCausalLM {
     /// Load a single-file `.safetensors` (or `.bpk`) Qwen3-MoE checkpoint. (Qwen3-MoE checkpoints are
     /// normally sharded — see [`load_weights_sharded`](Self::load_weights_sharded).) The safetensors
     /// path uses the single-owner contiguous expert loader (see [`load_moe_safetensors`](Self::load_moe_safetensors)).
@@ -272,9 +268,7 @@ impl<B: Backend> Qwen3MoeForCausalLM<B> {
         match extension.as_deref() {
             Some("safetensors") => self.load_moe_safetensors(&[path]),
             Some("bpk") | None => {
-                let mut weights = BurnpackStore::from_file(path)
-                    .auto_extension(false)
-                    .zero_copy(true);
+                let mut weights = BurnpackStore::from_file(path).auto_extension(false);
                 weights.apply_to(self).context(ModelLoadError::LoadError)?;
                 Ok(())
             }
@@ -402,15 +396,15 @@ impl<B: Backend> Qwen3MoeForCausalLM<B> {
         // PyTorch→Burn transpose: HF `[d_out, d_in]` → `transpose()` → Burn `[d_in, d_out]`
         // (gate/up `[I,H]→[H,I]`, down `[H,I]→[I,H]`), then `cat` over the new leading expert axis.
         for l in 0..n_layers {
-            let mut built: Vec<Tensor<B, 3>> = Vec::with_capacity(3);
+            let mut built: Vec<Tensor<3>> = Vec::with_capacity(3);
             for p in 0..3 {
-                let mut slabs: Vec<Tensor<B, 3>> = Vec::with_capacity(n_experts);
+                let mut slabs: Vec<Tensor<3>> = Vec::with_capacity(n_experts);
                 for e in 0..n_experts {
                     let snap = &expert_snaps[&(l, p, e)];
                     let data = snap
                         .to_data()
                         .map_err(|_| Report::new(ModelLoadError::LoadError))?;
-                    let raw = Tensor::<B, 2>::from_data_dtype(data, &device, weight_dtype); // [out,in]
+                    let raw = Tensor::<2>::from_data(data, (&device, weight_dtype)); // [out,in]
                     let slab = raw.transpose(); // [in,out]
                     let [d0, d1] = slab.dims();
                     slabs.push(slab.reshape([1, d0, d1]));
@@ -426,7 +420,7 @@ impl<B: Backend> Qwen3MoeForCausalLM<B> {
     }
 }
 
-impl<B: Backend> Qwen3_5MoeForCausalLM<B> {
+impl Qwen3_5MoeForCausalLM {
     pub fn verify_weights_sharded(
         config: &Qwen3_5MoeConfig,
         dir: impl AsRef<Path>,
@@ -439,7 +433,7 @@ impl<B: Backend> Qwen3_5MoeForCausalLM<B> {
         dir: impl AsRef<Path>,
     ) -> Result<Qwen35LoadVerifyReport, Report<ModelLoadError>> {
         let dir = dir.as_ref();
-        let config = self.model.config.0.clone();
+        let config = self.model.config.clone();
         let report = verify_qwen35_weight_map(&config, dir)?;
         if !report.pass() {
             eprintln!("[qwen3_5 load] verify failed before materializing weights: {report:?}");
@@ -476,6 +470,66 @@ impl<B: Backend> Qwen3_5MoeForCausalLM<B> {
         Ok(report)
     }
 
+    /// Load everything EXCEPT the routed-expert weight stacks (`mlp.experts.gate_up_proj` /
+    /// `mlp.experts.down_proj`), leaving those `Param<Tensor<3>>`s at whatever `init_causal_lm` set
+    /// them to (a tiny placeholder — see `moe.rs`/`qwen3_5/mod.rs` init). This is
+    /// `docs/MEMORY_STREAMING_PLAN.md`'s "resident core" load path: attention, GDN, router, norms,
+    /// embedding/head, and shared-expert weights (small relative to routed experts) are fully
+    /// materialized as usual; routed experts are meant to be fetched on demand later via
+    /// [`crate::expert_stream::ExpertSlotPool`] instead of being resident. Structural verification
+    /// (`verify_qwen35_weight_map`) still runs against the FULL expected weight set, since we still
+    /// want a loud failure on a genuinely corrupt/incomplete checkpoint — only the two big per-layer
+    /// tensors are skipped during materialization.
+    pub fn load_weights_sharded_resident_core(
+        &mut self,
+        dir: impl AsRef<Path>,
+    ) -> Result<Qwen35LoadVerifyReport, Report<ModelLoadError>> {
+        let dir = dir.as_ref();
+        let config = self.model.config.clone();
+        let report = verify_qwen35_weight_map(&config, dir)?;
+        if !report.pass() {
+            eprintln!("[qwen3_5 load] verify failed before materializing weights: {report:?}");
+            return Err(Report::new(ModelLoadError::IncompleteLoad));
+        }
+
+        let index = read_qwen35_weight_map(dir)?;
+        let mut by_shard: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut skipped = 0usize;
+        for (key, shard) in index {
+            if key.starts_with("model.visual.") {
+                continue;
+            }
+            if key.ends_with("mlp.experts.gate_up_proj") || key.ends_with("mlp.experts.down_proj") {
+                skipped += 1;
+                continue;
+            }
+            by_shard.entry(shard).or_default().push(key);
+        }
+
+        let device = self.model.device();
+        for (shard, keys) in by_shard {
+            let path = dir.join(&shard);
+            let mut store = SafetensorsStore::from_file(path);
+            let snaps = store
+                .get_all_snapshots()
+                .context(ModelLoadError::LoadError)?;
+            for key in keys {
+                let snap = snaps
+                    .get(&key)
+                    .ok_or_else(|| Report::new(ModelLoadError::IncompleteLoad))?;
+                self.load_qwen35_tensor(&key, snap, &device)
+                    .map_err(|msg| {
+                        eprintln!("[qwen3_5 load] {msg}");
+                        Report::new(ModelLoadError::LoadError)
+                    })?;
+            }
+        }
+        eprintln!(
+            "[qwen3_5 load] resident-core load: skipped {skipped} routed-expert tensor(s), fetch them via ExpertSlotPool instead"
+        );
+        Ok(report)
+    }
+
     /// Load NVIDIA's ModelOpt mixed-precision Qwen3.6 NVFP4 checkpoint.
     ///
     /// Dense GDN/full-attention projections are loaded as fp8 sidecars from raw E4M3 bytes
@@ -494,7 +548,7 @@ impl<B: Backend> Qwen3_5MoeForCausalLM<B> {
         dir: impl AsRef<Path>,
     ) -> Result<(), Report<ModelLoadError>> {
         let dir = dir.as_ref();
-        let config = self.model.config.0.clone();
+        let config = self.model.config.clone();
         let index = shard_index(dir).map_err(|msg| {
             eprintln!("[load_nvidia_nvfp4] {msg}");
             Report::new(ModelLoadError::LoadError)
@@ -660,7 +714,7 @@ impl<B: Backend> Qwen3_5MoeForCausalLM<B> {
             let w = crate::nvidia_ckpt::dequant_nvfp4_linear_to_kn(&lm_parts);
             self.lm_head.weight = Param::initialized(
                 ParamId::new(),
-                Tensor::<B, 2>::from_data(TensorData::new(w, [lm_parts.k, lm_parts.n]), &device)
+                Tensor::<2>::from_data(TensorData::new(w, [lm_parts.k, lm_parts.n]), &device)
                     .cast(DType::BF16),
             );
             self.lm_head_quant = QuantSidecar(None);
@@ -796,7 +850,7 @@ impl<B: Backend> Qwen3_5MoeForCausalLM<B> {
         &mut self,
         key: &str,
         snap: &TensorSnapshot,
-        device: &B::Device,
+        device: &Device,
     ) -> Result<(), String> {
         if key == "lm_head.weight" {
             return set_linear(&mut self.lm_head, snap, device);
@@ -814,7 +868,7 @@ impl<B: Backend> Qwen3_5MoeForCausalLM<B> {
         &mut self,
         rest: &str,
         snap: &TensorSnapshot,
-        device: &B::Device,
+        device: &Device,
     ) -> Result<(), String> {
         if rest == "embed_tokens.weight" {
             return set_embedding(&mut self.model.embed_tokens, snap, device);
@@ -838,7 +892,7 @@ impl<B: Backend> Qwen3_5MoeForCausalLM<B> {
         &mut self,
         rest: &str,
         snap: &TensorSnapshot,
-        device: &B::Device,
+        device: &Device,
     ) -> Result<(), String> {
         match rest {
             "pre_fc_norm_embedding.weight" => {
@@ -920,7 +974,7 @@ pub fn verify_qwen35_weight_map(
             seen.insert(key.clone());
             mapped_tensors += 1;
             param_count += elems;
-            if &snap.shape != expect {
+            if snap.shape.as_slice() != expect.as_slice() {
                 shape_mismatches.push(format!(
                     "{key}: checkpoint {:?}, expected {:?}",
                     snap.shape, expect
@@ -989,10 +1043,10 @@ fn print_load_mem(stage: &str) {
 }
 
 #[cfg(feature = "cuda")]
-fn experts_by_layer_mut<B: Backend>(
-    m: &mut Qwen3_5MoeForCausalLM<B>,
+fn experts_by_layer_mut(
+    m: &mut Qwen3_5MoeForCausalLM,
     layer: usize,
-) -> Option<&mut crate::qwen3_5::Qwen3_5FusedExperts<B>> {
+) -> Option<&mut crate::qwen3_5::Qwen3_5FusedExperts> {
     match m.model.layers.get_mut(layer)? {
         Qwen3_5DecoderLayer::Linear(layer) => Some(&mut layer.mlp.experts),
         Qwen3_5DecoderLayer::Full(layer) => Some(&mut layer.mlp.experts),
@@ -1000,20 +1054,17 @@ fn experts_by_layer_mut<B: Backend>(
 }
 
 #[cfg(feature = "cuda")]
-fn set_expert_placeholders<B: Backend>(
-    experts: &mut crate::qwen3_5::Qwen3_5FusedExperts<B>,
-    device: &B::Device,
-) {
-    let tiny = Tensor::<B, 3>::from_data(TensorData::new(vec![0.0f32], [1, 1, 1]), device);
+fn set_expert_placeholders(experts: &mut crate::qwen3_5::Qwen3_5FusedExperts, device: &Device) {
+    let tiny = Tensor::<3>::from_data(TensorData::new(vec![0.0f32], [1, 1, 1]), device);
     experts.gate_up_proj = Param::initialized(ParamId::new(), tiny.clone());
     experts.down_proj = Param::initialized(ParamId::new(), tiny);
 }
 
 #[cfg(feature = "cuda")]
-fn set_quant_sidecar<B: Backend>(
-    m: &mut Qwen3_5MoeForCausalLM<B>,
+fn set_quant_sidecar(
+    m: &mut Qwen3_5MoeForCausalLM,
     role: &str,
-    q: QuantLinear<B>,
+    q: QuantLinear,
 ) -> Result<(), String> {
     let slot = quant_sidecar_slot_mut(m, role)
         .ok_or_else(|| format!("no quant sidecar slot for role {role}"))?;
@@ -1022,10 +1073,10 @@ fn set_quant_sidecar<B: Backend>(
 }
 
 #[cfg(feature = "cuda")]
-fn quant_sidecar_slot_mut<'a, B: Backend>(
-    m: &'a mut Qwen3_5MoeForCausalLM<B>,
+fn quant_sidecar_slot_mut<'a>(
+    m: &'a mut Qwen3_5MoeForCausalLM,
     role: &str,
-) -> Option<&'a mut Option<QuantLinear<B>>> {
+) -> Option<&'a mut Option<QuantLinear>> {
     if role == "lm_head" {
         return Some(&mut m.lm_head_quant.0);
     }
@@ -1055,10 +1106,10 @@ fn quant_sidecar_slot_mut<'a, B: Backend>(
 }
 
 #[cfg(feature = "cuda")]
-fn quant_mlp_sidecar_slot_mut<'a, B: Backend>(
-    mlp: &'a mut Qwen3_5SharedMoeBlock<B>,
+fn quant_mlp_sidecar_slot_mut<'a>(
+    mlp: &'a mut Qwen3_5SharedMoeBlock,
     tail: &str,
-) -> Option<&'a mut Option<QuantLinear<B>>> {
+) -> Option<&'a mut Option<QuantLinear>> {
     match tail {
         "moe.shared.gate_proj" => Some(&mut mlp.shared_expert.gate_proj_fp8.0),
         "moe.shared.up_proj" => Some(&mut mlp.shared_expert.up_proj_fp8.0),
@@ -1081,11 +1132,11 @@ fn split_index<'a>(rest: &'a str, label: &str) -> Result<(usize, &'a str), Strin
     Ok((idx, suffix))
 }
 
-fn load_decoder_layer<B: Backend>(
-    layer: &mut Qwen3_5DecoderLayer<B>,
+fn load_decoder_layer(
+    layer: &mut Qwen3_5DecoderLayer,
     suffix: &str,
     snap: &TensorSnapshot,
-    device: &B::Device,
+    device: &Device,
 ) -> Result<(), String> {
     match layer {
         Qwen3_5DecoderLayer::Linear(layer) => load_gdn_layer(layer, suffix, snap, device),
@@ -1093,11 +1144,11 @@ fn load_decoder_layer<B: Backend>(
     }
 }
 
-fn load_gdn_layer<B: Backend>(
-    layer: &mut Qwen3_5GdnLayer<B>,
+fn load_gdn_layer(
+    layer: &mut Qwen3_5GdnLayer,
     suffix: &str,
     snap: &TensorSnapshot,
-    device: &B::Device,
+    device: &Device,
 ) -> Result<(), String> {
     match suffix {
         "input_layernorm.weight" => return set_norm(&mut layer.input_layernorm, snap, device),
@@ -1115,11 +1166,11 @@ fn load_gdn_layer<B: Backend>(
     Err(format!("unhandled GDN layer tensor suffix {suffix}"))
 }
 
-fn load_full_layer<B: Backend>(
-    layer: &mut Qwen3_5FullAttnLayer<B>,
+fn load_full_layer(
+    layer: &mut Qwen3_5FullAttnLayer,
     suffix: &str,
     snap: &TensorSnapshot,
-    device: &B::Device,
+    device: &Device,
 ) -> Result<(), String> {
     match suffix {
         "input_layernorm.weight" => return set_norm(&mut layer.input_layernorm, snap, device),
@@ -1139,11 +1190,11 @@ fn load_full_layer<B: Backend>(
     ))
 }
 
-fn load_gdn_attention<B: Backend>(
-    attn: &mut Qwen3_5GdnAttention<B>,
+fn load_gdn_attention(
+    attn: &mut Qwen3_5GdnAttention,
     rest: &str,
     snap: &TensorSnapshot,
-    device: &B::Device,
+    device: &Device,
 ) -> Result<(), String> {
     match rest {
         "in_proj_qkv.weight" => set_linear(&mut attn.in_proj_qkv, snap, device),
@@ -1162,11 +1213,11 @@ fn load_gdn_attention<B: Backend>(
     }
 }
 
-fn load_full_attention<B: Backend>(
-    attn: &mut Qwen3_5FullAttention<B>,
+fn load_full_attention(
+    attn: &mut Qwen3_5FullAttention,
     rest: &str,
     snap: &TensorSnapshot,
-    device: &B::Device,
+    device: &Device,
 ) -> Result<(), String> {
     match rest {
         "q_proj.weight" => set_linear(&mut attn.q_proj, snap, device),
@@ -1179,11 +1230,11 @@ fn load_full_attention<B: Backend>(
     }
 }
 
-fn load_mlp<B: Backend>(
-    mlp: &mut Qwen3_5SharedMoeBlock<B>,
+fn load_mlp(
+    mlp: &mut Qwen3_5SharedMoeBlock,
     rest: &str,
     snap: &TensorSnapshot,
-    device: &B::Device,
+    device: &Device,
 ) -> Result<(), String> {
     match rest {
         "gate.weight" => set_linear(&mut mlp.gate, snap, device),
@@ -1201,37 +1252,29 @@ fn load_mlp<B: Backend>(
     }
 }
 
-fn set_embedding<B: Backend>(
-    embedding: &mut Embedding<B>,
+fn set_embedding(
+    embedding: &mut Embedding,
     snap: &TensorSnapshot,
-    device: &B::Device,
+    device: &Device,
 ) -> Result<(), String> {
     let data = snap
         .to_data()
         .map_err(|e| format!("load embedding data: {e:?}"))?;
-    let tensor = Tensor::<B, 2>::from_data_dtype(data, device, snap.dtype);
+    let tensor = Tensor::<2>::from_data(data, (device, snap.dtype));
     embedding.weight = Param::initialized(ParamId::new(), tensor);
     Ok(())
 }
 
-fn set_linear<B: Backend>(
-    linear: &mut Linear<B>,
-    snap: &TensorSnapshot,
-    device: &B::Device,
-) -> Result<(), String> {
+fn set_linear(linear: &mut Linear, snap: &TensorSnapshot, device: &Device) -> Result<(), String> {
     let data = snap
         .to_data()
         .map_err(|e| format!("load linear data: {e:?}"))?;
-    let tensor = Tensor::<B, 2>::from_data_dtype(data, device, snap.dtype).transpose();
+    let tensor = Tensor::<2>::from_data(data, (device, snap.dtype)).transpose();
     linear.weight = Param::initialized(ParamId::new(), tensor);
     Ok(())
 }
 
-fn set_norm<B: Backend>(
-    norm: &mut RmsNorm<B>,
-    snap: &TensorSnapshot,
-    device: &B::Device,
-) -> Result<(), String> {
+fn set_norm(norm: &mut RmsNorm, snap: &TensorSnapshot, device: &Device) -> Result<(), String> {
     // qwen3_5_moe uses Gemma-style (1 + weight) RMSNorm — the stored gamma is the DELTA from 1.0.
     // The checkpoint's input/post-attention layernorm weights are centered at ~0 (mean 0.03 / -0.10,
     // with negative values), so a plain `x_normed * gamma` multiplies each sublayer's input by ~0,
@@ -1243,7 +1286,7 @@ fn set_norm<B: Backend>(
     let data = snap
         .to_data()
         .map_err(|e| format!("load norm gamma: {e:?}"))?;
-    let tensor = Tensor::<B, 1>::from_data_dtype(data, device, snap.dtype)
+    let tensor = Tensor::<1>::from_data(data, (device, snap.dtype))
         .cast(DType::F32)
         .add_scalar(1.0);
     norm.gamma = Param::initialized(ParamId::new(), tensor);
@@ -1253,18 +1296,18 @@ fn set_norm<B: Backend>(
 /// PLAIN RMSNorm gamma load (no +1.0 offset). Used ONLY for the GDN GatedDeltaNet output norm
 /// (`linear_attn.norm`, the Mamba2-style RMSNormGated `self.weight * x`), which stores an absolute
 /// gamma (~0.88 across all GDN layers, all-positive) — unlike the model's regular (1+weight) RMSNorm.
-fn set_norm_plain<B: Backend>(
-    norm: &mut RmsNorm<B>,
+fn set_norm_plain(
+    norm: &mut RmsNorm,
     snap: &TensorSnapshot,
-    device: &B::Device,
+    device: &Device,
 ) -> Result<(), String> {
     set_param1(&mut norm.gamma, snap, device)
 }
 
-fn set_param1<B: Backend>(
-    param: &mut Param<Tensor<B, 1>>,
+fn set_param1(
+    param: &mut Param<Tensor<1>>,
     snap: &TensorSnapshot,
-    device: &B::Device,
+    device: &Device,
 ) -> Result<(), String> {
     let data = snap
         .to_data()
@@ -1273,20 +1316,20 @@ fn set_param1<B: Backend>(
     // The activation stream is F32 (linear3/matmul_out_in always output F32 — "F32 activations, bf16
     // matmul-compute"), so load these in F32 to avoid F32-activation × bf16-gamma DTypeMismatch in the
     // norms. Negligible memory (1-D). Large 2-D/3-D weights stay bf16 (cast to bf16 inside linear3).
-    let tensor = Tensor::<B, 1>::from_data_dtype(data, device, snap.dtype).cast(DType::F32);
+    let tensor = Tensor::<1>::from_data(data, (device, snap.dtype)).cast(DType::F32);
     *param = Param::initialized(ParamId::new(), tensor);
     Ok(())
 }
 
-fn set_param3<B: Backend>(
-    param: &mut Param<Tensor<B, 3>>,
+fn set_param3(
+    param: &mut Param<Tensor<3>>,
     snap: &TensorSnapshot,
-    device: &B::Device,
+    device: &Device,
 ) -> Result<(), String> {
     let data = snap
         .to_data()
         .map_err(|e| format!("load rank-3 data: {e:?}"))?;
-    let tensor = Tensor::<B, 3>::from_data_dtype(data, device, snap.dtype);
+    let tensor = Tensor::<3>::from_data(data, (device, snap.dtype));
     *param = Param::initialized(ParamId::new(), tensor);
     Ok(())
 }
@@ -1313,7 +1356,7 @@ fn raw_tensor_to_snapshot(key: &str, raw: RawTensor) -> Result<TensorSnapshot, S
             return Err(format!(
                 "bf16-path tensor {key}: unsupported dtype {other:?} (shape {:?})",
                 raw.shape
-            ))
+            ));
         }
     };
     let expected = raw.shape.iter().product::<usize>() * dtype.size();

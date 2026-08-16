@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use burn::{
     backend::cuda::CudaDevice,
-    prelude::Backend,
+    prelude::Device,
     tensor::{Bool, DType, Int, Tensor},
 };
 use cubecl::{Runtime, cuda::CudaRuntime};
@@ -95,11 +95,11 @@ fn print_mem(label: &str) {
     println!("{label}: VmRSS={rss}, VmHWM={hwm}");
 }
 
-fn positions(start: usize, len: usize, device: &CudaDevice) -> Tensor<B, 2, Int> {
+fn positions(start: usize, len: usize, device: &CudaDevice) -> Tensor<2, Int> {
     if len == 1 {
-        Tensor::<B, 2, Int>::from_data([[start as i64]], device)
+        Tensor::<2, Int>::from_data([[start as i64]], device)
     } else {
-        Tensor::<B, 1, Int>::arange(start as i64..(start + len) as i64, device).unsqueeze()
+        Tensor::<1, Int>::arange(start as i64..(start + len) as i64, device).unsqueeze()
     }
 }
 
@@ -119,14 +119,14 @@ where
 }
 
 fn sample_emit_from_last(
-    last: &Tensor<B, 2>,
-    finished: &Tensor<B, 1, Bool>,
-    eos_pad: &Tensor<B, 2, Int>,
+    last: &Tensor<2>,
+    finished: &Tensor<1, Bool>,
+    eos_pad: &Tensor<2, Int>,
     device: &CudaDevice,
-) -> (Tensor<B, 2, Int>, Tensor<B, 1, Bool>) {
+) -> (Tensor<2, Int>, Tensor<1, Bool>) {
     let sampled = last.clone().argmax(1);
     let emit = sampled.mask_where(finished.clone().reshape([BATCH, 1]), eos_pad.clone());
-    let mut is_eos = Tensor::<B, 2, Int>::zeros([BATCH, 1], device).equal_elem(1i64);
+    let mut is_eos = Tensor::<2, Int>::zeros([BATCH, 1], device).equal_elem(1i64);
     for &e in &EOS {
         is_eos = is_eos.bool_or(emit.clone().equal_elem(e));
     }
@@ -181,9 +181,9 @@ where
 
 #[allow(clippy::too_many_arguments)]
 fn reset_and_prefill(
-    model: &Qwen3_5MoeForCausalLM<B>,
-    state: &mut Qwen35DecodeState<B>,
-    prompt_base: &mut Option<Tensor<B, 1, Int>>,
+    model: &Qwen3_5MoeForCausalLM,
+    state: &mut Qwen35DecodeState,
+    prompt_base: &mut Option<Tensor<1, Int>>,
     prompt_ids: &[i64],
     prec: Precision,
     device: &CudaDevice,
@@ -197,7 +197,7 @@ fn reset_and_prefill(
     );
 
     state.reset_for_replay();
-    let input = Tensor::<B, 1, Int>::from_data(prompt_ids, device).unsqueeze();
+    let input = Tensor::<1, Int>::from_data(prompt_ids, device).unsqueeze();
     let prompt_pos = positions(0, lp, device);
     let logits = static_prefill_logits(model, input, prompt_pos, &mut state.cache, prec);
     let last = logits
@@ -218,24 +218,24 @@ fn reset_and_prefill(
         prompt_base
             .take()
             .expect("prompt_base buffer missing")
-            .slice_assign([0..1], Tensor::<B, 1, Int>::from_data([lp as i64], device)),
+            .slice_assign([0..1], Tensor::<1, Int>::from_data([lp as i64], device)),
     );
 }
 
 #[allow(clippy::too_many_arguments)]
 fn eager_static_decode(
-    model: &Qwen3_5MoeForCausalLM<B>,
+    model: &Qwen3_5MoeForCausalLM,
     prompt_ids: &[i64],
     prec: Precision,
     device: &CudaDevice,
-    freqs: &Tensor<B, 1>,
-    arange_tmax: &Tensor<B, 1, Int>,
-    eos_pad: &Tensor<B, 2, Int>,
+    freqs: &Tensor<1>,
+    arange_tmax: &Tensor<1, Int>,
+    eos_pad: &Tensor<2, Int>,
 ) -> Result<DecodeRun, String> {
     let prompt_len = prompt_ids.len();
     assert!(prompt_len + MAX_NEW <= T_MAX);
 
-    let input = Tensor::<B, 1, Int>::from_data(prompt_ids, device).unsqueeze();
+    let input = Tensor::<1, Int>::from_data(prompt_ids, device).unsqueeze();
     let prompt_pos = positions(0, prompt_len, device);
     let mut cache = model.model.new_cache_with_capacity(T_MAX);
     model.init_static_caches(&mut cache, BATCH);
@@ -245,8 +245,8 @@ fn eager_static_decode(
 
     let logits = static_prefill_logits(model, input, prompt_pos, &mut cache, prec);
     let mut last = logits_last(&logits, "static prefill")?;
-    let mut pos = Tensor::<B, 1, Int>::full([1], prompt_len as i64, device);
-    let mut finished = Tensor::<B, 1, Int>::zeros([BATCH], device).equal_elem(1i64);
+    let mut pos = Tensor::<1, Int>::full([1], prompt_len as i64, device);
+    let mut finished = Tensor::<1, Int>::zeros([BATCH], device).equal_elem(1i64);
     let mut ids = Vec::with_capacity(MAX_NEW);
 
     let start = Instant::now();
@@ -280,7 +280,7 @@ fn eager_static_decode(
     })
 }
 
-fn emit_ids(state: &Qwen35DecodeState<B>) -> Result<Vec<i64>, String> {
+fn emit_ids(state: &Qwen35DecodeState) -> Result<Vec<i64>, String> {
     state
         .emit
         .as_ref()
@@ -312,7 +312,7 @@ fn print_token_diff(label: &str, expected: &[i64], got: &[i64]) {
 #[allow(clippy::too_many_arguments)]
 fn replay_captured(
     graph: &cubecl::client::CapturedGraph<CudaRuntime>,
-    state: &mut Qwen35DecodeState<B>,
+    state: &mut Qwen35DecodeState,
     client: &Client,
     n: usize,
     va_check_each: bool,
@@ -339,9 +339,9 @@ fn replay_captured(
 #[allow(clippy::too_many_arguments)]
 fn time_captured_replay(
     graph: &cubecl::client::CapturedGraph<CudaRuntime>,
-    model: &Qwen3_5MoeForCausalLM<B>,
-    state: &mut Qwen35DecodeState<B>,
-    prompt_base: &mut Option<Tensor<B, 1, Int>>,
+    model: &Qwen3_5MoeForCausalLM,
+    state: &mut Qwen35DecodeState,
+    prompt_base: &mut Option<Tensor<1, Int>>,
     prompt_ids: &[i64],
     prec: Precision,
     device: &CudaDevice,
@@ -403,7 +403,7 @@ fn run() -> Result<(), String> {
         .map(|value| value == "1")
         .unwrap_or(false);
 
-    let device = CudaDevice::default();
+    let device = Device::cuda(0);
     let client = CudaRuntime::client(&device);
     println!("device: {device:?} | backend=raw CaptureBackend");
     println!("quant mode: {quant_mode}, warmup={warmup}, reps={reps}, VA_CHECK={va_check_each}");
@@ -423,7 +423,7 @@ fn run() -> Result<(), String> {
     );
 
     let tokenizer = Qwen3Tokenizer::from_file(dir.join("tokenizer.json"))?;
-    let mut model = cfg.init_causal_lm::<B>(&device);
+    let mut model = cfg.init_causal_lm(&device);
 
     if quant_mode == "nvfp4" {
         // Official NVIDIA NVFP4 checkpoint: quantized bytes are ingested straight into the sidecars
@@ -494,8 +494,8 @@ fn run() -> Result<(), String> {
     }
 
     let freqs = rope_freqs::<B>(ROTARY_DIM, ROPE_THETA, &device);
-    let arange_tmax = Tensor::<B, 1, Int>::arange(0..T_MAX as i64, &device);
-    let eos_pad = Tensor::<B, 2, Int>::full([BATCH, 1], EOS[0], &device);
+    let arange_tmax = Tensor::<1, Int>::arange(0..T_MAX as i64, &device);
+    let eos_pad = Tensor::<2, Int>::full([BATCH, 1], EOS[0], &device);
 
     println!("running eager-static reference for prompt1 ...");
     let eager1 = eager_static_decode(
@@ -521,7 +521,7 @@ fn run() -> Result<(), String> {
         .preflight_static(&cache, BATCH)
         .map_err(|e| format!("preflight_static failed for captured state: {e}"))?;
     let mut state = Qwen35DecodeState::new(BATCH, cfg.vocab_size, T_MAX, MAX_NEW, &device, cache);
-    let mut prompt_base = Some(Tensor::<B, 1, Int>::zeros([1], &device));
+    let mut prompt_base = Some(Tensor::<1, Int>::zeros([1], &device));
 
     reset_and_prefill(
         &model,
@@ -537,7 +537,7 @@ fn run() -> Result<(), String> {
 
     println!("capturing one Qwen3.5 static decode step ...");
     let graph = {
-        let step = |state: &mut Qwen35DecodeState<B>| {
+        let step = |state: &mut Qwen35DecodeState| {
             let last = state.last.take().expect("last buffer missing");
             let finished = state.finished.take().expect("finished buffer missing");
             let (emit, new_finished) = sample_emit_from_last(&last, &finished, &eos_pad, &device);

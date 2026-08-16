@@ -8,8 +8,7 @@
 //! on device. Do not read tensors, synchronize, allocate persistent outputs, or branch on host data
 //! inside that step.
 
-use burn::tensor::backend::Backend;
-use burn::tensor::{Bool, Int, Tensor};
+use burn::tensor::{Bool, Device, Int, Tensor};
 #[cfg(feature = "cuda")]
 use burn::tensor::{DType, IndexingUpdateOp, TensorPrimitive};
 #[cfg(feature = "cuda")]
@@ -21,7 +20,7 @@ use cubecl::cuda::CudaRuntime;
 
 #[cfg(feature = "cuda")]
 use crate::ModelCache;
-use crate::{Qwen3_5HybridCache, Qwen3_5HybridLayerCache};
+use crate::Qwen3_5HybridCache;
 
 #[cfg(feature = "cuda")]
 pub type CaptureBackend = CubeBackend<CudaRuntime, f32, i32, u8>;
@@ -38,20 +37,20 @@ fn block_sync(client: &Client) {
 ///
 /// Callers must ensure the eventual prompt length plus `max_new` is within `t_max`; that assertion
 /// belongs at the capture-driver point where the prompt length is known.
-pub struct Qwen35DecodeState<B: Backend> {
-    pub tok: Option<Tensor<B, 2, Int>>,
-    pub pos: Option<Tensor<B, 1, Int>>,
-    pub finished: Option<Tensor<B, 1, Bool>>,
-    pub last: Option<Tensor<B, 2>>,
-    pub cache: Qwen3_5HybridCache<B>,
-    pub emit: Option<Tensor<B, 2, Int>>,
+pub struct Qwen35DecodeState {
+    pub tok: Option<Tensor<2, Int>>,
+    pub pos: Option<Tensor<1, Int>>,
+    pub finished: Option<Tensor<1, Bool>>,
+    pub last: Option<Tensor<2>>,
+    pub cache: Qwen3_5HybridCache,
+    pub emit: Option<Tensor<2, Int>>,
     pub batch: usize,
     pub vocab: usize,
     pub t_max: usize,
     pub max_new: usize,
 }
 
-impl<B: Backend> Qwen35DecodeState<B> {
+impl Qwen35DecodeState {
     /// Allocate all persistent Qwen3.5 decode buffers outside the captured region.
     ///
     /// `t_max` is retained for capture-driver budget checks; callers with a concrete prompt length
@@ -61,14 +60,14 @@ impl<B: Backend> Qwen35DecodeState<B> {
         vocab: usize,
         t_max: usize,
         max_new: usize,
-        device: &B::Device,
-        cache: Qwen3_5HybridCache<B>,
+        device: &Device,
+        cache: Qwen3_5HybridCache,
     ) -> Self {
-        let tok = Tensor::<B, 2, Int>::zeros([batch, 1], device);
-        let pos = Tensor::<B, 1, Int>::zeros([1], device);
-        let finished = Tensor::<B, 1, Int>::zeros([batch], device).equal_elem(1i64);
-        let last = Tensor::<B, 2>::zeros([batch, vocab], device);
-        let emit = Tensor::<B, 2, Int>::zeros([batch, max_new], device);
+        let tok = Tensor::<2, Int>::zeros([batch, 1], device);
+        let pos = Tensor::<1, Int>::zeros([1], device);
+        let finished = Tensor::<1, Int>::zeros([batch], device).equal_elem(1i64);
+        let last = Tensor::<2>::zeros([batch, vocab], device);
+        let emit = Tensor::<2, Int>::zeros([batch, max_new], device);
         Self {
             tok: Some(tok),
             pos: Some(pos),
@@ -97,7 +96,7 @@ impl<B: Backend> Qwen35DecodeState<B> {
 
         let finished = self.finished.take().expect("finished buffer missing");
         let device = finished.device();
-        let false_values = Tensor::<B, 1, Int>::zeros([self.batch], &device).equal_elem(1i64);
+        let false_values = Tensor::<1, Int>::zeros([self.batch], &device).equal_elem(1i64);
         self.finished = Some(finished.slice_assign([0..self.batch], false_values));
 
         self.cache.reset_for_replay();
@@ -111,14 +110,14 @@ impl<B: Backend> Qwen35DecodeState<B> {
 /// update these fields in place via `take()` + a single tensor operation; replacing a field with a
 /// clone/copy can relocate the baked VA and make replay read stale memory.
 #[cfg(feature = "cuda")]
-pub struct DecodeState<B: Backend> {
-    pub tok: Option<Tensor<B, 2, Int>>,
-    pub pos: Option<Tensor<B, 1, Int>>,
-    pub last: Option<Tensor<B, 2>>,
-    pub finished: Option<Tensor<B, 2, Int>>,
-    pub cache: ModelCache<B>,
-    pub input_ids: Tensor<B, 2, Int>,
-    pub pad: Tensor<B, 2, Int>,
+pub struct DecodeState {
+    pub tok: Option<Tensor<2, Int>>,
+    pub pos: Option<Tensor<1, Int>>,
+    pub last: Option<Tensor<2>>,
+    pub finished: Option<Tensor<2, Int>>,
+    pub cache: ModelCache,
+    pub input_ids: Tensor<2, Int>,
+    pub pad: Tensor<2, Int>,
     pub eos: Vec<i64>,
     pub batch: usize,
     pub prompt_len: usize,
@@ -131,8 +130,8 @@ pub struct DecodeState<B: Backend> {
 impl DecodeState<CaptureBackend> {
     /// Allocate every persistent buffer outside the captured region.
     pub fn new(
-        input_ids: Tensor<CaptureBackend, 2, Int>,
-        cache: ModelCache<CaptureBackend>,
+        input_ids: Tensor<2, Int>,
+        cache: ModelCache,
         max_new: usize,
         vocab: usize,
         eos: Vec<i64>,
@@ -141,12 +140,12 @@ impl DecodeState<CaptureBackend> {
         let [batch, prompt_len] = input_ids.dims();
         let total = prompt_len + max_new;
         let eos0 = eos.first().copied().unwrap_or(0);
-        let tok = Tensor::<CaptureBackend, 2, Int>::zeros([batch, total], &device)
+        let tok = Tensor::<2, Int>::zeros([batch, total], &device)
             .slice_assign([0..batch, 0..prompt_len], input_ids.clone());
-        let pos = Tensor::<CaptureBackend, 1, Int>::full([1], prompt_len as i64, &device);
-        let finished = Tensor::<CaptureBackend, 2, Int>::zeros([batch, 1], &device);
-        let pad = Tensor::<CaptureBackend, 2, Int>::full([batch, 1], eos0, &device);
-        let last = Tensor::<CaptureBackend, 2>::zeros([batch, vocab], &device);
+        let pos = Tensor::<1, Int>::full([1], prompt_len as i64, &device);
+        let finished = Tensor::<2, Int>::zeros([batch, 1], &device);
+        let pad = Tensor::<2, Int>::full([batch, 1], eos0, &device);
+        let last = Tensor::<2>::zeros([batch, vocab], &device);
         Self {
             tok: Some(tok),
             pos: Some(pos),
@@ -402,8 +401,8 @@ where
     /// `warmup` must be at least 3 and strictly less than `max_new`; the warmup/capture pass writes
     /// column `prompt_len + warmup`, so `warmup >= max_new` would write past the token buffer.
     pub fn build<Step>(
-        input_ids: Tensor<CaptureBackend, 2, Int>,
-        cache: ModelCache<CaptureBackend>,
+        input_ids: Tensor<2, Int>,
+        cache: ModelCache,
         max_new: usize,
         vocab: usize,
         eos: Vec<i64>,
@@ -455,7 +454,7 @@ where
             "prompt_ids length must match the captured [batch, prompt_len] shape"
         );
         let device = self.state.input_ids.device();
-        self.state.input_ids = Tensor::<CaptureBackend, 1, Int>::from_data(prompt_ids, &device)
+        self.state.input_ids = Tensor::<1, Int>::from_data(prompt_ids, &device)
             .reshape([self.state.batch, self.state.prompt_len]);
         self.reset_and_prefill_current();
     }
@@ -560,7 +559,7 @@ where
 }
 
 #[cfg(feature = "cuda")]
-pub fn float_va<const D: usize>(t: &Tensor<CaptureBackend, D>) -> u64 {
+pub fn float_va<const D: usize>(t: &Tensor<D>) -> u64 {
     match t.clone().into_primitive() {
         TensorPrimitive::Float(ct) => {
             ct.client
@@ -629,11 +628,11 @@ pub fn assert_no_new_allocs(
 
 #[cfg(feature = "cuda")]
 pub fn write_last_in_place(
-    last: Tensor<CaptureBackend, 2>,
-    logits_3d: Tensor<CaptureBackend, 3>,
+    last: Tensor<2>,
+    logits_3d: Tensor<3>,
     batch: usize,
     vocab: usize,
-) -> Tensor<CaptureBackend, 2> {
+) -> Tensor<2> {
     let new_last = logits_3d
         .slice([0..batch, 0..1, 0..vocab])
         .reshape([batch, vocab])
@@ -644,24 +643,25 @@ pub fn write_last_in_place(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Qwen3_5LayerType;
-    use burn::{backend::NdArray, tensor::TensorData};
+    use crate::{Qwen3_5HybridLayerCache, Qwen3_5LayerType};
+    use burn::{
+        prelude::Device,
+        tensor::{DType, TensorData},
+    };
 
-    type B = NdArray;
-
-    fn device() -> <B as Backend>::Device {
-        Default::default()
+    fn device() -> Device {
+        Device::flex()
     }
 
-    fn vec_i(t: Tensor<B, 2, Int>) -> Vec<i64> {
-        t.into_data().to_vec::<i64>().unwrap()
+    fn vec_i<const D: usize>(t: Tensor<D, Int>) -> Vec<i64> {
+        t.cast(DType::I64).into_data().to_vec::<i64>().unwrap()
     }
 
-    fn vec_f<const D: usize>(t: Tensor<B, D>) -> Vec<f32> {
+    fn vec_f<const D: usize>(t: Tensor<D>) -> Vec<f32> {
         t.into_data().to_vec::<f32>().unwrap()
     }
 
-    fn vec_b(t: Tensor<B, 1, Bool>) -> Vec<bool> {
+    fn vec_b(t: Tensor<1, Bool>) -> Vec<bool> {
         t.into_data().to_vec::<bool>().unwrap()
     }
 
@@ -672,12 +672,12 @@ mod tests {
             Qwen3_5LayerType::LinearAttention,
             Qwen3_5LayerType::FullAttention,
         ];
-        let mut cache = Qwen3_5HybridCache::<B>::with_capacity(&layer_types, 2, 2, 2, 3, 3, 6);
+        let mut cache = Qwen3_5HybridCache::with_capacity(&layer_types, 2, 2, 2, 3, 3, 6);
 
         if let Qwen3_5HybridLayerCache::Linear(gdn) = &mut cache.layers[0] {
             gdn.init_static(2, &device);
             gdn.set_state_static(
-                Tensor::<B, 1>::from_floats(
+                Tensor::<1>::from_floats(
                     [
                         1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0,
                         15.0, 16.0,
@@ -687,21 +687,19 @@ mod tests {
                 .reshape([2, 2, 2, 2]),
             );
             let _ = gdn.push_conv(
-                Tensor::<B, 1>::from_floats([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &device)
-                    .reshape([2, 3]),
+                Tensor::<1>::from_floats([1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &device).reshape([2, 3]),
             );
             let _ = gdn.push_conv(
-                Tensor::<B, 1>::from_floats([7.0, 8.0, 9.0, 10.0, 11.0, 12.0], &device)
+                Tensor::<1>::from_floats([7.0, 8.0, 9.0, 10.0, 11.0, 12.0], &device)
                     .reshape([2, 3]),
             );
         } else {
             panic!("test layer 0 must be GDN");
         }
         if let Qwen3_5HybridLayerCache::Full(kv) = &mut cache.layers[1] {
-            let key =
-                Tensor::<B, 1>::from_floats([1.0, 2.0, 3.0, 4.0], &device).reshape([2, 2, 1, 1]);
+            let key = Tensor::<1>::from_floats([1.0, 2.0, 3.0, 4.0], &device).reshape([2, 2, 1, 1]);
             let value =
-                Tensor::<B, 1>::from_floats([5.0, 6.0, 7.0, 8.0], &device).reshape([2, 2, 1, 1]);
+                Tensor::<1>::from_floats([5.0, 6.0, 7.0, 8.0], &device).reshape([2, 2, 1, 1]);
             let _ = kv.update(key, value);
             assert_eq!(kv.filled(), 2);
         } else {
@@ -709,20 +707,17 @@ mod tests {
         }
 
         let mut state = Qwen35DecodeState::new(2, 5, 6, 3, &device, cache);
-        state.tok = Some(Tensor::<B, 2, Int>::from_data(
+        state.tok = Some(Tensor::<2, Int>::from_data(
             TensorData::new(vec![9i64, 8], [2, 1]),
             &device,
         ));
-        state.pos = Some(Tensor::<B, 1, Int>::from_data([4], &device));
-        state.finished = Some(Tensor::<B, 1, Bool>::from_data([true, true], &device));
+        state.pos = Some(Tensor::<1, Int>::from_data([4], &device));
+        state.finished = Some(Tensor::<1, Bool>::from_data([true, true], &device));
         state.last = Some(
-            Tensor::<B, 1>::from_floats(
-                [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
-                &device,
-            )
-            .reshape([2, 5]),
+            Tensor::<1>::from_floats([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0], &device)
+                .reshape([2, 5]),
         );
-        state.emit = Some(Tensor::<B, 2, Int>::from_data(
+        state.emit = Some(Tensor::<2, Int>::from_data(
             TensorData::new(vec![1i64, 2, 3, 4, 5, 6], [2, 3]),
             &device,
         ));
@@ -735,17 +730,7 @@ mod tests {
         assert_eq!(state.last.as_ref().unwrap().dims(), [2, 5]);
         assert_eq!(state.emit.as_ref().unwrap().dims(), [2, 3]);
         assert_eq!(vec_i(state.tok.as_ref().unwrap().clone()), vec![0, 0]);
-        assert_eq!(
-            state
-                .pos
-                .as_ref()
-                .unwrap()
-                .clone()
-                .into_data()
-                .to_vec::<i64>()
-                .unwrap(),
-            vec![0]
-        );
+        assert_eq!(vec_i(state.pos.as_ref().unwrap().clone()), vec![0]);
         assert_eq!(
             vec_b(state.finished.as_ref().unwrap().clone()),
             vec![false, false]
@@ -796,10 +781,10 @@ mod tests {
 
 #[cfg(feature = "cuda")]
 pub fn scatter_emit_to_tok(
-    tok: Tensor<CaptureBackend, 2, Int>,
-    pos: Tensor<CaptureBackend, 1, Int>,
-    emit: Tensor<CaptureBackend, 2, Int>,
-) -> Tensor<CaptureBackend, 2, Int> {
+    tok: Tensor<2, Int>,
+    pos: Tensor<1, Int>,
+    emit: Tensor<2, Int>,
+) -> Tensor<2, Int> {
     tok.select_assign(1, pos, emit, IndexingUpdateOp::Add)
 }
 

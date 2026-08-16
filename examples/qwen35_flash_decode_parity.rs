@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use burn::{
-    backend::cuda::{Cuda, CudaDevice},
+    prelude::Device,
     tensor::{Distribution, Int, Tensor, TensorData},
 };
 use qwen3_burn::{
@@ -28,9 +28,9 @@ fn arg<'a>(args: &'a [String], flag: &str) -> Option<&'a String> {
         .and_then(|i| args.get(i + 1))
 }
 
-fn positions(start: usize, len: usize, device: &CudaDevice) -> Tensor<B, 2, Int> {
+fn positions(start: usize, len: usize, device: &CudaDevice) -> Tensor<2, Int> {
     let vals: Vec<i64> = (start..start + len).map(|x| x as i64).collect();
-    Tensor::<B, 2, Int>::from_data(TensorData::new(vals, [1, len]), device)
+    Tensor::<2, Int>::from_data(TensorData::new(vals, [1, len]), device)
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f64 {
@@ -81,14 +81,14 @@ fn run() -> Result<(), String> {
             .unwrap_or_else(|| "models/qwen3.6-35b-a3b".to_string()),
     );
     let load = has_flag(&args, "--load");
-    let device = CudaDevice::default();
+    let device = Device::cuda(0);
     let cfg = if dir.join("config.json").exists() {
         Qwen3_5MoeConfig::from_hf_config_file(dir.join("config.json"))?
     } else {
         Qwen3_5MoeConfig::default()
     };
 
-    let mut model = cfg.init_causal_lm::<B>(&device);
+    let mut model = cfg.init_causal_lm(&device);
     if load {
         model
             .load_weights_sharded(&dir)
@@ -111,8 +111,11 @@ fn run() -> Result<(), String> {
         let mut sdpa_cache = KVCache::<B>::new();
 
         if prefix_len > 0 {
-            let prefix =
-                Tensor::<B, 3>::random([1, prefix_len, cfg.hidden_size], Distribution::Normal(0.0, 1.0), &device);
+            let prefix = Tensor::<3>::random(
+                [1, prefix_len, cfg.hidden_size],
+                Distribution::Normal(0.0, 1.0),
+                &device,
+            );
             let pos = positions(0, prefix_len, &device);
             let _ = layer.self_attn.forward_with_cache_sdpa_reference(
                 prefix.clone(),
@@ -128,7 +131,11 @@ fn run() -> Result<(), String> {
             );
         }
 
-        let x = Tensor::<B, 3>::random([1, 1, cfg.hidden_size], Distribution::Normal(0.0, 1.0), &device);
+        let x = Tensor::<3>::random(
+            [1, 1, cfg.hidden_size],
+            Distribution::Normal(0.0, 1.0),
+            &device,
+        );
         let pos = positions(total_seq - 1, 1, &device);
         let flash = layer.self_attn.forward_with_cache(
             x.clone(),
@@ -136,10 +143,12 @@ fn run() -> Result<(), String> {
             &mut flash_cache,
             Precision::F32,
         );
-        let sdpa =
-            layer
-                .self_attn
-                .forward_with_cache_sdpa_reference(x, pos, &mut sdpa_cache, Precision::F32);
+        let sdpa = layer.self_attn.forward_with_cache_sdpa_reference(
+            x,
+            pos,
+            &mut sdpa_cache,
+            Precision::F32,
+        );
 
         let flash = flash.into_data().to_vec::<f32>().unwrap();
         let sdpa = sdpa.into_data().to_vec::<f32>().unwrap();
@@ -150,7 +159,10 @@ fn run() -> Result<(), String> {
         println!(
             "total_seq={total_seq}: cosine={cos:.8} argmax_flash={a_flash} argmax_sdpa={a_sdpa} top10_overlap={overlap}/10"
         );
-        assert!(cos > 0.9999, "cosine {cos:.8} <= 0.9999 at total_seq={total_seq}");
+        assert!(
+            cos > 0.9999,
+            "cosine {cos:.8} <= 0.9999 at total_seq={total_seq}"
+        );
         assert_eq!(a_flash, a_sdpa, "argmax mismatch at total_seq={total_seq}");
         assert!(
             overlap >= 9,

@@ -83,14 +83,24 @@ fn count(n: usize) -> CubeCount {
     CubeCount::Static((n as u32).div_ceil(THREADS), 1, 1)
 }
 fn dim() -> CubeDim {
-    CubeDim { x: THREADS, y: 1, z: 1 }
+    CubeDim {
+        x: THREADS,
+        y: 1,
+        z: 1,
+    }
 }
 
 fn fill(client: &Client, h: &Handle, n: usize, v: f32) {
     unsafe {
         let arg = ArrayArg::from_raw_parts::<f32>(h, n, 1);
-        kernels::fill::launch_unchecked::<CudaRuntime>(client, count(n), dim(), arg, ScalarArg::new(v))
-            .expect("fill launch failed");
+        kernels::fill::launch_unchecked::<CudaRuntime>(
+            client,
+            count(n),
+            dim(),
+            arg,
+            ScalarArg::new(v),
+        )
+        .expect("fill launch failed");
     }
 }
 fn fma_scalar(client: &Client, h: &Handle, n: usize, scale: f32, bias: f32) {
@@ -252,7 +262,11 @@ fn test_alloc_recycle(client: &Client) -> bool {
     );
     println!(
         "      parity max_abs_diff = {diff:.3e}  -> {}",
-        if parity { "OK (bit-identical)" } else { "MISMATCH" }
+        if parity {
+            "OK (bit-identical)"
+        } else {
+            "MISMATCH"
+        }
     );
     println!(
         "      arena high-water = {} KB  ({:.2}x one tmp; sum-of-all would be {} KB)  -> {}",
@@ -379,10 +393,17 @@ fn test_multi_live(client: &Client) -> bool {
     // < 3x (proves it did not allocate a fresh block per call / still recycles across replays).
     let two_distinct = arena >= 2 * tmp_bytes && arena < 3 * tmp_bytes;
 
-    println!("[4] multi-live (t1=2a, t2=3a both live, b+=t1+t2, tmp={} KB):", tmp_bytes / 1024);
+    println!(
+        "[4] multi-live (t1=2a, t2=3a both live, b+=t1+t2, tmp={} KB):",
+        tmp_bytes / 1024
+    );
     println!(
         "      parity max_abs_diff = {diff:.3e}  -> {}",
-        if parity { "OK (bit-identical)" } else { "MISMATCH" }
+        if parity {
+            "OK (bit-identical)"
+        } else {
+            "MISMATCH"
+        }
     );
     println!(
         "      arena high-water = {} KB  ({:.2}x one tmp)  -> {}",
@@ -488,12 +509,24 @@ fn test_arena_panic_recovery(client: &Client) -> bool {
         "      arena bytes after panic: base={} KB after={} KB  -> {}",
         base / 1024,
         after_panic / 1024,
-        if arena_zeroed { "FREED (back to baseline)" } else { "LEAK (arena not freed)" }
+        if arena_zeroed {
+            "FREED (back to baseline)"
+        } else {
+            "LEAK (arena not freed)"
+        }
     );
     println!(
         "      eager launch after panic -> {}   fresh capture+replay -> {}",
-        if eager_ok { "OK (not wedged)" } else { "WEDGED" },
-        if fresh_ok { "OK (bit-identical)" } else { "BROKEN" }
+        if eager_ok {
+            "OK (not wedged)"
+        } else {
+            "WEDGED"
+        },
+        if fresh_ok {
+            "OK (bit-identical)"
+        } else {
+            "BROKEN"
+        }
     );
     ok
 }
@@ -516,11 +549,26 @@ fn main() {
     println!();
 
     println!("=== SUMMARY ===");
-    println!("  [1] scalar-bearing capture+replay bit-identical : {}", yn(t1));
-    println!("  [2] alloc-in-capture recycles (peak-LIVE)       : {}", yn(t2));
-    println!("  [3] arena freed on graph drop (no leak / 100x)  : {}", yn(t3));
-    println!("  [4] multi-live: >=2 distinct concurrent blocks  : {}", yn(t4));
-    println!("  [5] allocator usable after panicked capture     : {}", yn(t5));
+    println!(
+        "  [1] scalar-bearing capture+replay bit-identical : {}",
+        yn(t1)
+    );
+    println!(
+        "  [2] alloc-in-capture recycles (peak-LIVE)       : {}",
+        yn(t2)
+    );
+    println!(
+        "  [3] arena freed on graph drop (no leak / 100x)  : {}",
+        yn(t3)
+    );
+    println!(
+        "  [4] multi-live: >=2 distinct concurrent blocks  : {}",
+        yn(t4)
+    );
+    println!(
+        "  [5] allocator usable after panicked capture     : {}",
+        yn(t5)
+    );
 
     assert!(t1, "scalar capture parity failed");
     assert!(t2, "alloc-in-capture parity/recycle failed");

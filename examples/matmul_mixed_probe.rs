@@ -1,9 +1,9 @@
 //! Probe: does CubeCL 2-D GEMM corrupt mixed operand dtypes on sm_121?
 //! Uniform rows are the regression gate. Mixed rows document the known CubeCL GB10 mixed-dtype
 //! corruption; do not rely on them staying broken.
-use burn::backend::cuda::{Cuda, CudaDevice};
-use burn::backend::ndarray::{NdArray, NdArrayDevice};
-use burn::tensor::{DType, Tensor, TensorData};
+use burn::prelude::Device;
+use burn::prelude::Device;
+use burn::tensor::{DType, Device, Tensor, TensorData};
 use half::bf16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,7 +53,7 @@ fn quantized(data: &[f32], dtype: OperandDType) -> Vec<f32> {
     data.iter().map(|&v| dtype.quantize(v)).collect()
 }
 
-fn cast_operand(t: Tensor<Cuda, 2>, dtype: OperandDType) -> Tensor<Cuda, 2> {
+fn cast_operand(t: Tensor<2>, dtype: OperandDType) -> Tensor<2> {
     match dtype {
         OperandDType::F32 => t,
         OperandDType::BF16 => t.cast(DType::BF16),
@@ -81,7 +81,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f64 {
 
 fn run_case(
     dev: &CudaDevice,
-    cdev: &NdArrayDevice,
+    cdev: &Device,
     m: usize,
     k: usize,
     n: usize,
@@ -93,13 +93,13 @@ fn run_case(
 
     let xref_data = quantized(&xdata, lhs);
     let wref_data = quantized(&wdata, rhs);
-    let xc = Tensor::<NdArray, 2>::from_data(TensorData::new(xref_data, [m, k]), cdev);
-    let wc = Tensor::<NdArray, 2>::from_data(TensorData::new(wref_data, [k, n]), cdev);
+    let xc = Tensor::<2>::from_data(TensorData::new(xref_data, [m, k]), cdev);
+    let wc = Tensor::<2>::from_data(TensorData::new(wref_data, [k, n]), cdev);
     let y_cpu = xc.matmul(wc);
     let cpu_vec = y_cpu.into_data().to_vec::<f32>().unwrap();
 
-    let x = Tensor::<Cuda, 2>::from_data(TensorData::new(xdata, [m, k]), dev);
-    let w = Tensor::<Cuda, 2>::from_data(TensorData::new(wdata, [k, n]), dev);
+    let x = Tensor::<2>::from_data(TensorData::new(xdata, [m, k]), dev);
+    let w = Tensor::<2>::from_data(TensorData::new(wdata, [k, n]), dev);
     let y_gpu = cast_operand(x, lhs).matmul(cast_operand(w, rhs));
     let out_dtype = format!("{:?}", y_gpu.dtype());
     let gpu_vec = y_gpu.cast(DType::F32).into_data().to_vec::<f32>().unwrap();
@@ -144,8 +144,8 @@ fn run_case(
 }
 
 fn main() {
-    let dev = CudaDevice::default();
-    let cdev = NdArrayDevice::default();
+    let dev = Device::cuda(0);
+    let cdev = Device::flex();
     let shapes = [
         (1usize, 2048usize, 512usize),
         (5, 2048, 512),

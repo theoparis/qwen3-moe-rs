@@ -27,7 +27,6 @@
 //! backward returns the gradient in the source dtype), so the optimizer state stays f32.
 
 use burn::nn::Linear;
-use burn::prelude::Backend;
 use burn::tensor::{DType, Tensor};
 
 /// Compute precision for the Linear GEMMs. A NAMED type rather than a bare `bool`, so each of the
@@ -44,19 +43,35 @@ pub enum Precision {
     F32,
     /// bf16 inputs, f32 accumulation (cubek `Acc=(bf16,f32)`), bf16 output widened back to f32.
     Bf16,
+    /// f16 (IEEE half) inputs/output, widened back to f32. Unlike `Bf16`, confirmed to work on
+    /// Metal (`examples/f16_matmul_probe.rs`): cubecl-wgpu/Metal's fused-matmul autotune has no
+    /// candidate for BF16 lhs/rhs (panics with "required feature is unavailable"), but F16 matmul
+    /// runs and gives correct results. Not validated for accumulation precision/numerics beyond
+    /// basic correctness — use with care for training; fine for inference-only streamed experts.
+    F16,
 }
 
 /// bf16 GEMM: cast both operands to bf16, matmul (accumulates in f32 on the CubeCL CUDA backend),
 /// widen the bf16 output back to f32. Autodiff-safe: the per-forward weight cast is the gradient
 /// edge that routes the **f32-typed** gradient back to the f32 master weight.
-fn matmul_bf16<B: Backend>(a: Tensor<B, 2>, w: Tensor<B, 2>) -> Tensor<B, 2> {
-    a.cast(DType::BF16).matmul(w.cast(DType::BF16)).cast(DType::F32)
+fn matmul_bf16(a: Tensor<2>, w: Tensor<2>) -> Tensor<2> {
+    a.cast(DType::BF16)
+        .matmul(w.cast(DType::BF16))
+        .cast(DType::F32)
+}
+
+/// f16 GEMM: cast both operands to f16 (IEEE half), matmul, widen back to f32. Unlike bf16, this
+/// is confirmed to actually execute on the Metal backend (see `Precision::F16` docs).
+fn matmul_f16(a: Tensor<2>, w: Tensor<2>) -> Tensor<2> {
+    a.cast(DType::F16)
+        .matmul(w.cast(DType::F16))
+        .cast(DType::F32)
 }
 
 /// Apply a [`Linear`] to a 3-D tensor `[batch, seq, d_input]` via a 2-D GEMM, returning
 /// `[batch, seq, d_output]`. See module docs for why the 3-D batched path is avoided. `prec`
 /// selects f32 (default) or bf16 compute for the GEMM.
-pub fn linear3<B: Backend>(lin: &Linear<B>, x: Tensor<B, 3>, prec: Precision) -> Tensor<B, 3> {
+pub fn linear3(lin: &Linear, x: Tensor<3>, prec: Precision) -> Tensor<3> {
     let [batch, seq, d_in] = x.dims();
     let x2 = x.reshape([batch * seq, d_in]); // [B*S, d_in]
     let xdt = x2.dtype();
@@ -78,6 +93,13 @@ pub fn linear3<B: Backend>(lin: &Linear<B>, x: Tensor<B, 3>, prec: Precision) ->
         // bf16 path: weight-only GEMM in bf16, then add the (f32) bias if present.
         Precision::Bf16 => {
             let mut y = matmul_bf16(x2, lin.weight.val()); // [B*S, d_out]
+            if let Some(bias) = &lin.bias {
+                y = y + bias.val().unsqueeze();
+            }
+            y
+        }
+        Precision::F16 => {
+            let mut y = matmul_f16(x2, lin.weight.val());
             if let Some(bias) = &lin.bias {
                 y = y + bias.val().unsqueeze();
             }

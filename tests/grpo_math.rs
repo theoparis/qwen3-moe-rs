@@ -4,18 +4,17 @@
 //!
 //! Run: `cargo test --test grpo_math`
 
-use burn::backend::NdArray;
-use burn::tensor::{Int, Tensor, TensorData};
-use qwen3_burn::grpo::{grpo_loss, group_norm_advantage, token_logprobs, GrpoConfig};
+use burn::tensor::{Device, Int, Tensor, TensorData};
+use qwen3_burn::grpo::{GrpoConfig, group_norm_advantage, grpo_loss, token_logprobs};
 use serde_json::Value;
 
-type B = NdArray;
 const TOL: f32 = 2e-4; // f32 vs f64 reference
 
 fn load() -> Value {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/ref/grpo_expected.json");
-    let txt = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("missing {path}: {e}. Run `python3 a0/grpo_reference.py` first."));
+    let txt = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        panic!("missing {path}: {e}. Run `python3 a0/grpo_reference.py` first.")
+    });
     serde_json::from_str(&txt).expect("valid json")
 }
 
@@ -37,17 +36,26 @@ fn flat_i64(v: &Value) -> Vec<i64> {
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(a.len(), b.len(), "length mismatch {} vs {}", a.len(), b.len());
-    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "length mismatch {} vs {}",
+        a.len(),
+        b.len()
+    );
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f32::max)
 }
 
-fn as_vec<const D: usize>(t: Tensor<B, D>) -> Vec<f32> {
+fn as_vec<const D: usize>(t: Tensor<D>) -> Vec<f32> {
     t.into_data().to_vec::<f32>().unwrap()
 }
 
 #[test]
 fn grpo_math_matches_openrlhf_reference() {
-    let dev = Default::default();
+    let dev = Device::flex();
     let j = load();
     let cfg_j = &j["config"];
     let p = cfg_j["P"].as_u64().unwrap() as usize;
@@ -58,17 +66,17 @@ fn grpo_math_matches_openrlhf_reference() {
     let inp = &j["inputs"];
     let exp = &j["expected"];
 
-    let mk3 = |val: &Value| Tensor::<B, 1>::from_floats(flat_f32(val).as_slice(), &dev).reshape([n, t, v]);
-    let mk2 = |val: &Value| Tensor::<B, 1>::from_floats(flat_f32(val).as_slice(), &dev).reshape([n, t]);
+    let mk3 =
+        |val: &Value| Tensor::<1>::from_floats(flat_f32(val).as_slice(), &dev).reshape([n, t, v]);
+    let mk2 =
+        |val: &Value| Tensor::<1>::from_floats(flat_f32(val).as_slice(), &dev).reshape([n, t]);
 
     let logits_pi = mk3(&inp["logits_pi"]);
     let logits_old = mk3(&inp["logits_old"]);
     let logits_ref = mk3(&inp["logits_ref"]);
-    let targets = Tensor::<B, 2, Int>::from_data(
-        TensorData::new(flat_i64(&inp["target_ids"]), [n, t]),
-        &dev,
-    );
-    let rewards = Tensor::<B, 1>::from_floats(flat_f32(&inp["rewards"]).as_slice(), &dev);
+    let targets =
+        Tensor::<2, Int>::from_data(TensorData::new(flat_i64(&inp["target_ids"]), [n, t]), &dev);
+    let rewards = Tensor::<1>::from_floats(flat_f32(&inp["rewards"]).as_slice(), &dev);
     let mask = mk2(&inp["mask"]);
 
     let cfg = GrpoConfig::default(); // group_norm + token_global + k3, matches the reference
@@ -90,11 +98,23 @@ fn grpo_math_matches_openrlhf_reference() {
     let want_pol = exp["pol_loss"].as_f64().unwrap() as f32;
     let want_kl = exp["kl_loss"].as_f64().unwrap() as f32;
     let want_total = exp["total_loss"].as_f64().unwrap() as f32;
-    assert!((m.pol_loss - want_pol).abs() < TOL, "pol_loss {} vs {want_pol}", m.pol_loss);
-    assert!((m.kl_loss - want_kl).abs() < TOL, "kl_loss {} vs {want_kl}", m.kl_loss);
-    assert!((m.total_loss - want_total).abs() < TOL, "total_loss {} vs {want_total}", m.total_loss);
     assert!(
-        (loss.into_scalar() - want_total).abs() < TOL,
+        (m.pol_loss - want_pol).abs() < TOL,
+        "pol_loss {} vs {want_pol}",
+        m.pol_loss
+    );
+    assert!(
+        (m.kl_loss - want_kl).abs() < TOL,
+        "kl_loss {} vs {want_kl}",
+        m.kl_loss
+    );
+    assert!(
+        (m.total_loss - want_total).abs() < TOL,
+        "total_loss {} vs {want_total}",
+        m.total_loss
+    );
+    assert!(
+        (loss.into_scalar::<f32>() - want_total).abs() < TOL,
         "loss tensor must equal total_loss"
     );
 

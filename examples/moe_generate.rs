@@ -9,8 +9,8 @@
 
 use std::path::PathBuf;
 
-use burn::backend::cuda::{Cuda, CudaDevice};
-use burn::tensor::{Int, Tensor};
+use burn::prelude::Device;
+use burn::tensor::{Device, Int, Tensor};
 use qwen3_burn::{Qwen3MoeConfig, Qwen3Tokenizer};
 
 type B = Cuda;
@@ -21,8 +21,10 @@ fn arg<'a>(a: &'a [String], f: &str) -> Option<&'a String> {
 
 /// Build a `Qwen3MoeConfig` from a HuggingFace `config.json`.
 fn config_from_hf(dir: &PathBuf) -> Result<Qwen3MoeConfig, String> {
-    let txt = std::fs::read_to_string(dir.join("config.json")).map_err(|e| format!("read config.json: {e}"))?;
-    let v: serde_json::Value = serde_json::from_str(&txt).map_err(|e| format!("parse config.json: {e}"))?;
+    let txt = std::fs::read_to_string(dir.join("config.json"))
+        .map_err(|e| format!("read config.json: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&txt).map_err(|e| format!("parse config.json: {e}"))?;
     let u = |k: &str, d: u64| -> usize { v.get(k).and_then(|x| x.as_u64()).unwrap_or(d) as usize };
     let f = |k: &str, d: f64| -> f64 { v.get(k).and_then(|x| x.as_f64()).unwrap_or(d) };
     let mut cfg = Qwen3MoeConfig::new()
@@ -55,31 +57,49 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
-    let dir = PathBuf::from(arg(&args, "--dir").cloned().unwrap_or_else(|| "models/qwen3-15b-a2b".into()));
-    let prompt = arg(&args, "--prompt").cloned().unwrap_or_else(|| "The capital of France is".into());
-    let max_tokens: usize = arg(&args, "--max-tokens").and_then(|s| s.parse().ok()).unwrap_or(48);
+    let dir = PathBuf::from(
+        arg(&args, "--dir")
+            .cloned()
+            .unwrap_or_else(|| "models/qwen3-15b-a2b".into()),
+    );
+    let prompt = arg(&args, "--prompt")
+        .cloned()
+        .unwrap_or_else(|| "The capital of France is".into());
+    let max_tokens: usize = arg(&args, "--max-tokens")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(48);
 
-    let device = CudaDevice::default();
+    let device = Device::cuda(0);
     println!("device: {device:?}");
 
     let cfg = config_from_hf(&dir)?;
     println!(
         "config: {} layers, hidden {}, {} experts top-{}, moe_inter {}, untied head",
-        cfg.num_hidden_layers, cfg.hidden_size, cfg.num_experts, cfg.num_experts_per_tok, cfg.moe_intermediate_size
+        cfg.num_hidden_layers,
+        cfg.hidden_size,
+        cfg.num_experts,
+        cfg.num_experts_per_tok,
+        cfg.moe_intermediate_size
     );
 
     let tokenizer = Qwen3Tokenizer::from_file(dir.join("tokenizer.json"))?;
-    let mut model = cfg.init_causal_lm::<B>(&device);
+    let mut model = cfg.init_causal_lm(&device);
 
     println!("loading sharded weights from {dir:?} ...");
     let t0 = std::time::Instant::now();
-    model.load_weights_sharded(&dir).map_err(|e| format!("load_weights_sharded failed: {e:?}"))?;
-    println!("loaded {} layers in {:.1}s", model.num_layers(), t0.elapsed().as_secs_f64());
+    model
+        .load_weights_sharded(&dir)
+        .map_err(|e| format!("load_weights_sharded failed: {e:?}"))?;
+    println!(
+        "loaded {} layers in {:.1}s",
+        model.num_layers(),
+        t0.elapsed().as_secs_f64()
+    );
 
     let (ids_u32, _) = tokenizer.encode_no_pad(&prompt)?;
     let ids: Vec<i64> = ids_u32.iter().map(|&x| x as i64).collect();
-    let input: Tensor<B, 1, Int> = Tensor::from_data(ids.as_slice(), &device);
-    let input: Tensor<B, 2, Int> = input.unsqueeze();
+    let input: Tensor<1, Int> = Tensor::from_data(ids.as_slice(), &device);
+    let input: Tensor<2, Int> = input.unsqueeze();
 
     println!("\n--- prompt ---\n{prompt}");
     // Report the ACTUAL MoE dispatch (mirrors `Qwen3MoeSparseBlock::forward` env-toggle order in
@@ -91,13 +111,23 @@ fn run() -> Result<(), String> {
     } else {
         "dense oracle (all experts)"
     };
-    println!("generating {max_tokens} tokens (greedy, MoE path: {moe_path}; {} experts top-{}/layer)...", cfg.num_experts, cfg.num_experts_per_tok);
+    println!(
+        "generating {max_tokens} tokens (greedy, MoE path: {moe_path}; {} experts top-{}/layer)...",
+        cfg.num_experts, cfg.num_experts_per_tok
+    );
     let start = std::time::Instant::now();
     let out = model.generate_greedy(input, max_tokens, &[151643, 151645]);
-    let out_ids: Vec<i64> = out.cast(burn::tensor::DType::I64).to_data().to_vec().map_err(|e| format!("read output: {e:?}"))?;
+    let out_ids: Vec<i64> = out
+        .cast(burn::tensor::DType::I64)
+        .to_data()
+        .to_vec()
+        .map_err(|e| format!("read output: {e:?}"))?;
     let out_u32: Vec<u32> = out_ids.iter().map(|&x| x as u32).collect();
     let text = tokenizer.decode(&out_u32)?;
 
-    println!("\n===== GENERATION ({:.1}s) =====\n{text}\n==============================", start.elapsed().as_secs_f64());
+    println!(
+        "\n===== GENERATION ({:.1}s) =====\n{text}\n==============================",
+        start.elapsed().as_secs_f64()
+    );
     Ok(())
 }

@@ -1,11 +1,8 @@
-use burn::backend::NdArray;
-use burn::tensor::{Tensor, TensorData};
-
-type B = NdArray;
+use burn::tensor::{Device, Tensor, TensorData};
 
 #[test]
 fn qwen35_gqa_repeat_layout_matches_flash_decode_grouping() {
-    let device = Default::default();
+    let device = Device::flex();
     let (b, sk, hkv, d) = (2usize, 3usize, 2usize, 4usize);
     let (hq, n_rep) = (16usize, 8usize);
     let mut data = vec![0.0f32; b * sk * hkv * d];
@@ -20,7 +17,7 @@ fn qwen35_gqa_repeat_layout_matches_flash_decode_grouping() {
         }
     }
 
-    let kv = Tensor::<B, 4>::from_data(TensorData::new(data, [b, sk, hkv, d]), &device);
+    let kv = Tensor::<4>::from_data(TensorData::new(data, [b, sk, hkv, d]), &device);
     let expanded = kv
         .unsqueeze_dim::<5>(3)
         .repeat(&[1, 1, 1, n_rep, 1])

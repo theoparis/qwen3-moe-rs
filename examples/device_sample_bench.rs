@@ -18,22 +18,22 @@
 //!
 //!   RUSTFLAGS="-C target-feature=+fp16" cargo run --release --features cuda --example device_sample_bench
 
-use burn::backend::cuda::{Cuda, CudaDevice};
-use burn::tensor::backend::Backend;
-use burn::tensor::{Int, Tensor};
-use qwen3_burn::device_sample_step;
-use qwen3_burn::grpo::{group_sample_cached, group_sample_cached_device, RolloutConfig};
+use burn::prelude::Device;
+
+use burn::tensor::{Device, Int, Tensor};
 use qwen3_burn::Qwen3Config;
+use qwen3_burn::device_sample_step;
+use qwen3_burn::grpo::{RolloutConfig, group_sample_cached, group_sample_cached_device};
 use std::time::Instant;
 
 type B = Cuda;
 
 /// Force the device queue to drain so `Instant` brackets measure real GPU work (not just enqueue).
 fn sync(d: &CudaDevice) {
-    let _ = Tensor::<B, 1>::zeros([1], d).sum().into_scalar();
+    let _ = Tensor::<1>::zeros([1], d).sum().into_scalar();
 }
 
-fn build_model(device: &CudaDevice, vocab: usize, layers: usize) -> qwen3_burn::Qwen3ForCausalLM<B> {
+fn build_model(device: &CudaDevice, vocab: usize, layers: usize) -> qwen3_burn::Qwen3ForCausalLM {
     let cfg = Qwen3Config::new()
         .with_vocab_size(vocab)
         .with_hidden_size(1024)
@@ -42,7 +42,7 @@ fn build_model(device: &CudaDevice, vocab: usize, layers: usize) -> qwen3_burn::
         .with_num_attention_heads(16)
         .with_num_key_value_heads(8)
         .with_head_dim(Some(128));
-    cfg.init_causal_lm::<B>(device)
+    cfg.init_causal_lm(device)
 }
 
 // ---- host sampler mirrors (copied from src/sampling.rs + src/grpo/rollout.rs so the example can
@@ -61,7 +61,9 @@ fn softmax_temp(row: &[f32], temp: f32) -> Vec<f32> {
         let argmax = row
             .iter()
             .enumerate()
-            .fold((0usize, f32::NEG_INFINITY), |b, (i, &x)| if x > b.1 { (i, x) } else { b })
+            .fold((0usize, f32::NEG_INFINITY), |b, (i, &x)| {
+                if x > b.1 { (i, x) } else { b }
+            })
             .0;
         let mut p = vec![0.0f32; row.len()];
         p[argmax] = 1.0;
@@ -94,21 +96,32 @@ fn sample_index_unfiltered(probs: &[f32], r: f32) -> usize {
 
 /// Prime a KV cache with a `ctx0` prefill, then return the steady-state last-token logits `[N, V]` (on
 /// device) — the per-step tensor the rollout sampler consumes.
-fn primed_last(model: &qwen3_burn::Qwen3ForCausalLM<B>, device: &CudaDevice, n: usize, vocab: usize, ctx0: usize) -> Tensor<B, 2> {
-    let prompt = Tensor::<B, 1, Int>::from_data(
-        (0..(n * ctx0) as i64).map(|i| (i * 131 + 17) % vocab as i64).collect::<Vec<_>>().as_slice(),
+fn primed_last(
+    model: &qwen3_burn::Qwen3ForCausalLM,
+    device: &CudaDevice,
+    n: usize,
+    vocab: usize,
+    ctx0: usize,
+) -> Tensor<2> {
+    let prompt = Tensor::<1, Int>::from_data(
+        (0..(n * ctx0) as i64)
+            .map(|i| (i * 131 + 17) % vocab as i64)
+            .collect::<Vec<_>>()
+            .as_slice(),
         device,
     )
     .reshape([n, ctx0]);
     let mut cache = model.new_cache_with_capacity(ctx0 + 4);
-    let pos0 = Tensor::<B, 1, Int>::arange(0..ctx0 as i64, device).unsqueeze_dim::<2>(0).repeat(&[n, 1]);
+    let pos0 = Tensor::<1, Int>::arange(0..ctx0 as i64, device)
+        .unsqueeze_dim::<2>(0)
+        .repeat(&[n, 1]);
     let logits = model.forward_with_cache(prompt, None, pos0, &mut cache); // [n, ctx0, v]
     let [_, _, v] = logits.dims();
     logits.slice([0..n, (ctx0 - 1)..ctx0, 0..v]).reshape([n, v])
 }
 
 fn main() {
-    let device = CudaDevice::default();
+    let device = Device::cuda(0);
     println!("device: {device:?} | backend: Cuda (sm_121 / GB10)\n");
 
     let vocab = 151936usize; // the real Qwen3 vocab
@@ -116,7 +129,7 @@ fn main() {
     let n = 64usize; // rollout rows (e.g. 16 prompts x group 4)
     let reps = 64usize;
 
-    <B as Backend>::seed(&device, 7);
+    device.seed(7);
     let model = build_model(&device, vocab, layers);
 
     // ===================================================================================
@@ -156,7 +169,11 @@ fn main() {
         let mut sink = 0i64;
         for _ in 0..reps {
             let (toks, logp) = device_sample_step(last.clone(), temp); // ON device
-            let tv = toks.cast(burn::tensor::DType::I64).into_data().to_vec::<i64>().unwrap(); // copy back [N] only
+            let tv = toks
+                .cast(burn::tensor::DType::I64)
+                .into_data()
+                .to_vec::<i64>()
+                .unwrap(); // copy back [N] only
             let lv = logp.into_data().to_vec::<f32>().unwrap(); // copy back [N] only
             sink ^= tv[0] ^ (lv[0].to_bits() as i64);
         }
@@ -169,28 +186,56 @@ fn main() {
 
     let host_bytes = n * vocab * 4;
     let dev_bytes = 2 * n * 8; // [N] i64 tokens + [N] f32 logp (~[N]*4); use 8 as an upper bound
-    println!("  host boundary: into_data[N,V] = {} floats/step ({:.2} MB)", n * vocab, host_bytes as f64 / 1e6);
-    println!("  dev  boundary: [N] tokens + [N] logp = {} values/step ({:.4} MB)\n", 2 * n, dev_bytes as f64 / 1e6);
+    println!(
+        "  host boundary: into_data[N,V] = {} floats/step ({:.2} MB)",
+        n * vocab,
+        host_bytes as f64 / 1e6
+    );
+    println!(
+        "  dev  boundary: [N] tokens + [N] logp = {} values/step ({:.4} MB)\n",
+        2 * n,
+        dev_bytes as f64 / 1e6
+    );
     println!("  GREEDY  (temp=0):");
-    println!("    host sampling (into_data[N,V] + softmax + SORT, as sample_step) : {ms_host_greedy:8.3} ms");
-    println!("    device sampling (argmax/logsumexp + [N] copy-back)             : {ms_dev_greedy:8.3} ms");
-    println!("    host time removed: {:+.3} ms  ({:.2}x)\n", ms_host_greedy - ms_dev_greedy, ms_host_greedy / ms_dev_greedy);
+    println!(
+        "    host sampling (into_data[N,V] + softmax + SORT, as sample_step) : {ms_host_greedy:8.3} ms"
+    );
+    println!(
+        "    device sampling (argmax/logsumexp + [N] copy-back)             : {ms_dev_greedy:8.3} ms"
+    );
+    println!(
+        "    host time removed: {:+.3} ms  ({:.2}x)\n",
+        ms_host_greedy - ms_dev_greedy,
+        ms_host_greedy / ms_dev_greedy
+    );
     println!("  TEMPERATURE  (temp=1.0, unfiltered — the GRPO default, host pays the FULL SORT):");
     println!("    host sampling (into_data[N,V] + CPU softmax + SORT)   : {ms_host_temp:8.3} ms");
     println!("    device sampling (Gumbel-max + [N] copy-back)          : {ms_dev_temp:8.3} ms");
-    println!("    host time removed: {:+.3} ms  ({:.2}x)\n", ms_host_temp - ms_dev_temp, ms_host_temp / ms_dev_temp);
+    println!(
+        "    host time removed: {:+.3} ms  ({:.2}x)\n",
+        ms_host_temp - ms_dev_temp,
+        ms_host_temp / ms_dev_temp
+    );
 
     // ===================================================================================
     // (2) END-TO-END decode wall-clock: group_sample_cached vs group_sample_cached_device.
     println!("=== (2) END-TO-END DECODE WALL-CLOCK  (vocab={vocab}, N={n}) ===");
     let (p, g, lp, max_new) = (16usize, 4usize, 16usize, 64usize);
     assert_eq!(p * g, n);
-    let prompt_ids: Vec<i64> = (0..(p * lp) as i64).map(|i| (i * 131 + 17) % vocab as i64).collect();
-    let prompt = Tensor::<B, 1, Int>::from_data(prompt_ids.as_slice(), &device).reshape([p, lp]);
+    let prompt_ids: Vec<i64> = (0..(p * lp) as i64)
+        .map(|i| (i * 131 + 17) % vocab as i64)
+        .collect();
+    let prompt = Tensor::<1, Int>::from_data(prompt_ids.as_slice(), &device).reshape([p, lp]);
     let eos = [vocab as i64 - 1]; // unlikely id -> generate the full length (worst case for sampling cost)
 
     let bench_e2e = |temp: f32, parity: bool| {
-        let rc = RolloutConfig { group_size: g, max_new_tokens: max_new, temperature: temp, top_p: 1.0, top_k: 0 };
+        let rc = RolloutConfig {
+            group_size: g,
+            max_new_tokens: max_new,
+            temperature: temp,
+            top_p: 1.0,
+            top_k: 0,
+        };
         // warmup (JIT-compile kernels) both paths
         let _ = group_sample_cached(&model, prompt.clone(), &rc, &eos);
         let _ = group_sample_cached_device(&model, prompt.clone(), &rc, &eos);
@@ -206,10 +251,18 @@ fn main() {
         sync(&device);
         let ms_dev = t0.elapsed().as_secs_f64() * 1e3;
 
-        let tag = if temp <= 0.0 { "GREEDY     " } else { "TEMPERATURE" };
-        print!("  {tag} (temp={temp}): host {ms_host:8.1} ms | device {ms_dev:8.1} ms | speedup {:.2}x", ms_host / ms_dev);
+        let tag = if temp <= 0.0 {
+            "GREEDY     "
+        } else {
+            "TEMPERATURE"
+        };
+        print!(
+            "  {tag} (temp={temp}): host {ms_host:8.1} ms | device {ms_dev:8.1} ms | speedup {:.2}x",
+            ms_host / ms_dev
+        );
         if parity {
-            let id_ok = a.seq_ids.into_data().to_vec::<i32>().unwrap() == b.seq_ids.into_data().to_vec::<i32>().unwrap();
+            let id_ok = a.seq_ids.into_data().to_vec::<i32>().unwrap()
+                == b.seq_ids.into_data().to_vec::<i32>().unwrap();
             print!(" | ids identical: {id_ok}");
         }
         println!(" (gen_len={})", a.gen_len);

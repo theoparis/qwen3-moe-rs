@@ -9,7 +9,7 @@
 use std::{path::PathBuf, time::Instant};
 
 use burn::{
-    backend::cuda::{Cuda, CudaDevice},
+    prelude::Device,
     tensor::{DType, Int, Tensor},
 };
 use cubecl::{Runtime, cuda::CudaRuntime};
@@ -89,15 +89,15 @@ fn parse_precision() -> Result<QuantPrecision, String> {
     }
 }
 
-fn positions(start: usize, len: usize, device: &CudaDevice) -> Tensor<B, 2, Int> {
+fn positions(start: usize, len: usize, device: &CudaDevice) -> Tensor<2, Int> {
     if len == 1 {
-        Tensor::<B, 2, Int>::from_data([[start as i64]], device)
+        Tensor::<2, Int>::from_data([[start as i64]], device)
     } else {
-        Tensor::<B, 1, Int>::arange(start as i64..(start + len) as i64, device).unsqueeze()
+        Tensor::<1, Int>::arange(start as i64..(start + len) as i64, device).unsqueeze()
     }
 }
 
-fn assert_logits_all_finite(logits: &Tensor<B, 3>, what: &str) -> Result<(), String> {
+fn assert_logits_all_finite(logits: &Tensor<3>, what: &str) -> Result<(), String> {
     let [batch, seq, vocab] = logits.dims();
     let values = logits
         .clone()
@@ -118,10 +118,10 @@ fn assert_logits_all_finite(logits: &Tensor<B, 3>, what: &str) -> Result<(), Str
     Ok(())
 }
 
-fn argmax_last(logits: &Tensor<B, 3>) -> Result<i64, String> {
+fn argmax_last(logits: &Tensor<3>) -> Result<i64, String> {
     assert_logits_all_finite(logits, "decode")?;
     let [batch, seq, vocab] = logits.dims();
-    let next: Tensor<B, 2, Int> = logits
+    let next: Tensor<2, Int> = logits
         .clone()
         .slice([0..batch, (seq - 1)..seq, 0..vocab])
         .reshape([batch, vocab])
@@ -182,7 +182,7 @@ fn logsumexp(row: &[f32]) -> f64 {
 }
 
 fn teacher_forced_logits(
-    model: &qwen3_burn::Qwen3_5MoeForCausalLM<B>,
+    model: &qwen3_burn::Qwen3_5MoeForCausalLM,
     tokenizer: &Qwen3Tokenizer,
     text: &str,
     device: &CudaDevice,
@@ -194,7 +194,7 @@ fn teacher_forced_logits(
     }
 
     let seq = token_ids.len();
-    let input = Tensor::<B, 1, Int>::from_data(token_ids.as_slice(), device).unsqueeze();
+    let input = Tensor::<1, Int>::from_data(token_ids.as_slice(), device).unsqueeze();
     let mut cache = model.model.new_cache_with_capacity(seq);
     let pos = positions(0, seq, device);
     let logits = model.forward_prec(input, pos, &mut cache, Precision::Bf16);
@@ -227,7 +227,7 @@ fn teacher_forced_logits(
 
 #[allow(dead_code)]
 fn teacher_forced_argmax(
-    model: &qwen3_burn::Qwen3_5MoeForCausalLM<B>,
+    model: &qwen3_burn::Qwen3_5MoeForCausalLM,
     tokenizer: &Qwen3Tokenizer,
     text: &str,
     device: &CudaDevice,
@@ -242,7 +242,7 @@ fn teacher_forced_argmax(
 }
 
 fn teacher_forced_baseline(
-    model: &qwen3_burn::Qwen3_5MoeForCausalLM<B>,
+    model: &qwen3_burn::Qwen3_5MoeForCausalLM,
     tokenizer: &Qwen3Tokenizer,
     text: &str,
     device: &CudaDevice,
@@ -281,7 +281,7 @@ fn bucket_pct(bucket: BucketStats) -> f64 {
 /// These are held in host memory (`TeacherForceBaseline.logits`) so the reference model can be
 /// mutated in place (fake-quant) or fully dropped (real-nvfp4 two-phase) before the eval pass.
 fn collect_baselines(
-    model: &qwen3_burn::Qwen3_5MoeForCausalLM<B>,
+    model: &qwen3_burn::Qwen3_5MoeForCausalLM,
     tokenizer: &Qwen3Tokenizer,
     device: &CudaDevice,
 ) -> Result<Vec<TeacherForceBaseline>, String> {
@@ -325,7 +325,7 @@ fn collect_baselines(
 /// Run the eval pass: recompute logits from `model` for each corpus item and score them against the
 /// host-resident BF16 `baselines`. `prec_label`/`quant_experts` only annotate the printed metrics.
 fn evaluate_teacherforce(
-    model: &qwen3_burn::Qwen3_5MoeForCausalLM<B>,
+    model: &qwen3_burn::Qwen3_5MoeForCausalLM,
     tokenizer: &Qwen3Tokenizer,
     baselines: &[TeacherForceBaseline],
     prec_label: &str,
@@ -432,7 +432,7 @@ fn evaluate_teacherforce(
 
 /// Fake-quant teacher-force gate: BF16 baseline -> in-place fake-quant of the resident model -> eval.
 fn run_teacherforce(
-    model: &mut qwen3_burn::Qwen3_5MoeForCausalLM<B>,
+    model: &mut qwen3_burn::Qwen3_5MoeForCausalLM,
     tokenizer: &Qwen3Tokenizer,
     prec: QuantPrecision,
     quant_experts: bool,
@@ -461,7 +461,7 @@ fn run_teacherforce(
 /// checkpoint fresh (NO fake-quant) and scores it against the host-resident baselines. Peak device
 /// residency is therefore max(bf16, nvfp4), never their sum.
 fn run_teacherforce_real_nvfp4(
-    model: qwen3_burn::Qwen3_5MoeForCausalLM<B>,
+    model: qwen3_burn::Qwen3_5MoeForCausalLM,
     config: &Qwen3_5MoeConfig,
     tokenizer: &Qwen3Tokenizer,
     nvfp4_dir: &std::path::Path,
@@ -495,7 +495,7 @@ fn run_teacherforce_real_nvfp4(
         }
     );
     let load_start = Instant::now();
-    let mut model = config.init_causal_lm::<B>(device);
+    let mut model = config.init_causal_lm(device);
     model
         .load_nvidia_nvfp4(nvfp4_dir)
         .map_err(|e| format!("load_nvidia_nvfp4 failed: {e:?}"))?;
@@ -516,7 +516,7 @@ fn run_teacherforce_real_nvfp4(
 }
 
 fn greedy_decode(
-    model: &qwen3_burn::Qwen3_5MoeForCausalLM<B>,
+    model: &qwen3_burn::Qwen3_5MoeForCausalLM,
     tokenizer: &Qwen3Tokenizer,
     prompt_ids: &[i64],
     max_new_tokens: usize,
@@ -524,7 +524,7 @@ fn greedy_decode(
 ) -> Result<(Vec<i64>, String, String), String> {
     let prompt_len = prompt_ids.len();
     let total = prompt_len + max_new_tokens;
-    let input = Tensor::<B, 1, Int>::from_data(prompt_ids, device).unsqueeze();
+    let input = Tensor::<1, Int>::from_data(prompt_ids, device).unsqueeze();
     let mut cache = model.model.new_cache_with_capacity(total);
 
     let pos0 = positions(0, prompt_len, device);
@@ -539,7 +539,7 @@ fn greedy_decode(
         new_ids.push(id);
 
         if step + 1 < max_new_tokens {
-            let tok = Tensor::<B, 2, Int>::from_data([[id]], device);
+            let tok = Tensor::<2, Int>::from_data([[id]], device);
             let pos = positions(prompt_len + step, 1, device);
             logits = model.forward_prec(tok, pos, &mut cache, Precision::Bf16);
         }
@@ -577,7 +577,7 @@ fn run() -> Result<(), String> {
     };
     let quant_experts = env_string("QUANT_EXPERTS", "0") == "1";
 
-    let device = CudaDevice::default();
+    let device = Device::cuda(0);
     println!("device: {device:?}");
     let prec_display = if real_nvfp4 {
         "real-nvfp4".to_string()
@@ -619,7 +619,7 @@ fn run() -> Result<(), String> {
     );
 
     let tokenizer = Qwen3Tokenizer::from_file(dir.join("tokenizer.json"))?;
-    let mut model = cfg.init_causal_lm::<B>(&device);
+    let mut model = cfg.init_causal_lm(&device);
 
     println!("loading sharded BF16 weights from {dir:?} ...");
     let load_start = Instant::now();

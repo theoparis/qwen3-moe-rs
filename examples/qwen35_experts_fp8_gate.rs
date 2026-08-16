@@ -8,15 +8,15 @@
 
 use std::{path::PathBuf, time::Instant};
 
-use cubecl::{cuda::CudaRuntime, Runtime};
+use cubecl::{Runtime, cuda::CudaRuntime};
 
 use burn::{
-    backend::cuda::{Cuda, CudaDevice},
+    prelude::Device,
     tensor::{DType, Int, Tensor},
 };
 use qwen3_burn::{
     Precision, Qwen3_5MoeConfig, Qwen3Tokenizer,
-    quant_gate::{quantize_dense_fp8, quantize_experts_fp8, QuantCoverage},
+    quant_gate::{QuantCoverage, quantize_dense_fp8, quantize_experts_fp8},
 };
 
 type B = Cuda;
@@ -77,12 +77,15 @@ fn corpus() -> Vec<String> {
             .filter(|text| !text.is_empty())
             .map(str::to_string)
             .collect(),
-        Err(_) => TEACHER_FORCE_CORPUS.iter().map(|text| text.to_string()).collect(),
+        Err(_) => TEACHER_FORCE_CORPUS
+            .iter()
+            .map(|text| text.to_string())
+            .collect(),
     }
 }
 
-fn positions(pos: usize, device: &CudaDevice) -> Tensor<B, 2, Int> {
-    Tensor::<B, 2, Int>::from_data([[pos as i64]], device)
+fn positions(pos: usize, device: &CudaDevice) -> Tensor<2, Int> {
+    Tensor::<2, Int>::from_data([[pos as i64]], device)
 }
 
 fn argmax_top2(row: &[f32]) -> (usize, f32, f32) {
@@ -103,18 +106,28 @@ fn argmax_top2(row: &[f32]) -> (usize, f32, f32) {
 
 fn logsumexp(row: &[f32]) -> f64 {
     let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
-    max + row.iter().map(|&v| ((v as f64) - max).exp()).sum::<f64>().ln()
+    max + row
+        .iter()
+        .map(|&v| ((v as f64) - max).exp())
+        .sum::<f64>()
+        .ln()
 }
 
 fn assert_finite(values: &[f32], label: &str) -> Result<(), String> {
-    if let Some((idx, value)) = values.iter().enumerate().find(|(_, value)| !value.is_finite()) {
-        return Err(format!("{label} contains non-finite value at flat index {idx}: {value}"));
+    if let Some((idx, value)) = values
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(format!(
+            "{label} contains non-finite value at flat index {idx}: {value}"
+        ));
     }
     Ok(())
 }
 
 fn teacher_forced_decode_logits(
-    model: &qwen3_burn::Qwen3_5MoeForCausalLM<B>,
+    model: &qwen3_burn::Qwen3_5MoeForCausalLM,
     tokenizer: &Qwen3Tokenizer,
     text: &str,
     max_positions: usize,
@@ -132,11 +145,13 @@ fn teacher_forced_decode_logits(
     let mut all = Vec::new();
     let mut vocab = None;
     for pos in 0..positions_count {
-        let input = Tensor::<B, 2, Int>::from_data([[token_ids[pos]]], device);
+        let input = Tensor::<2, Int>::from_data([[token_ids[pos]]], device);
         let logits = model.forward_prec(input, positions(pos, device), &mut cache, Precision::Bf16);
         let [batch, seq, got_vocab] = logits.dims();
         if batch != 1 || seq != 1 {
-            return Err(format!("decode logits shape mismatch: got [{batch}, {seq}, {got_vocab}]"));
+            return Err(format!(
+                "decode logits shape mismatch: got [{batch}, {seq}, {got_vocab}]"
+            ));
         }
         vocab.get_or_insert(got_vocab);
         let row = logits
@@ -152,7 +167,7 @@ fn teacher_forced_decode_logits(
 }
 
 fn run_baselines(
-    model: &qwen3_burn::Qwen3_5MoeForCausalLM<B>,
+    model: &qwen3_burn::Qwen3_5MoeForCausalLM,
     tokenizer: &Qwen3Tokenizer,
     texts: &[String],
     max_positions: usize,
@@ -182,7 +197,7 @@ fn run_baselines(
 }
 
 fn compare_fp8(
-    model: &qwen3_burn::Qwen3_5MoeForCausalLM<B>,
+    model: &qwen3_burn::Qwen3_5MoeForCausalLM,
     tokenizer: &Qwen3Tokenizer,
     texts: &[String],
     baselines: &[Baseline],
@@ -235,8 +250,8 @@ fn load_model(
     cfg: &Qwen3_5MoeConfig,
     dir: &PathBuf,
     device: &CudaDevice,
-) -> Result<qwen3_burn::Qwen3_5MoeForCausalLM<B>, String> {
-    let mut model = cfg.init_causal_lm::<B>(device);
+) -> Result<qwen3_burn::Qwen3_5MoeForCausalLM, String> {
+    let mut model = cfg.init_causal_lm(device);
     let start = Instant::now();
     let report = model
         .load_weights_sharded(dir)
@@ -280,7 +295,10 @@ fn check_gate(metrics: &mut Metrics, coverage: &QuantCoverage) -> Result<(), Str
         max_kl
     );
     if coverage.intended == 0 || coverage.quantized != coverage.intended {
-        return Err(format!("coverage failed: quantized={} intended={}", coverage.quantized, coverage.intended));
+        return Err(format!(
+            "coverage failed: quantized={} intended={}",
+            coverage.quantized, coverage.intended
+        ));
     }
     if top1 < 0.975 {
         return Err(format!(
@@ -329,7 +347,7 @@ fn run() -> Result<(), String> {
     let dir = PathBuf::from(env_string("QWEN35_DIR", MODEL_DIR));
     let max_positions = env_usize("MAX_POSITIONS", MAX_POSITIONS);
     let texts = corpus();
-    let device = CudaDevice::default();
+    let device = Device::cuda(0);
     println!(
         "fp8 gate config: dir={dir:?} corpus_items={} max_positions={max_positions} device={device:?}",
         texts.len()
@@ -343,7 +361,10 @@ fn run() -> Result<(), String> {
         let model = load_model(&cfg, &dir, &device)?;
         let start = Instant::now();
         let baselines = run_baselines(&model, &tokenizer, &texts, max_positions, &device)?;
-        println!("BF16 reference collected in {:.1}s", start.elapsed().as_secs_f64());
+        println!(
+            "BF16 reference collected in {:.1}s",
+            start.elapsed().as_secs_f64()
+        );
         baselines
     };
 
@@ -371,8 +392,18 @@ fn run() -> Result<(), String> {
             .collect(),
     };
     let start = Instant::now();
-    let mut metrics = compare_fp8(&model, &tokenizer, &texts, &baselines, max_positions, &device)?;
-    println!("FP8 candidate collected in {:.1}s", start.elapsed().as_secs_f64());
+    let mut metrics = compare_fp8(
+        &model,
+        &tokenizer,
+        &texts,
+        &baselines,
+        max_positions,
+        &device,
+    )?;
+    println!(
+        "FP8 candidate collected in {:.1}s",
+        start.elapsed().as_secs_f64()
+    );
     check_gate(&mut metrics, &coverage)?;
     println!("FP8_EXPERT_GATE PASS");
     Ok(())

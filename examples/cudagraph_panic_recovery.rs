@@ -57,7 +57,11 @@ fn count(n: usize) -> CubeCount {
     CubeCount::Static((n as u32).div_ceil(THREADS), 1, 1)
 }
 fn dim() -> CubeDim {
-    CubeDim { x: THREADS, y: 1, z: 1 }
+    CubeDim {
+        x: THREADS,
+        y: 1,
+        z: 1,
+    }
 }
 
 fn launch_step(client: &Client, handle: &Handle, n: usize) {

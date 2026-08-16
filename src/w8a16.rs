@@ -44,7 +44,7 @@
 //!    serving lever, NOT the GRPO-rollout decode lever the plan assumed.
 
 use burn::backend::cuda::Cuda;
-use burn::tensor::backend::Backend;
+
 use burn::tensor::{DType, Int, Tensor, TensorPrimitive};
 
 use cubecl::cuda::CudaRuntime;
@@ -52,9 +52,9 @@ use cubecl::e4m3;
 use cubecl::prelude::CubeElement;
 use cubecl::{CubeCount, CubeDim};
 
+use burn_cubecl::CubeBackend;
 use burn_cubecl::kernel::into_contiguous;
 use burn_cubecl::tensor::CubeTensor;
-use burn_cubecl::CubeBackend;
 
 use crate::capture::CaptureBackend;
 use crate::cube_custom_op::CubeCustomOp;
@@ -229,8 +229,8 @@ fn alloc_f32(like: &CubeTensor<CudaRuntime>, shape: &[usize]) -> CubeTensor<Cuda
 ///
 /// fp8 has no Burn float DType and Burn's Int kind has no `u8`, so the raw e4m3 byte is carried in a
 /// 1-byte `I8` tensor (bit-preserving `byte as i8`; the kernel reinterprets the bits as e4m3). Build it
-/// with `Tensor::<Cuda,1,Int>::from_data_dtype(TensorData::new(i8_bytes, [n]), &dev, DType::I8)`.
-pub fn e4m3_decode(q: Tensor<Cuda, 1, Int>) -> Tensor<Cuda, 1> {
+/// with `Tensor::<1, Int>::from_data(TensorData::new(i8_bytes, ([n]), &dev, DType::I8))`.
+pub fn e4m3_decode(q: Tensor<1, Int>) -> Tensor<1> {
     assert_eq!(
         q.dtype(),
         DType::I8,
@@ -274,10 +274,10 @@ pub fn e4m3_decode(q: Tensor<Cuda, 1, Int>) -> Tensor<Cuda, 1> {
 ///
 /// * `x` — activations `[M, K]` (f32).
 /// * `q` — packed e4m3 weight `[K, N]`, a 1-byte `DType::I8` Int tensor (raw e4m3 bits; build with
-///   `from_data_dtype(.., DType::I8)`).
+///   `from_data(.., (DType::I8)`).
 /// * `s` — per-output-channel scale `[N]` (f32), `s[n] = max_k|W[k,n]| / 448`.
 ///
-/// Returns `y:[M,N]` (f32), `y[m,n] = sum_k x[m,k] * (e4m3_to_f32(q[k,n]) * s[n])`.
+/// Returns `y:[M,N]` (f32)), `y[m,n] = sum_k x[m,k] * (e4m3_to_f32(q[k,n]) * s[n])`.
 fn run_w8a16_gemm_tensors(
     x: CubeTensor<CudaRuntime>,
     q: CubeTensor<CudaRuntime>,
@@ -337,20 +337,12 @@ fn run_w8a16_gemm_tensors(
 
 #[cfg(feature = "cuda")]
 pub trait W8A16GemvBackend: Backend {
-    fn w8a16_gemv(
-        x: Tensor<Self, 2>,
-        q: Tensor<Self, 2, Int>,
-        s: Tensor<Self, 1>,
-    ) -> Tensor<Self, 2>;
+    fn w8a16_gemv(x: Tensor<2>, q: Tensor<2, Int>, s: Tensor<1>) -> Tensor<2>;
 }
 
 #[cfg(feature = "cuda")]
 impl W8A16GemvBackend for Cuda {
-    fn w8a16_gemv(
-        x: Tensor<Cuda, 2>,
-        q: Tensor<Cuda, 2, Int>,
-        s: Tensor<Cuda, 1>,
-    ) -> Tensor<Cuda, 2> {
+    fn w8a16_gemv(x: Tensor<2>, q: Tensor<2, Int>, s: Tensor<1>) -> Tensor<2> {
         let [m, n] = [x.dims()[0], q.dims()[1]];
         let x_prim = x.into_primitive().tensor();
         let q_prim = q.into_primitive(); // Int primitive routed via get_int_tensor (§0b rule 4)
@@ -376,11 +368,7 @@ impl W8A16GemvBackend for Cuda {
 
 #[cfg(feature = "cuda")]
 impl W8A16GemvBackend for CubeBackend<CudaRuntime, f32, i32, u8> {
-    fn w8a16_gemv(
-        x: Tensor<Self, 2>,
-        q: Tensor<Self, 2, Int>,
-        s: Tensor<Self, 1>,
-    ) -> Tensor<Self, 2> {
+    fn w8a16_gemv(x: Tensor<2>, q: Tensor<2, Int>, s: Tensor<1>) -> Tensor<2> {
         let x = x.into_primitive().tensor();
         let q = q.into_primitive();
         let s = s.into_primitive().tensor();
@@ -396,12 +384,12 @@ impl W8A16GemvBackend for CubeBackend<CudaRuntime, f32, i32, u8> {
 /// setup from host-side packed weights.
 #[cfg(feature = "cuda")]
 pub fn w8a16_gemv_raw(
-    x: Tensor<CaptureBackend, 2>,
+    x: Tensor<2>,
     q_bytes: &[i8],
     scale: &[f32],
     k: usize,
     n: usize,
-) -> Tensor<CaptureBackend, 2> {
+) -> Tensor<2> {
     let [_m, xk] = x.dims();
     assert_eq!(xk, k, "w8a16_gemv_raw: x K ({xk}) != requested K ({k})");
     assert_eq!(x.dtype(), DType::F32, "w8a16_gemv_raw: x must be f32");
@@ -445,10 +433,6 @@ pub fn w8a16_gemv_raw(
     )
 }
 
-pub fn w8a16_gemm(
-    x: Tensor<Cuda, 2>,
-    q: Tensor<Cuda, 2, Int>,
-    s: Tensor<Cuda, 1>,
-) -> Tensor<Cuda, 2> {
+pub fn w8a16_gemm(x: Tensor<2>, q: Tensor<2, Int>, s: Tensor<1>) -> Tensor<2> {
     <Cuda as W8A16GemvBackend>::w8a16_gemv(x, q, s)
 }

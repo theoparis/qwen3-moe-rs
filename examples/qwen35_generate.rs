@@ -6,10 +6,10 @@
 
 use std::{path::PathBuf, time::Instant};
 
-use cubecl::{cuda::CudaRuntime, Runtime};
+use cubecl::{Runtime, cuda::CudaRuntime};
 
 use burn::{
-    backend::cuda::{Cuda, CudaDevice},
+    prelude::Device,
     tensor::{DType, Int, Tensor},
 };
 use qwen3_burn::{Precision, Qwen3_5MoeConfig, Qwen3Tokenizer};
@@ -35,15 +35,15 @@ fn print_mem(label: &str) {
     println!("{label}: VmRSS={rss}, VmHWM={hwm}");
 }
 
-fn positions(start: usize, len: usize, device: &CudaDevice) -> Tensor<B, 2, Int> {
+fn positions(start: usize, len: usize, device: &CudaDevice) -> Tensor<2, Int> {
     if len == 1 {
-        Tensor::<B, 2, Int>::from_data([[start as i64]], device)
+        Tensor::<2, Int>::from_data([[start as i64]], device)
     } else {
-        Tensor::<B, 1, Int>::arange(start as i64..(start + len) as i64, device).unsqueeze()
+        Tensor::<1, Int>::arange(start as i64..(start + len) as i64, device).unsqueeze()
     }
 }
 
-fn assert_logits_all_finite(logits: &Tensor<B, 3>, what: &str) -> Result<(), String> {
+fn assert_logits_all_finite(logits: &Tensor<3>, what: &str) -> Result<(), String> {
     let [batch, seq, vocab] = logits.dims();
     let values = logits
         .clone()
@@ -64,10 +64,10 @@ fn assert_logits_all_finite(logits: &Tensor<B, 3>, what: &str) -> Result<(), Str
     Ok(())
 }
 
-fn argmax_last(logits: &Tensor<B, 3>) -> Result<i64, String> {
+fn argmax_last(logits: &Tensor<3>) -> Result<i64, String> {
     assert_logits_all_finite(logits, "decode")?;
     let [batch, seq, vocab] = logits.dims();
-    let next: Tensor<B, 2, Int> = logits
+    let next: Tensor<2, Int> = logits
         .clone()
         .slice([0..batch, (seq - 1)..seq, 0..vocab])
         .reshape([batch, vocab])
@@ -95,7 +95,7 @@ struct GreedyRun {
 }
 
 fn greedy_decode(
-    model: &qwen3_burn::Qwen3_5MoeForCausalLM<B>,
+    model: &qwen3_burn::Qwen3_5MoeForCausalLM,
     tokenizer: &Qwen3Tokenizer,
     prompt_ids: &[i64],
     max_new_tokens: usize,
@@ -109,14 +109,14 @@ fn greedy_decode(
 
     let prompt_len = prompt_ids.len();
     let total = prompt_len + max_new_tokens;
-    let input = Tensor::<B, 1, Int>::from_data(prompt_ids, device).unsqueeze();
+    let input = Tensor::<1, Int>::from_data(prompt_ids, device).unsqueeze();
     let mut cache = model.model.new_cache_with_capacity(total);
     let gen_start = Instant::now();
     let pos0 = positions(0, prompt_len, device);
     // Greedy decode only needs the LAST position's logits. `forward_last_logits` slices the last
     // hidden BEFORE the head, keeping a quantized (NVFP4/fp8) lm_head at M=1 within its m_max on
     // prefill (T>1) exactly as on decode; identical to slicing full-T logits on the bf16/fp8 heads.
-    let mut logits: Tensor<B, 3> = model
+    let mut logits: Tensor<3> = model
         .forward_last_logits(input, pos0, &mut cache, prec)
         .unsqueeze_dim(1);
     assert_logits_all_finite(&logits, "prefill")?;
@@ -143,7 +143,7 @@ fn greedy_decode(
         new_ids.push(id);
 
         if step + 1 < max_new_tokens {
-            let tok = Tensor::<B, 2, Int>::from_data([[id]], device);
+            let tok = Tensor::<2, Int>::from_data([[id]], device);
             let pos = positions(prompt_len + step, 1, device);
             logits = model
                 .forward_last_logits(tok, pos, &mut cache, prec)
@@ -171,7 +171,7 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let device = CudaDevice::default();
+    let device = Device::cuda(0);
     let quant = std::env::var("QUANT").unwrap_or_else(|_| "bf16".to_string());
     // QUANT=nvfp4 loads the official NVIDIA NVFP4 checkpoint via load_nvidia_nvfp4 (raw dispatch);
     // NVFP4_DEQUANT_TO_FP8=1 selects the staged B5.0c fp8 fallback inside the loader.
@@ -216,7 +216,7 @@ fn run() -> Result<(), String> {
     );
 
     let tokenizer = Qwen3Tokenizer::from_file(dir.join("tokenizer.json"))?;
-    let mut model = cfg.init_causal_lm::<B>(&device);
+    let mut model = cfg.init_causal_lm(&device);
 
     let client = CudaRuntime::client(&device);
     if quant_mode == "nvfp4" {
@@ -286,7 +286,9 @@ fn run() -> Result<(), String> {
     println!("prefill + greedy decode: max_new_tokens={MAX_NEW_TOKENS}, precision={prec:?}");
 
     if quant_mode == "fp8" && std::env::var("COMPARE_FP8_FUSED_HOST").as_deref() == Ok("1") {
-        println!("FP8 fused-vs-host gate: crossing note T<=16 uses fused path, T>16 remains host-loop");
+        println!(
+            "FP8 fused-vs-host gate: crossing note T<=16 uses fused path, T>16 remains host-loop"
+        );
         let host = greedy_decode(
             &model,
             &tokenizer,
@@ -355,7 +357,10 @@ fn run() -> Result<(), String> {
     );
     print_mem("memory after generation");
     if repeated_garbage(&result.new_ids) {
-        println!("CRITICAL: repeated-token symptom in generated ids: {:?}", result.new_ids);
+        println!(
+            "CRITICAL: repeated-token symptom in generated ids: {:?}",
+            result.new_ids
+        );
     }
     println!("L1.6 GENERATE: {}", result.text);
 

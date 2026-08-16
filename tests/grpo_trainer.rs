@@ -11,15 +11,13 @@
 //!
 //! Run: `cargo test --test grpo_trainer`
 
-use burn::backend::{Autodiff, NdArray};
 use burn::module::AutodiffModule;
 use burn::optim::AdamWConfig;
-use burn::tensor::{Int, Tensor};
-use qwen3_burn::grpo::{grpo_step, grpo_step_ragged, GrpoConfig, GrpoTrainConfig, RolloutConfig, Rollouts};
+use burn::tensor::{Device, Int, Tensor};
 use qwen3_burn::Qwen3Config;
-
-type IB = NdArray;
-type B = Autodiff<IB>;
+use qwen3_burn::grpo::{
+    GrpoConfig, GrpoTrainConfig, RolloutConfig, Rollouts, grpo_step, grpo_step_ragged,
+};
 
 fn tiny_config() -> Qwen3Config {
     Qwen3Config::new()
@@ -34,10 +32,10 @@ fn tiny_config() -> Qwen3Config {
 
 #[test]
 fn one_grpo_step_runs_and_updates_policy() {
-    let dev = Default::default();
+    let dev = Device::flex().autodiff();
     let cfg = tiny_config();
 
-    let policy = cfg.init_causal_lm::<B>(&dev);
+    let policy = cfg.init_causal_lm(&dev);
     let ref_model = policy.valid(); // frozen snapshot on the inner backend
 
     let optim = AdamWConfig::new().init();
@@ -45,15 +43,24 @@ fn one_grpo_step_runs_and_updates_policy() {
     let p = 2usize;
     let lp = 3usize;
     let prompts =
-        Tensor::<B, 1, Int>::from_data([1i64, 2, 3, 4, 5, 6].as_slice(), &dev).reshape([p, lp]);
+        Tensor::<1, Int>::from_data([1i64, 2, 3, 4, 5, 6].as_slice(), &dev).reshape([p, lp]);
 
     let train_cfg = GrpoTrainConfig {
         // group_size must match the rollout's (the trainer now asserts this); 8 default vs 4 rollout
         // was the silent mismatch the assert is here to catch.
-        grpo: GrpoConfig { group_size: 4, ..GrpoConfig::default() },
+        grpo: GrpoConfig {
+            group_size: 4,
+            ..GrpoConfig::default()
+        },
         // high temperature + top_p off so a tiny random-init model still samples DIVERSE
         // completions (peaked random logits otherwise collapse a group to identical tokens)
-        rollout: RolloutConfig { group_size: 4, max_new_tokens: 6, temperature: 5.0, top_p: 1.0, top_k: 0 },
+        rollout: RolloutConfig {
+            group_size: 4,
+            max_new_tokens: 6,
+            temperature: 5.0,
+            top_p: 1.0,
+            top_k: 0,
+        },
         eos: vec![7],
         lr: 1e-2,
     };
@@ -63,7 +70,7 @@ fn one_grpo_step_runs_and_updates_policy() {
     // real gradient) regardless of what the random-init model samples, so the test verifies the
     // loop mechanics deterministically. (Real training uses the Manim execution reward.)
     let g = train_cfg.rollout.group_size;
-    let reward_fn = move |roll: &Rollouts<IB>| -> Vec<f32> {
+    let reward_fn = move |roll: &Rollouts| -> Vec<f32> {
         let n = roll.seq_ids.dims()[0];
         (0..n).map(|s| (s % g) as f32 / g as f32).collect()
     };
@@ -71,15 +78,24 @@ fn one_grpo_step_runs_and_updates_policy() {
     // weight snapshot before the step (tied embedding gets a dense gradient via the LM head)
     let before: f32 = policy.model.embed_tokens_weight().abs().sum().into_scalar();
 
-    let (policy, _optim, report) = grpo_step(policy, &ref_model, optim, prompts, reward_fn, &train_cfg);
+    let (policy, _optim, report) =
+        grpo_step(policy, &ref_model, optim, prompts, reward_fn, &train_cfg);
 
     // loss + metrics finite
     assert!(report.metrics.total_loss.is_finite(), "loss must be finite");
-    assert!(report.metrics.kl_loss >= -1e-5, "k3 KL >= 0, got {}", report.metrics.kl_loss);
+    assert!(
+        report.metrics.kl_loss >= -1e-5,
+        "k3 KL >= 0, got {}",
+        report.metrics.kl_loss
+    );
     assert!(report.gen_len >= 1);
 
     // reward signal had variance (otherwise the test wouldn't exercise learning)
-    assert!(report.reward_std > 0.0, "expected reward variance, std={}", report.reward_std);
+    assert!(
+        report.reward_std > 0.0,
+        "expected reward variance, std={}",
+        report.reward_std
+    );
 
     // PPO ratio ≈ 1 at step 0: old_logprobs (rollout) == policy recomputed log-probs
     assert!(
@@ -90,17 +106,35 @@ fn one_grpo_step_runs_and_updates_policy() {
 
     // policy parameters actually moved (gradient flowed + AdamW stepped)
     let after: f32 = policy.model.embed_tokens_weight().abs().sum().into_scalar();
-    assert!((after - before).abs() > 1e-7, "policy weights must change after a step ({before} -> {after})");
+    assert!(
+        (after - before).abs() > 1e-7,
+        "policy weights must change after a step ({before} -> {after})"
+    );
 
     // frozen reference is unchanged (it's a separate inner model, never stepped)
-    let ref_sum_a: f32 = ref_model.model.embed_tokens_weight().abs().sum().into_scalar();
-    let ref_sum_b: f32 = ref_model.model.embed_tokens_weight().abs().sum().into_scalar();
+    let ref_sum_a: f32 = ref_model
+        .model
+        .embed_tokens_weight()
+        .abs()
+        .sum()
+        .into_scalar();
+    let ref_sum_b: f32 = ref_model
+        .model
+        .embed_tokens_weight()
+        .abs()
+        .sum()
+        .into_scalar();
     assert_eq!(ref_sum_a, ref_sum_b, "frozen reference must not change");
 
     println!(
         "GRPO step OK — loss={:.6} kl={:.6} mean_ratio={:.4} mean_reward={:.3} reward_std={:.3} zero_std_groups={} gen_len={}",
-        report.metrics.total_loss, report.metrics.kl_loss, report.metrics.mean_ratio,
-        report.mean_reward, report.reward_std, report.zero_std_groups, report.gen_len
+        report.metrics.total_loss,
+        report.metrics.kl_loss,
+        report.metrics.mean_ratio,
+        report.mean_reward,
+        report.reward_std,
+        report.zero_std_groups,
+        report.gen_len
     );
 }
 
@@ -110,8 +144,8 @@ fn one_grpo_step_runs_and_updates_policy() {
 /// mismatch (wrong pad mask or off-by-one position) would push the ratio away from 1.
 #[test]
 fn one_grpo_step_ragged_runs_and_updates_policy() {
-    let dev = Default::default();
-    let policy = tiny_config().init_causal_lm::<B>(&dev);
+    let dev = Device::flex().autodiff();
+    let policy = tiny_config().init_causal_lm(&dev);
     let ref_model = policy.valid();
     let optim = AdamWConfig::new().init();
 
@@ -121,23 +155,37 @@ fn one_grpo_step_ragged_runs_and_updates_policy() {
 
     let g = 4usize;
     let train_cfg = GrpoTrainConfig {
-        grpo: GrpoConfig { group_size: g, ..GrpoConfig::default() },
-        rollout: RolloutConfig { group_size: g, max_new_tokens: 6, temperature: 5.0, top_p: 1.0, top_k: 0 },
+        grpo: GrpoConfig {
+            group_size: g,
+            ..GrpoConfig::default()
+        },
+        rollout: RolloutConfig {
+            group_size: g,
+            max_new_tokens: 6,
+            temperature: 5.0,
+            top_p: 1.0,
+            top_k: 0,
+        },
         eos: vec![7],
         lr: 1e-2,
     };
 
-    let reward_fn = move |roll: &Rollouts<IB>| -> Vec<f32> {
+    let reward_fn = move |roll: &Rollouts| -> Vec<f32> {
         let n = roll.seq_ids.dims()[0];
         (0..n).map(|s| (s % g) as f32 / g as f32).collect()
     };
 
     let before: f32 = policy.model.embed_tokens_weight().abs().sum().into_scalar();
-    let (policy, _optim, report) =
-        grpo_step_ragged(policy, &ref_model, optim, prompts, pad_token, &dev, reward_fn, &train_cfg);
+    let (policy, _optim, report) = grpo_step_ragged(
+        policy, &ref_model, optim, prompts, pad_token, &dev, reward_fn, &train_cfg,
+    );
 
     assert!(report.metrics.total_loss.is_finite(), "loss must be finite");
-    assert!(report.metrics.kl_loss >= -1e-5, "k3 KL >= 0, got {}", report.metrics.kl_loss);
+    assert!(
+        report.metrics.kl_loss >= -1e-5,
+        "k3 KL >= 0, got {}",
+        report.metrics.kl_loss
+    );
     assert!(report.gen_len >= 1);
     // THE gate: left-pad rollout old_logprobs must equal the policy recompute -> ratio ~ 1
     assert!(
@@ -146,7 +194,10 @@ fn one_grpo_step_ragged_runs_and_updates_policy() {
         report.metrics.mean_ratio
     );
     let after: f32 = policy.model.embed_tokens_weight().abs().sum().into_scalar();
-    assert!((after - before).abs() > 1e-7, "policy weights must change ({before} -> {after})");
+    assert!(
+        (after - before).abs() > 1e-7,
+        "policy weights must change ({before} -> {after})"
+    );
 
     println!(
         "ragged GRPO step OK — loss={:.6} mean_ratio={:.4} gen_len={}",
